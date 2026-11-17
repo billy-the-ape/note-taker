@@ -115,7 +115,9 @@ Non-functional targets:
 
 ## 4. Answers to the open questions in README.md
 
-README leaves five design questions open. Decisions below (each gets an ADR in `docs/adr/` during PR-20);
+README leaves six design questions open. Five ADRs in `docs/adr/` (written in PR-20) capture them — ADR-0001 ← Q2,
+ADR-0002 ← Q1, ADR-0003 ← Q3, ADR-0005 ← Q6, plus ADR-0004 from the §5 session decision; Q4 and Q5 are conventions
+pinned in §11.4 and §11.5 instead of separate ADRs;
 the *recommended default* is what the PRs implement — see [§21](#21-open-questions-for-the-product-owner) if any need revisiting.
 
 | # | README question | Decision | Rationale / trade-off |
@@ -371,7 +373,7 @@ CREATE INDEX folders_user_parent_idx ON folders(user_id, parent_id);
 CREATE TABLE notes (
   id                uuid PRIMARY KEY,
   user_id           uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  folder_id         uuid NOT NULL REFERENCES folders(id) ON DELETE CASCADE,  -- NULL = root
+  folder_id         uuid REFERENCES folders(id) ON DELETE CASCADE,  -- NULL = root (nullable, mirrors folders.parent_id)
   name              text NOT NULL CHECK (name <> ''),       -- WITHOUT the ".md" suffix
   version           integer NOT NULL DEFAULT 1,             -- bumped on every content write (optimistic concurrency)
   content_cipher    bytea NOT NULL DEFAULT '',              -- AES-256-GCM ciphertext || 16-byte tag
@@ -414,6 +416,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 | A folder cannot be moved inside itself | `folder.service.ts` CTE ancestor walk → `CONFLICT` |
 | `note.version` monotonic | conditional `UPDATE … WHERE id = $1 AND version = $2 RETURNING` → 0 rows ⇒ `409` |
 | Deleting a folder removes descendants | `ON DELETE CASCADE`, gated by explicit `?cascade=true` in the API |
+| Notes **and** folders may live at the root of the tree | `notes.folder_id` and `folders.parent_id` are both nullable, `NULL` = root; the `COALESCE`-based unique indexes above keep sibling names unique for root-level rows too |
 | Note content is never stored in plaintext in production | `crypto/envelope.ts` is the only writer of `content_cipher`; `env.ts` requires `NOTE_ENCRYPTION_KEY` when `NODE_ENV=production` |
 
 No soft-delete/trash in the MVP (backlog `PR-23`); deletes are hard, guarded by a typed confirmation dialog
@@ -454,7 +457,7 @@ PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` fr
 | 11 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash |
 | 12 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard |
 | 13 | `DELETE /api/folders/:id` | yes | query `cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
-| 14 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and unifies it |
+| 14 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root) |
 | 15 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
 | 16 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server content |
 | 17 | `PATCH /api/notes/:id` | yes | `{name?, folderId?}` | `200 NoteNode` | rename / move; `notes.name` stays extension-free |
@@ -522,8 +525,10 @@ home/LAN/VM network, possibly behind a reverse proxy.
 
 **Container hardening (PR-18)**
 
-- Multi-stage build; final image `node:22-slim`, non-root `USER node`, `npm ci --omit=dev`, no build toolchain in
-  the runtime layer, `HEALTHCHECK CMD curl -fsS localhost:3000/api/healthz`, `init` via `docker compose` `init: true`.
+- Multi-stage build; final image `node:22-slim`, non-root `USER node`, `pnpm deploy --prod` (or `npm ci --omit=dev`)
+  pruned install, no build toolchain in the runtime layer. `node:22-slim` ships **no `curl`**, so the healthcheck must
+  not use it: `HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`
+  (Node's global `fetch`, no extra package; `init` via `docker compose` `init: true`).
 - App image contains no secrets; `DATABASE_URL`/`NOTE_ENCRYPTION_KEY` come from env/compose.
 - `scripts/check-env.ts` refuses to boot in production when: `NOTE_ENCRYPTION_KEY` missing/≠32 bytes,
   `SESSION_TTL_DAYS` > 365, `ALLOW_REGISTRATION=true` with no `INITIAL_*` credentials set, `NODE_ENV` unset.
@@ -666,8 +671,13 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 - **Create:** `docker/compose.dev.yml` (`postgres:16-alpine`, named volume, `POSTGRES_*` from `.env`, healthcheck,
   host port 5432), `Makefile` (`make db-up db-down db-reset dev build test coverage`), `scripts/seed-demo.ts`
   (idempotent: demo user + tree) — invoked by `pnpm db:seed`.
+  Every `make` target pins the full invocation — `docker compose --env-file .env -f docker/compose.dev.yml …` —
+  because Compose auto-loads `.env` from the compose file's own directory (`docker/`), not the repo root; PR-18
+  follows the same rule for `docker/compose.yml`, so there is one convention to remember (see §15).
 - **Acceptance:** `make db-up && pnpm db:migrate && pnpm db:seed && pnpm dev` works from a cold clone; a README
-  "Local development" section documents the 4 commands; no committed credentials (dev defaults only).
+  "Local development" section documents the 4 commands; no committed credentials (dev defaults only); changing
+  `POSTGRES_PORT` in the repo-root `.env` actually changes the host port after `make db-up` (proves the env file is
+  really being read).
 - **Tests:** `scripts/seed-demo.ts` guarded by `NODE_ENV !== 'production'`; nothing to unit-test.
 - **Out of scope:** production image (PR-18), CI (PR-03).
 
@@ -697,7 +707,9 @@ merge with the placeholder still in place — see note)
   `test/fixtures.ts`, `docs/DATA-MODEL.md`, repositories for `users`, `sessions`, `folders`, `notes`
   (notes repo initially writes/reads **plaintext** — PR-06 swaps in the envelope behind the same interface).
 - **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB; integration tests
-  prove: sibling uniqueness (folder & note), cascade delete of nested folders, `notes.version` conditional update
+  prove: sibling uniqueness (folder & note), **root-level rows work** (`folders.parent_id IS NULL` and
+  `notes.folder_id IS NULL` insert, and two root notes with the same name collide while a root note and a note inside
+  a folder do not), cascade delete of nested folders, `notes.version` conditional update
   returns 0 rows on stale `baseVersion`, cross-user select returns nothing.
 - **Tests:** ≥ 15 integration assertions; coverage floor for `db/repositories` ≥ 80%.
 - **Out of scope:** HTTP routes, auth, crypto.
@@ -715,7 +727,8 @@ merge with the placeholder still in place — see note)
   (`…-2.md`, `-3.md`), plus `createNoteSchema.superRefine` enforcing them; folder name rules (no extension handling).
 - **Acceptance:** `pnpm -w typecheck` resolves contracts from both apps; contract unit tests cover name rules
   (unicode, 121 chars, path chars, existing sibling), error envelope typing, `uniquify` sequences.
-- **Coverage:** ≥ 90% lines/branches in `packages/contracts` (pure module, no excuse).
+- **Coverage:** ≥ 90% lines and ≥ 85% branches in `packages/contracts` (the `packages/contracts` row of the §14
+  threshold table: 90/85 here, ratcheting to 95/90 after PR-19; pure module, no excuse).
 - **Out of scope:** server route registration (comes with each route PR).
 
 #### PR-06 — Envelope encryption module + key management + rotation script
@@ -769,7 +782,8 @@ merge with the placeholder still in place — see note)
   `new-file-<msepoch>` then `uniquify`; cross-user id in any path/query ⇒ `404`.
 - **Acceptance:** integration suite covers each behavior above plus: 3-level nesting, rename into a sibling
   occupied name, move folder A under its own child B rejected, cascade delete removes nested notes (and content
-  rows), tree depth 50 renders without recursion errors (CTE depth guard at 100).
+  rows), **create at root (`folderId: null`) and move a note back to root both work**, tree depth 50 renders
+  without recursion errors (CTE depth guard at 100).
 - **Tests:** ≥ 25 assertions; `services` coverage ≥ 85%.
 - **Out of scope:** content versioning endpoint (PR-10), search (PR-11), UI (PR-12).
 
@@ -807,8 +821,8 @@ merge with the placeholder still in place — see note)
   (shared dialog forms), `plugins/static-spa.ts` on the server so a built SPA is served from the API port.
 - **Behavior:** expand/collapse persisted per session, keyboard nav (↑↓←→, `Enter`, `F2`, `Del`), context menu +
   "New folder" / "Rename" / "Move to…" (folder tree picker) / "Delete" with typed-name confirm, optimistic
-  reorder-free tree (alphabetical), empty state, loading skeletons, error toasts with retry, `aria-tree`/`aria-selected`
-  semantics, notes shown under their folder with the `.md` suffix visible.
+  reorder-free tree (alphabetical), empty state, loading skeletons, error toasts with retry, `role="tree"` plus
+  `role="treeitem"`/`aria-selected`/`aria-expanded` semantics, notes shown under their folder with the `.md` suffix visible.
 - **Acceptance (Vitest + testing-library):** tree selectors (flatten/sort/indent/ancestors) unit-tested; rename
   optimistic-then-rollback on 409 with inline error; move into own descendant blocked **client-side** and surfaced
   if the server rejects; delete cascade requires exact name; tree renders 500 nodes in < 150 ms (jsdom smoke).
@@ -874,16 +888,25 @@ prepared earlier and rebased)
 
 - **Create:** `docker/Dockerfile` (stage 1 build all workspaces with dev deps + `pnpm build`; stage 2
   `node:22-slim`, `pnpm deploy --prod` or `npm ci --omit=dev` pruned install, copy `dist`/`migrations`, copy
-  `apps/web/dist` into the server's static path, `USER node`, `HEALTHCHECK`, `EXPOSE 3000`, `ENTRYPOINT
+  `apps/web/dist` into the server's static path, `USER node`, `EXPOSE 3000`, `ENTRYPOINT
   docker/entrypoint.sh` → `scripts/check-env.ts` → `pnpm db:migrate` → `exec node apps/server/dist/index.js`),
-  `docker/compose.yml` (`db` + `app`, `db` published **only** internally, `app.ports: "3000:3000"`,
+  with `HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 CMD node -e "fetch(…/api/healthz)…"`
+  — **no `curl`**: `node:22-slim` does not ship it, and installing it in the runtime layer is out of scope, so the
+  probe uses Node's built-in `fetch` (see §10).
+  `docker/compose.yml` (`db` + `app`, `db` published **only** internally, `app.ports: "${PORT:-3000}:3000"`,
   `depends_on: condition: service_healthy`, named `pgdata` volume, optional `notes-keys` volume for a mounted key
-  file, `restart: unless-stopped`, `init: true`, healthcheck), `scripts/check-env.ts`, `docs/DEPLOY.md`
-  (one-port mapping, TLS/reverse-proxy recipe, backups: `pg_dump` + key backup, key-rotation procedure, upgrade
-  procedure, troubleshooting table).
-- **Acceptance:** `docker compose -f docker/compose.yml up -d` on a clean VM → `curl :3000/api/healthz` ok →
-  browser on `:3000` reaches `/setup`, creates the account, and CRUD survives `docker compose restart`;
-  `docker history` shows no dev deps; image runs as uid ≠ 0; boot fails loudly (non-zero) when
+  file, `restart: unless-stopped`, `init: true`, `db` healthcheck via `pg_isready`), `scripts/check-env.ts`,
+  `docs/DEPLOY.md`
+  (one-port mapping, **exactly how to invoke compose with the env file** (see §15: the stack is started with
+  `docker compose --env-file .env -f docker/compose.yml`, because Compose otherwise auto-loads `.env` from
+  `docker/`, not the repo root), TLS/reverse-proxy recipe, backups: `pg_dump` + key backup, key-rotation procedure,
+  upgrade procedure, troubleshooting table).
+- **Acceptance:** `docker compose --env-file .env -f docker/compose.yml up -d` on a clean VM → the `app` container
+  reaches `healthy` (`docker inspect --format '{{.State.Health.Status}}'` — this proves the Node `HEALTHCHECK`
+  works with no `curl` in the image) → `curl http://localhost:3000/api/healthz` ok **from the host** →
+  browser on `:3000` reaches `/setup`, creates the account, and CRUD survives `docker compose … restart`;
+  `${PORT}` from the repo-root `.env` is honored in the published port mapping (proves env-file wiring);
+  `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production.
 - **Out of scope:** Kubernetes manifests, TLS termination (documented only), image registry publishing.
 
@@ -903,7 +926,7 @@ prepared earlier and rebased)
      `Unsaved changes` until `Ctrl+S`.
   6. two pages, same note ⇒ conflict UI in the stale page, no silent overwrite.
 - **Acceptance:** green in CI on `ubuntu-24.04` with the `postgres` service; retries ≤ 1 and the suite is proven
-  non-flaky across 3 consecutive runs; coverage thresholds bumped to the values in §17.
+  non-flaky across 3 consecutive runs; coverage thresholds bumped to the values in §14.
 
 #### PR-20 — Documentation & instructions pass (docs-as-code, ADRs, README rewrite)
 **Branch:** `docs/pr-20-docs` · **Size:** S · **Depends on:** PR-18 (structure final), PR-19 (verification steps known)
@@ -1029,22 +1052,33 @@ Rules:
 **Production** (PR-18):
 
 ```bash
-# 1. generate config
+# 1. generate config in the REPO ROOT (this is the file the app and compose both read)
 printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
   'console.log(require("crypto").randomBytes(32).toString("base64"))')" > .env
-# 2. fill in POSTGRES_PASSWORD / DATABASE_URL in .env (see §16), then
-docker compose -f docker/compose.yml up -d        # publishes ONLY 3000
-docker compose ps                                 # app healthy via /api/healthz
+# 2. fill in POSTGRES_PASSWORD / DATABASE_URL / PORT in .env (see §16), then — always from the repo root,
+#    and always with BOTH flags (see the note below):
+docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${PORT:-3000}
+docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
 # 3. open http://<host>:3000  → /setup → create the first owner
 ```
 
-- Single published port: `app.ports: ["3000:3000"]` (change host side with `PORT=8080` in `.env` →
-  `"${PORT:-3000}:3000"`); `db` has **no** published port.
+> **Why the flags are mandatory.** Compose resolves its *project directory* from the compose file's location, so
+> with `-f docker/compose.yml` it auto-loads `.env` from `docker/` — **not** from the repo root. Without
+> `--env-file .env`, `${PORT:-3000}`, `POSTGRES_PASSWORD` and the `DATABASE_URL` handed to the app silently fall
+> back to defaults/empty. Either always pass `--env-file .env` (recommended, shown above), or keep the file at
+> `docker/.env` and say so in `docs/DEPLOY.md`. `docs/DEPLOY.md` and the `Makefile` must use the identical
+> invocation; `make` targets wrap it so operators cannot get it wrong. `docker/compose.yml` additionally declares
+> `env_file: ../.env` on the `app` service so the container's own environment does not depend on the shell.
+
+- Single published port: `app.ports: ["${PORT:-3000}:3000"]` (set `PORT=8080` in the repo-root `.env` to move the
+  host side); `db` has **no** published port.
 - Volumes: `pgdata` (Postgres). Optionally mount a key file (`secrets/note-key.txt`) instead of an env var —
   `check-env.ts` supports `NOTE_ENCRYPTION_KEY_FILE`.
-- Updates: `git pull && docker compose build && docker compose up -d` (entrypoint runs migrations first;
+- Updates: `git pull && docker compose --env-file .env -f docker/compose.yml build && docker compose --env-file .env
+  -f docker/compose.yml up -d` (entrypoint runs migrations first;
   migrations must be backward-compatible within one minor release — documented rule).
-- Backups: `docker compose exec db pg_dump -U notetaker notetaker | gzip > backup.sql.gz` **plus the encryption
+- Backups: `docker compose --env-file .env -f docker/compose.yml exec db pg_dump -U notetaker notetaker | gzip > backup.sql.gz`
+  **plus the encryption
   key**; restore + `scripts/rotate-note-key.ts` documented in `docs/DEPLOY.md`. Restore drill is part of PR-18's
   acceptance criteria (restore into a scratch compose file and log in).
 
@@ -1103,8 +1137,8 @@ the CI job (a throwaway value, not a real key); no test touches the network.
 
 The MVP is done when **all** of these are true on `main`:
 
-1. `docker compose -f docker/compose.yml up -d` from a clean VM serves the app on **one** port; the browser flow
-   `/setup → /app → CRUD notes` works; data survives restart.
+1. `docker compose --env-file .env -f docker/compose.yml up -d` from a clean VM serves the app on **one** port and
+   the `app` container reaches `healthy`; the browser flow `/setup → /app → CRUD notes` works; data survives restart.
 2. Username+password auth with hashed passwords, DB sessions, logout, change-password, rate-limited login, CSRF
    protection, and per-user data isolation verified by tests.
 3. Folder tree: create / rename / nest / move (cycle-safe) / cascade delete — with typed confirmation for deletes.

@@ -460,7 +460,7 @@ PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` fr
 | 14 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root) |
 | 15 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
 | 16 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server content |
-| 17 | `PATCH /api/notes/:id` | yes | `{name?, folderId?}` | `200 NoteNode` | rename / move; `notes.name` stays extension-free |
+| 17 | `PATCH /api/notes/:id` | yes | `{name?, folderId\|null}` | `200 NoteNode` | rename / move (`folderId: null` = move to root); `notes.name` stays extension-free |
 | 18 | `DELETE /api/notes/:id` | yes | — | `204` | |
 | 19 | `GET /api/search?q=&limit=` | yes | — | `{results:[{noteId,name,folderPath,snippet,score}]}` | name match in SQL + body match after decrypt (cap 500 candidates) |
 | 20 | `GET /api/settings` / `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | `autosave`, `theme` |

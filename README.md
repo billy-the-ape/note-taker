@@ -2,6 +2,9 @@
 
 note-taker is currently in the INITIAL MVP PLANNING PHASE (user generated). 
 
+The full MVP plan (architecture, repository map, and the PR-by-PR task breakdown) lives in
+[docs/plans/MVP-FULL-PLAN.md](docs/plans/MVP-FULL-PLAN.md).
+
 ## It will become:
 
 ### A simple, lightweight web app, which can be easily self hosted and assigned to a port

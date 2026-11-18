@@ -1435,10 +1435,12 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
      `docker compose --env-file .env -f docker/compose.yml run -d --rm --name restore-drill -p 127.0.0.1:3100:3000 -e DATABASE_URL="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/${POSTGRES_DB}_restore" app`
      — with the **same** `NOTE_ENCRYPTION_KEY`, or every note decrypts to garbage and the drill proves nothing. `run -e`
      overrides the service's `environment:` mapping; confirm that with
-     `docker compose --env-file .env -f docker/compose.yml exec restore-drill printenv DATABASE_URL` before trusting a
-     green run;
-  4. open `http://127.0.0.1:3100`, log in, and read a note back; then `docker compose --env-file .env -f docker/compose.yml stop restore-drill`
-     (`--rm` removes the container) and
+     `docker exec restore-drill printenv DATABASE_URL` before trusting a green run — note the **plain `docker`** CLI here
+     and in step 4: `docker compose exec` and `docker compose stop` take a **service** name, not a container name, so
+     `docker compose exec restore-drill …` fails, and `docker compose stop app` would take the **live** app down
+     mid-drill;
+  4. open `http://127.0.0.1:3100`, log in, and read a note back; then `docker stop restore-drill` — plain `docker`, per
+     the step-3 note, and `--rm` then removes that one-off container; then
      `docker compose --env-file .env -f docker/compose.yml exec -T db dropdb -U "$POSTGRES_USER" "${POSTGRES_DB}_restore"`.
   The drill must consume exactly the artifact the backup step produces, `gzip` included — an ungzipped or TTY-corrupted
   dump failing at step 2 is the point of the drill.

@@ -84,7 +84,8 @@ Non-functional targets:
 
 ### 3.1 In the MVP (shipped by PR-20)
 
-- Username + password auth (register on first run / explicit invite or open-registration flag, login, logout, change password).
+- Username + password auth (first-run `/setup`, owner-created accounts via `POST /api/users`, and — only when
+  `ALLOW_REGISTRATION=true` — self-service sign-up via `POST /api/auth/register`), login, logout, change password.
 - Session-based auth with DB-backed sessions and cookie transport.
 - Folder tree: create, rename, move, delete (with explicit cascade confirmation), unlimited nesting, cycle-safe.
 - Notes: create (name prompt with `new-file-<msepoch>.md` prefill, fixed `.md`), rename, move, delete.
@@ -219,12 +220,12 @@ note-taker/
 │   ├── Dockerfile                             PR-18  (multi-stage, non-root, HEALTHCHECK)
 │   ├── compose.yml                            PR-18  (app + db, one published port)
 │   ├── compose.dev.yml                        PR-02  (db only)
-│   └── entrypoint.sh                          PR-18  (migrate → exec node)
+│   └── entrypoint.sh                          PR-18  (exec node only — env checks + migrations run inside the compiled bootstrap)
 ├── scripts/
 │   ├── generate-keys.ts                       PR-06  (NOTE_ENCRYPTION_KEY)
 │   ├── rotate-note-key.ts                     PR-06  (re-encrypt all rows)
-│   ├── seed-demo.ts                           PR-02  (dev user + sample tree)
-│   └── check-env.ts                           PR-18  (fail fast on missing/prod-unsafe env)
+│   ├── seed-demo.ts                           PR-09  (demo user + sample tree; needs auth+repos)
+│   └── check-env.ts                           PR-18  (dev/CI fail-fast on missing/prod-unsafe env; the same rules live in the compiled `env.ts` at boot)
 ├── packages/
 │   └── contracts/                             PR-05  (no runtime deps except zod)
 │       ├── package.json  tsconfig.json  vitest.config.ts
@@ -258,7 +259,7 @@ note-taker/
     │       ├── db/repositories/sessions.repo.ts    PR-07
     │       ├── db/repositories/folders.repo.ts     PR-09
     │       ├── db/repositories/notes.repo.ts       PR-09 (content crypto applied here, PR-10 wiring)
-    │       ├── db/repositories/settings.repo.ts    PR-16
+    │       ├── db/repositories/settings.repo.ts    PR-09
     │       ├── db/repositories/*.test.ts      integration (real DB)
     │       ├── crypto/envelope.ts             PR-06 encrypt/decrypt AES-256-GCM
     │       ├── crypto/keys.ts                 PR-06 keyring from env (current + previous versions)
@@ -272,6 +273,7 @@ note-taker/
     │       ├── services/folder.service.ts     PR-09 rename/move/cycle guard/cascade
     │       ├── services/note.service.ts       PR-09/PR-10 create, content update + version, rename/move
     │       ├── services/tree.service.ts       PR-09 recursive CTE tree assembly
+    │       ├── services/settings.service.ts   PR-09 (get/patch; consumed by PR-14 and the PR-16 UI)
     │       ├── services/search.service.ts     PR-11
     │       ├── routes/health.routes.ts        PR-01
     │       ├── routes/auth.routes.ts          PR-07
@@ -280,7 +282,7 @@ note-taker/
     │       ├── routes/folders.routes.ts       PR-09
     │       ├── routes/notes.routes.ts         PR-09 + PR-10
     │       ├── routes/search.routes.ts        PR-11
-    │       ├── routes/settings.routes.ts      PR-16
+    │       ├── routes/settings.routes.ts      PR-09 (consumed by PR-16 UI)
     │       ├── routes/*.test.ts               integration through `buildApp` + `app.inject()`
     │       ├── domain/errors.ts               PR-05 typed domain errors
     │       ├── domain/name.ts                 server-side wrapper around contracts `names.ts`
@@ -376,8 +378,8 @@ CREATE TABLE notes (
   folder_id         uuid REFERENCES folders(id) ON DELETE CASCADE,  -- NULL = root (nullable, mirrors folders.parent_id)
   name              text NOT NULL CHECK (name <> ''),       -- WITHOUT the ".md" suffix
   version           integer NOT NULL DEFAULT 1,             -- bumped on every content write (optimistic concurrency)
-  content_cipher    bytea NOT NULL DEFAULT '',              -- AES-256-GCM ciphertext || 16-byte tag
-  content_iv        bytea NOT NULL DEFAULT '',              -- 12 bytes, per-write random
+  content_cipher    bytea NOT NULL,                       -- AES-256-GCM ciphertext || 16-byte tag; NEVER a plain-text default
+  content_iv        bytea NOT NULL,                       -- 12 bytes, per-write random (no default: an empty IV is undecryptable)
   key_version       integer NOT NULL DEFAULT 1,
   content_format    text NOT NULL DEFAULT 'markdown',
   content_bytes     integer NOT NULL DEFAULT 0,             -- plaintext byte length (for listings, no decrypt)
@@ -418,6 +420,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 | Deleting a folder removes descendants | `ON DELETE CASCADE`, gated by explicit `?cascade=true` in the API |
 | Notes **and** folders may live at the root of the tree | `notes.folder_id` and `folders.parent_id` are both nullable, `NULL` = root; the `COALESCE`-based unique indexes above keep sibling names unique for root-level rows too |
 | Note content is never stored in plaintext in production | `crypto/envelope.ts` is the only writer of `content_cipher`; `env.ts` requires `NOTE_ENCRYPTION_KEY` when `NODE_ENV=production` |
+| Every note row has a **decryptable** content triple | `note.service.create` always calls `sealNoteContent(content ?? '')`, so a content-less `POST /api/notes` still stores a real 12-byte IV + 16-byte tag for the empty string; `openNoteContent()` never sees empty `content_cipher`/`content_iv` (a 0-byte IV makes GCM throw and surface as `INTERNAL`) |
 
 No soft-delete/trash in the MVP (backlog `PR-23`); deletes are hard, guarded by a typed confirmation dialog
 (type the folder/note name) so accidental cascade deletes require deliberate typing.
@@ -432,9 +435,12 @@ Base path `/api`. Content type `application/json; charset=utf-8`. All bodies val
 ### 9.1 Error envelope (every non-2xx)
 
 ```jsonc
-{ "error": { "code": "VALIDATION", "message": "name already exists in this folder",
-             "details": [{ "path": "name", "message": "must be unique" }], "requestId": "…" } }
+{ "error": { "code": "CONFLICT", "message": "name already exists in this folder",
+             "details": [{ "path": "name", "message": "must be unique among siblings" }], "requestId": "…" } }
 ```
+
+A sibling-name clash is always `CONFLICT` (409), never `VALIDATION` — see §9.2 notes and PR-09. `VALIDATION` (400)
+is reserved for malformed payloads (bad characters, length, missing fields).
 
 `code ∈ VALIDATION | UNAUTHORIZED | FORBIDDEN | NOT_FOUND | CONFLICT | RATE_LIMITED | VERSION_CONFLICT |
 PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` from typed domain errors in
@@ -445,25 +451,26 @@ PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` fr
 | # | Method + path | Auth | Request (contract schema) | Success response | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `GET /api/health` | none | — | `{status:'ok', db:'ok', version}` | also `GET /api/healthz` for the Docker `HEALTHCHECK` |
-| 2 | `GET /api/auth/status` | none | — | `{needsSetup:boolean}` | true iff `users` is empty → client routes to `/setup` |
-| 3 | `POST /api/auth/setup` | none, **only when `needsSetup`** | `registerSchema {username, password, displayName?}` | `200 {user}` + session cookie | first-run bootstrap; returns `CONFLICT` once a user exists |
-| 4 | `POST /api/auth/login` | none | `{username, password}` | `200 {user}` + `note_session` cookie | argon2id verify, timing-safe dummy hash, rate-limited |
-| 5 | `POST /api/auth/logout` | yes | — | `204` | deletes session row, clears cookie |
-| 6 | `GET /api/auth/session` | optional | — | `{user\|null, expiresAt?}` | used on boot to rehydrate UI |
-| 7 | `POST /api/auth/password` | yes | `{currentPassword, newPassword}` | `204` | rotates + deletes all other sessions |
-| 8 | `POST /api/users` | owner | `{username, password}` | `201 {user}` | only when `ALLOW_REGISTRATION=false`; otherwise `FORBIDDEN` |
-| 9 | `GET /api/users` | owner | — | `{users:[{id,username,role,createdAt}]}` | minimal admin surface |
-| 10 | `GET /api/tree` | yes | — | `{folders:[FolderNode], notes:[NoteNode]}` | full tree metadata, **no content**; single query via recursive CTE; sized for MVP scale |
-| 11 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash |
-| 12 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard |
-| 13 | `DELETE /api/folders/:id` | yes | query `cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
-| 14 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root) |
-| 15 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
-| 16 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server content |
-| 17 | `PATCH /api/notes/:id` | yes | `{name?, folderId\|null}` | `200 NoteNode` | rename / move (`folderId: null` = move to root); `notes.name` stays extension-free |
-| 18 | `DELETE /api/notes/:id` | yes | — | `204` | |
-| 19 | `GET /api/search?q=&limit=` | yes | — | `{results:[{noteId,name,folderPath,snippet,score}]}` | name match in SQL + body match after decrypt (cap 500 candidates) |
-| 20 | `GET /api/settings` / `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | `autosave`, `theme` |
+| 2 | `GET /api/auth/status` | none | — | `{needsSetup:boolean, registrationOpen:boolean}` | `needsSetup` true iff `users` is empty → client routes to `/setup`; `registrationOpen` mirrors `ALLOW_REGISTRATION` → `/login` can offer "Create account" |
+| 3 | `POST /api/auth/setup` | none, **only when `needsSetup`** | `registerSchema {username, password, displayName?}` | `200 {user}` + session cookie | first-run bootstrap that creates the `owner`; returns `CONFLICT` once a user exists |
+| 4 | `POST /api/auth/register` | none, **only when `ALLOW_REGISTRATION=true`** | `registerSchema` (no `displayName`) | `201 {user}` + session cookie | public self-sign-up, creates `role='member'`; `FORBIDDEN` when the flag is false; rate-limited + `auth_attempts` like login; cannot create an `owner` |
+| 5 | `POST /api/auth/login` | none | `{username, password}` | `200 {user}` + `note_session` cookie | argon2id verify, timing-safe dummy hash, rate-limited |
+| 6 | `POST /api/auth/logout` | yes | — | `204` | deletes session row, clears cookie |
+| 7 | `GET /api/auth/session` | optional | — | `{user\|null, expiresAt?}` | used on boot to rehydrate UI |
+| 8 | `POST /api/auth/password` | yes | `{currentPassword, newPassword}` | `204` | rotates + deletes all other sessions |
+| 9 | `POST /api/users` | owner | `{username, password}` | `201 {user}` | owner-created account; **the only way to add an account when `ALLOW_REGISTRATION=false`**, and still available when it is true |
+| 10 | `GET /api/users` | owner | — | `{users:[{id,username,role,createdAt}]}` | minimal admin surface |
+| 11 | `GET /api/tree` | yes | — | `{folders:[FolderNode], notes:[NoteNode]}` | full tree metadata, **no content**; single query via recursive CTE; sized for MVP scale |
+| 12 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash |
+| 13 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard |
+| 14 | `DELETE /api/folders/:id` | yes | query `cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
+| 15 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root); `content` omitted → `seal('')`, never empty cipher/iv columns |
+| 16 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
+| 17 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server content |
+| 18 | `PATCH /api/notes/:id` | yes | `{name?, folderId\|null}` | `200 NoteNode` | rename / move (`folderId: null` = move to root); `notes.name` stays extension-free |
+| 19 | `DELETE /api/notes/:id` | yes | — | `204` | |
+| 20 | `GET /api/search?q=&limit=` | yes | — | `{results:[{noteId,name,folderPath,snippet,score}]}` | name match in SQL + body match after decrypt (cap 500 candidates) |
+| 21 | `GET /api/settings` / `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | `autosave`, `theme`; lands in **PR-09** (not PR-16) because PR-14 needs the flag — see both PRs |
 
 Payload cap: 1 MiB note body (Fastify `bodyLimit`, → `PAYLOAD_TOO_LARGE`); UI warns at 900 KiB.
 
@@ -530,8 +537,13 @@ home/LAN/VM network, possibly behind a reverse proxy.
   not use it: `HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`
   (Node's global `fetch`, no extra package; `init` via `docker compose` `init: true`).
 - App image contains no secrets; `DATABASE_URL`/`NOTE_ENCRYPTION_KEY` come from env/compose.
-- `scripts/check-env.ts` refuses to boot in production when: `NOTE_ENCRYPTION_KEY` missing/≠32 bytes,
-  `SESSION_TTL_DAYS` > 365, `ALLOW_REGISTRATION=true` with no `INITIAL_*` credentials set, `NODE_ENV` unset.
+- The compiled `env.ts` bootstrap (`index.ts`, PR-01 + PR-06) refuses to boot in production when:
+  `NOTE_ENCRYPTION_KEY` missing/≠32 bytes **and** `NOTE_ENCRYPTION_KEY_FILE` unset/unreadable,
+  `SESSION_TTL_DAYS` > 365, `NODE_ENV` unset, `SECURE_COOKIES=false` while `TRUST_PROXY=true`, or
+  `ALLOW_REGISTRATION=true` while `SECURE_COOKIES=false` (public sign-up over plain HTTP). The first account is
+  **always** created through `POST /api/auth/setup`; there are no `INITIAL_*` environment credentials.
+  `scripts/check-env.ts` (PR-18) applies the same rules as a dev/CI preflight with operator-facing error text;
+  neither path requires `pnpm`/`tsx` inside the runtime image — the container only runs compiled JS (PR-18).
 
 ---
 
@@ -585,8 +597,18 @@ saving/clean ──VERSION_CONFLICT──▶ conflict ──(user picks)──�
 ```
 
 - Flush triggers: debounce (default 1200 ms), `maxUnflushedMs = 10 000`, `Ctrl/Cmd+S`, note switch, folder
-  rename/move affecting the open note, `window blur`, `visibilitychange → hidden`, `pagehide`
-  (`navigator.sendBeacon` fallback where `PUT` needs the CSRF header; otherwise a synchronous-ish `fetch(keepalive:true)`).
+  rename/move affecting the open note, `window blur`, and `visibilitychange → hidden` / `pagehide` via
+  `fetch(…, { keepalive: true })` with the normal `PUT` + `X-CSRF-Token` headers.
+  **No `navigator.sendBeacon`:** it can only `POST` and cannot set headers, so it cannot carry
+  `PUT /api/notes/:id/content` with the CSRF header (§9.3). `keepalive` requests are also capped at ~64 KiB of
+  body by the browser, while notes may reach 1 MiB (§9.2), so the unload path is deliberately bounded:
+  - dirty buffer ≤ 60 KiB (safety margin): best-effort `fetch(keepalive:true)` on `pagehide`;
+  - dirty buffer > 60 KiB: **no unload write is attempted**; the ≤ 10 s force-flush plus the explicit
+    dirty-guard prompt ("Save / Discard / Stay", §11.4 last bullet) are what protect the data, and the
+    `localStorage` draft mirror (§11.2) is the crash fallback. The pill shows `Unsaved changes` so the user
+    is never told "Saved" for a buffer that could not be flushed.
+  A CSRF-exempt beacon endpoint was rejected: it would trade a small convenience for a new write path that the
+  CSRF model does not cover (recorded in `docs/ARCHITECTURE.md`).
 - Every write sends `baseVersion = lastKnownServerVersion`. On `VERSION_CONFLICT` the server returns its current
   content; the UI shows `ConflictBanner` with *Keep mine* / *Use server* / *Copy server text*, never silently overwrites.
 - `SaveStatus` pill in `StatusBar`: `Saved 12:03:11`, `Saving…`, `Unsaved changes`, `Retrying (2)…`, `Conflict`,
@@ -625,22 +647,22 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 | ID | Title | Size | Depends on | Track |
 | --- | --- | --- | --- | --- |
 | PR-01 | Monorepo scaffold, tooling, hello-world app | M | — | A Foundation |
-| PR-02 | Dev infra: Postgres in Docker, Makefile, seed | S | 01 | A |
+| PR-02 | Dev infra: Postgres in Docker, Makefile | S | 01 | A |
 | PR-03 | Real CI (replaces placeholder `CI.yml`) | M | 01 | A |
 | PR-04 | DB schema, migrations, repository harness | L | 01, 02 | B Data |
 | PR-05 | Shared contracts (Zod DTOs, error envelope, typed client) | M | 01 | B |
 | PR-06 | Envelope encryption + key mgmt + rotation | M | 04, 05 | B |
 | PR-07 | Auth core (users, sessions, cookies, CSRF, rate limit) | M | 04, 05 | C Auth |
-| PR-08 | Auth UI (setup/login, session context, UI kit) | M | 05, 07 | C |
-| PR-09 | Folders & notes CRUD API + tree | L | 05, 07 | D Domain |
+| PR-08 | Auth UI (setup/login/sign-up, session context, UI kit) | M | 05, 07 | C |
+| PR-09 | Folders & notes CRUD API + tree + settings API + seed script | L | 05, 07 | D Domain |
 | PR-10 | Note content read/write + versioning | M | 06, 09 | D |
 | PR-11 | Search API | M | 10 | D |
 | PR-12 | App shell + folder tree UI | L | 08, 09 | E UI |
 | PR-13 | Markdown editor + toolbar + preview | L | 12, 10 | E |
-| PR-14 | Autosave engine + conflict UX | M | 10, 13 | E |
-| PR-15 | New-note dialog (`new-file-<ms>.md`) | S | 12, 09 | E |
-| PR-16 | Settings (autosave, theme, password) | M | 07, 14 | E |
-| PR-17 | Search UI | S | 11, 12 | E |
+| PR-14 | Autosave engine + conflict UX | M | 10, 13, 09 | E |
+| PR-15 | New-note dialog (`new-file-<ms>.md`) | S | 12, 09, 13 | E |
+| PR-16 | Settings **UI** (autosave toggle, theme, password form) | M | 07, 09, 14 | E |
+| PR-17 | Search UI | S | 11, 12, 13 | E |
 | PR-18 | Production Docker image + compose + deploy docs | M | 01–16 | F Ship |
 | PR-19 | Playwright e2e + CI e2e job + coverage ratchet | M | 08–18 | F |
 | PR-20 | Docs pass (README, ADRs, ARCHITECTURE, AGENTS.md) | S | 18, 19 | F |
@@ -653,7 +675,8 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 - **Goal:** a cloneable repo where `pnpm i && pnpm dev` serves a page and `pnpm build` produces a deployable
   artifact; all quality gates exist from day one so later PRs can only *add* tests, never bolt on tooling.
 - **Create:** `package.json` (root, `packageManager`, workspace scripts: `dev build lint format typecheck test
-  test:integration coverage db:generate db:migrate db:seed`), `pnpm-workspace.yaml`, `tsconfig.base.json`
+  test:integration coverage`) — the DB scripts are **not** stubbed here: `db:generate`/`db:migrate` arrive with PR-04
+  and `db:seed` with PR-09, when a runner/script actually exists behind them), `pnpm-workspace.yaml`, `tsconfig.base.json`
   (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`), `biome.json`,
   `.editorconfig`, `.gitignore`, `.dockerignore`, `.nvmrc`, `LICENSE` (MIT — confirm in §21), `.env.example`,
   `apps/server/{package.json,tsconfig.json,vitest.config.ts,src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}}`,
@@ -665,21 +688,25 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 - **Tests:** `env.test.ts` (prod invariants), `app.test.ts` (`app.inject('/api/health')` = 200).
 - **Out of scope:** any DB code, any real UI.
 
-#### PR-02 — Local dev infrastructure (Postgres in Docker, Make, seed)
+#### PR-02 — Local dev infrastructure (Postgres in Docker, Make)
 **Branch:** `chore/pr-02-dev-infra` · **Size:** S · **Depends on:** PR-01
 
 - **Create:** `docker/compose.dev.yml` (`postgres:16-alpine`, named volume, `POSTGRES_*` from `.env`, healthcheck,
-  host port 5432), `Makefile` (`make db-up db-down db-reset dev build test coverage`), `scripts/seed-demo.ts`
-  (idempotent: demo user + tree) — invoked by `pnpm db:seed`.
+  host port 5432), `Makefile` (`make db-up db-down db-reset dev build test coverage` — no `db:seed` target yet, that
+  arrives with PR-09 once there is a schema and an auth service to hash the demo password with).
   Every `make` target pins the full invocation — `docker compose --env-file .env -f docker/compose.dev.yml …` —
   because Compose auto-loads `.env` from the compose file's own directory (`docker/`), not the repo root; PR-18
   follows the same rule for `docker/compose.yml`, so there is one convention to remember (see §15).
-- **Acceptance:** `make db-up && pnpm db:migrate && pnpm db:seed && pnpm dev` works from a cold clone; a README
-  "Local development" section documents the 4 commands; no committed credentials (dev defaults only); changing
-  `POSTGRES_PORT` in the repo-root `.env` actually changes the host port after `make db-up` (proves the env file is
-  really being read).
-- **Tests:** `scripts/seed-demo.ts` guarded by `NODE_ENV !== 'production'`; nothing to unit-test.
-- **Out of scope:** production image (PR-18), CI (PR-03).
+- **Acceptance:** from a cold clone (`pnpm i` only, no schema yet): `make db-up` leaves a healthy Postgres
+  (`pg_isready -h localhost -p 5432` exits 0), `make db-reset` recreates it, and `make dev` serves the hello-world
+  app + `GET /api/health` = `ok`. A README "Local development" section documents those commands; no committed
+  credentials (dev defaults only); changing `POSTGRES_PORT` in the repo-root `.env` actually changes the host port
+  after `make db-up` (proves the env file is really being read).
+- **Explicitly not asserted here:** `pnpm db:migrate` / `pnpm db:seed` — they cannot pass before PR-04 (schema,
+  drizzle config, migration runner) and PR-09 (demo user + tree). PR-04 owns the first green `db:migrate`, PR-09 owns
+  `scripts/seed-demo.ts` + `pnpm db:seed`.
+- **Tests:** nothing to unit-test (compose + make only); the `pg_isready`/`/api/health` checks above are the proof.
+- **Out of scope:** production image (PR-18), CI (PR-03), migrations (PR-04), seed data (PR-09).
 
 #### PR-03 — Real CI (replaces the placeholder workflow)
 **Branch:** `ci/pr-03-real-ci` · **Size:** M · **Depends on:** PR-01 (lands before PR-04 if possible; PR-04 can
@@ -687,12 +714,16 @@ merge with the placeholder still in place — see note)
 
 - **Modify:** `.github/workflows/CI.yml` — **delete the `placeholder` job but keep `name: CI` and the same
   triggers**, because `claude-review.yml` runs `on: workflow_run: workflows: ["CI"]`. Do not rename the workflow.
-- **Jobs:** `quality` (checkout → `pnpm/action-setup` v12 → `actions/setup-node` cache `pnpm` → `pnpm install --frozen-lockfile`
-  → `pnpm lint && pnpm typecheck`), `unit` (`pnpm coverage`, uploads `coverage/` artifact, enforces thresholds),
-  `integration` (`services: postgres:16` with healthcheck + `DATABASE_URL` → `pnpm test:integration`),
-  `build` (`pnpm build` + `docker build` smoke with `cache-from`), later PR-19 adds `e2e` (Playwright, `pnpm exec
-  playwright install --with-deps chromium`, `apps/web/dist` + API in the same job).
-- **Acceptance:** all four jobs pass on a PR that touches nothing but the workflow; `pnpm install --frozen-lockfile`
+- **Jobs shipped by this PR:** `quality` (checkout → `pnpm/action-setup` v12 → `actions/setup-node` cache `pnpm` →
+  `pnpm install --frozen-lockfile` → `pnpm lint && pnpm typecheck`), `unit` (`pnpm coverage`, uploads `coverage/`
+  artifact, enforces thresholds), `build` (`pnpm build` only — **no `docker build` yet**, because
+  `docker/Dockerfile` does not exist until PR-18).
+- **Jobs added later (same file, additive edits — the rule in §12):** `integration` is added by **PR-04** (it runs
+  `pnpm test:integration`, which needs the integration config + first tests from that PR), the `docker build` smoke
+  step is added to `build` by **PR-18**, and `e2e` (Playwright, `pnpm exec playwright install --with-deps chromium`,
+  `apps/web/dist` + API in one job) is added by **PR-19**. A job never enters `CI.yml` before the files it runs exist.
+- **Acceptance:** the three jobs this PR introduces pass on a PR that touches nothing but the workflow;
+  `pnpm install --frozen-lockfile`
   (so `pnpm-lock.yaml` must be committed); a deliberately failing test in a throwaway branch is proven red;
   concurrency + `permissions: contents: read` retained; the Claude review workflow still triggers (verify via the
   `workflow_run` listing after merge).
@@ -704,8 +735,11 @@ merge with the placeholder still in place — see note)
 - **Create:** `apps/server/drizzle.config.ts`, `db/schema.ts` (all tables + indexes from §8), `db/client.ts`,
   `db/migrate.ts` (+ wire into `index.ts` bootstrap), first migration in `migrations/`, `test/helpers/db.ts`
   (spin/truncate against `DATABASE_URL`, transaction-per-test or truncate-all fixture), `test/helpers/app.ts`,
-  `test/fixtures.ts`, `docs/DATA-MODEL.md`, repositories for `users`, `sessions`, `folders`, `notes`
+  `test/fixtures.ts` (creates users with raw schema inserts — the auth-shaped `users.repo.ts`/`sessions.repo.ts` come
+  in PR-07, per §7), `docs/DATA-MODEL.md`, repositories for `folders` and `notes`
   (notes repo initially writes/reads **plaintext** — PR-06 swaps in the envelope behind the same interface).
+  Also **modify `.github/workflows/CI.yml`** to add the `integration` job (`services: postgres:16` + `DATABASE_URL` →
+  `pnpm test:integration`) — this is the PR that makes that job meaningful (see PR-03).
 - **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB; integration tests
   prove: sibling uniqueness (folder & note), **root-level rows work** (`folders.parent_id IS NULL` and
   `notes.folder_id IS NULL` insert, and two root notes with the same name collide while a root note and a note inside
@@ -734,7 +768,8 @@ merge with the placeholder still in place — see note)
 #### PR-06 — Envelope encryption module + key management + rotation script
 **Branch:** `feat/pr-06-encryption` · **Size:** M · **Depends on:** PR-04, PR-05
 
-- **Create:** `crypto/keys.ts` (parse `NOTE_ENCRYPTION_KEY` + `NOTE_ENCRYPTION_KEY_PREVIOUS`, validate 32 bytes,
+- **Create:** `crypto/keys.ts` (parse `NOTE_ENCRYPTION_KEY` — or read the key from `NOTE_ENCRYPTION_KEY_FILE` when set, so a
+  mounted secret file works without shell interpolation — plus `NOTE_ENCRYPTION_KEY_PREVIOUS`), validate 32 bytes,
   expose `keyring`, fingerprint log), `crypto/envelope.ts` (`encrypt(plain, {keyVersion, aad}) → {cipher, iv,
   keyVersion}`, `decrypt(...)`, `sealNoteContent()/openNoteContent()`), refactor `notes.repo.ts` to store
   `content_cipher/content_iv/key_version/content_bytes/word_count`, `scripts/generate-keys.ts`,
@@ -742,7 +777,9 @@ merge with the placeholder still in place — see note)
   `.env.example` additions, ADR-0002 stub.
 - **Acceptance:** round-trip test; tamper test (flip a ciphertext byte ⇒ `decrypt` throws ⇒ API surfaces
   `INTERNAL` + logs note id, never blank content); wrong-key test; `key_version` preserved after rotation;
-  server refuses to boot in production without a valid key.
+  server refuses to boot in production when neither `NOTE_ENCRYPTION_KEY` nor a readable `NOTE_ENCRYPTION_KEY_FILE`
+  yields 32 bytes; creating a note seals the **empty string** into a valid envelope that decrypts back to the empty
+  string (the schema never holds a NULL/empty cipher or iv).
 - **Tests:** ≥ 12 unit assertions (including AAD mismatch across two note ids ⇒ decrypt fails).
 - **Out of scope:** per-user keys, KMS integration.
 
@@ -750,32 +787,51 @@ merge with the placeholder still in place — see note)
 **Branch:** `feat/pr-07-auth-api` · **Size:** M · **Depends on:** PR-04, PR-05
 
 - **Create:** `db/repositories/{users,sessions}.repo.ts` final forms, `services/auth.service.ts`,
-  `routes/auth.routes.ts` (status/setup/login/logout/session/password), `routes/users.routes.ts`,
+  `routes/auth.routes.ts` (§9.2 #2–#8: status/setup/**register**/login/logout/session/password),
+  `routes/users.routes.ts` (§9.2 #9/#10),
   `plugins/auth-guard.ts`, `plugins/csrf.ts`, `http/rate-limit.ts`, argon2 hashing utils, `auth_attempts` writes.
+  `POST /api/auth/register` exists to make `ALLOW_REGISTRATION` real: 403 when the flag is false, rate-limited like
+  login, creates `role='member'`. `GET /api/auth/status` returns `{needsSetup, registrationOpen}` so the SPA knows
+  which form to offer.
 - **Acceptance:** integration tests: first-run `needsSetup=true` → `setup` creates owner + session; `setup` after
   that ⇒ `CONFLICT`; login success/failure (uniform 401 `UNAUTHORIZED` message); cookie flags asserted in responses;
   logout invalidates (subsequent `GET /api/auth/session` → `user:null`); password change kills other sessions;
   11th bad login in 15 min ⇒ 429; missing CSRF header on a mutation ⇒ 403; session expiry honored.
+  Registration matrix (the flag must have an implementation): with `ALLOW_REGISTRATION=false`,
+  `POST /api/auth/register` ⇒ 403 and accounts can only be created by the owner via `POST /api/users`; with
+  `ALLOW_REGISTRATION=true`, `register` creates a `member` + session, `registrationOpen=true` in the status payload,
+  and `register` still never creates the first `owner` (`/setup` owns that case).
 - **Out of scope:** login UI (PR-08), passkeys (backlog), OAuth/2FA.
 
-#### PR-08 — Auth UI (setup, login, session context, route guards, UI kit v1)
+#### PR-08 — Auth UI (setup, login, sign-up, session context, route guards, UI kit v1)
 **Branch:** `feat/pr-08-auth-ui` · **Size:** M · **Depends on:** PR-05, PR-07
 *(Can start against mocked handlers right after PR-05.)*
 
-- **Create:** `routes/{setup,login}.tsx`, `features/auth/*`, `components/ui/*` (Button, Input, Field, Dialog, Menu,
+- **Create:** `routes/{setup,login}.tsx` plus `routes/signup.tsx` (rendered only when the status payload reports
+  `registrationOpen: true` and driving `POST /api/auth/register` — closing the loop PR-07 opens), `features/auth/*`,
+  `components/ui/*` (Button, Input, Field, Dialog, Menu,
   Toast, Spinner — Radix primitives + Tailwind), `StatusBar` shell stub, Tailwind theme tokens
   (light/dark via `prefers-color-scheme` default), global error/not-found boundaries.
 - **Acceptance (playwright-able):** unauth visit → `/login`; `needsSetup` → `/setup`; wrong password shows the
   server message; success lands on `/app`; refresh keeps the session; sign-out returns to `/login`;
   `/login` when authed redirects to `/app`; password inputs have labels + autocomplete attrs; Vitest component
-  tests for the form validation + error rendering.
+  tests for the form validation + error rendering. With `ALLOW_REGISTRATION=true` the login page links `/signup`
+  and the form creates a member + lands on `/app`; with the flag false, `/signup` is not reachable from the UI and a
+  direct visit redirects to `/login`.
 - **Out of scope:** the app shell content (PR-12), settings page (PR-16).
 
 #### PR-09 — Folders & notes CRUD API + tree
 **Branch:** `feat/pr-09-notes-api` · **Size:** L · **Depends on:** PR-05, PR-07 (schema from PR-04)
 
-- **Create:** `db/repositories/{folders,notes}.repo.ts` final forms, `services/{folder,note,tree}.service.ts`,
-  `routes/{tree,folders,notes}.routes.ts`, `domain/errors.ts` mappings, `domain/name.ts`.
+- **Create:** `db/repositories/{folders,notes,settings}.repo.ts` final forms,
+  `services/{folder,note,tree,settings}.service.ts`,
+  `routes/{tree,folders,notes,settings}.routes.ts`, `domain/errors.ts` mappings, `domain/name.ts`,
+  `scripts/seed-demo.ts` (idempotent demo user + tree, guarded by `NODE_ENV !== 'production'`) wired to a new
+  `pnpm db:seed` script/target — the earliest point at which a seed can hash a password (PR-07) and write real
+  `folders`/`notes` rows.
+- **Settings API lands here, not in PR-16:** `GET /api/settings` + `PATCH /api/settings` (§9.2 #21), with the
+  `settings` row created on user insert. PR-14 must honor `settings.autosave`, and PR-16 depends on PR-14, so an API
+  that only lands in PR-16 would be circular. PR-16 keeps the settings **UI** (page, theme, change-password form).
 - **Behavior:** `GET /api/tree` one recursive CTE (ordered folders-then-notes, `name` collation `C`);
   create/rename/move with sibling-uniqueness ⇒ `CONFLICT` (body carries the conflicting `id`); move-to-self/descendant
   ⇒ `CONFLICT`; delete folder requires `cascade=true` when non-empty; `POST /api/notes` with no `name` generates
@@ -841,20 +897,27 @@ merge with the placeholder still in place — see note)
 - **Out of scope:** persistence wiring (PR-14), WYSIWYG.
 
 #### PR-14 — Autosave engine + save status + conflict UX
-**Branch:** `feat/pr-14-autosave` · **Size:** M · **Depends on:** PR-10, PR-13
+**Branch:** `feat/pr-14-autosave` · **Size:** M · **Depends on:** PR-10, PR-13 (+ PR-09 for the real `settings.autosave` value — the engine itself takes it as an injected flag)
 
-- **Create:** `lib/autosave.ts` (pure state machine) + `useAutosave()` hook, `SaveStatus`, `ConflictBanner`,
-  draft mirror in `localStorage`, `visibilitychange/pagehide` flush, respect `settings.autosave`.
+- **Create:** `lib/autosave.ts` (pure state machine; `autosave: boolean` is an **injected** input, not fetched here)
+  + `useAutosave()` hook, `SaveStatus`, `ConflictBanner`,
+  draft mirror in `localStorage`, `visibilitychange`/`pagehide` flush under the §11.4 60 KiB `keepalive` budget
+  (never `sendBeacon`). The flag itself is read by the caller from `GET /api/settings` (§9.2 #21, landed in **PR-09**)
+  and injected, so this PR needs no settings UI — PR-16 supplies the real value.
 - **Acceptance (fake-timer unit tests):** typing 5× in 200 ms ⇒ exactly **one** `PUT`; no write for 2 s idle;
   force-flush at 10 s; flush on unmount; backoff schedule exact; `VERSION_CONFLICT` ⇒ conflict state and the
   buffer is retained; "Keep mine" retries with the fresh server `version`; "Use server" replaces the buffer and
-  clears the draft mirror; autosave off ⇒ zero automatic writes and the pill says so.
+  clears the draft mirror; `autosave: false` injected ⇒ zero automatic writes and the pill says so.
+  Unload path (§11.4): a 40 KiB dirty buffer on `pagehide` ⇒ exactly one `fetch(…, {keepalive:true})` `PUT` with the
+  CSRF header; a 200 KiB dirty buffer ⇒ no unload request attempted, buffer stays dirty, pill stays
+  `Unsaved changes`, dirty-guard prompt fires; `navigator.sendBeacon` is never called.
 - **Live check (documented in the PR body):** type in two tabs, save in one, observe conflict UI in the other;
   reload immediately after typing and confirm the text is present.
 - **Out of scope:** merge/diff UI (a plain three-way merge is backlog `PR-25`).
 
 #### PR-15 — New-note dialog with `new-file-<msepoch>.md` prefill
-**Branch:** `feat/pr-15-new-note` · **Size:** S · **Depends on:** PR-12, PR-09
+**Branch:** `feat/pr-15-new-note` · **Size:** S · **Depends on:** PR-12, PR-09, PR-13 — the acceptance ends with the
+new note open in the editor, so `/app/note/$noteId` must already exist
 
 - **Create:** `components/notes/NewNoteDialog.tsx`, `lib/name.ts`, wire `Ctrl/Cmd+N` + "New note" buttons in
   `TopBar`/`StatusBar`/tree context menu.
@@ -865,18 +928,21 @@ merge with the placeholder still in place — see note)
   still gets a unique name (`uniquify`).
 - **Tests:** Vitest for `lib/name.ts` + dialog behavior (prefill, suffix immutability, disabled Create).
 
-#### PR-16 — Settings (autosave toggle, theme, change password) + users API wiring
-**Branch:** `feat/pr-16-settings` · **Size:** M · **Depends on:** PR-07, PR-14
+#### PR-16 — Settings UI (autosave toggle, theme, change-password form)
+**Branch:** `feat/pr-16-settings` · **Size:** M · **Depends on:** PR-07, PR-09 (settings API), PR-14
 
-- **Create:** `routes/app/settings.tsx`, `routes/settings.routes.ts`, `db/repositories/settings.repo.ts`,
-  `features/settings/*`, settings row created on user insert, theme application (`class="dark"` on `<html>`).
+- **Create:** `routes/app/settings.tsx`, `features/settings/*`, theme application (`class="dark"` on `<html>`), and the
+  wiring that feeds `GET/PATCH /api/settings` — already shipped in **PR-09** — into `useAutosave()`. No new server
+  code here, only a regression test that the flag round-trips into the open editor.
+- **Depends on:** PR-07 (change-password endpoint), PR-09 (settings API), PR-14 (the engine that consumes the flag).
 - **Acceptance:** toggling autosave off takes effect immediately in the open editor (pill + no debounce writes);
   change-password form validates current password, forces re-login, other sessions invalidated; theme persists
   across reload and respects `system`.
 - **Out of scope:** user management UI beyond the API from PR-07.
 
 #### PR-17 — Search UI
-**Branch:** `feat/pr-17-search-ui` · **Size:** S · **Depends on:** PR-11, PR-12
+**Branch:** `feat/pr-17-search-ui` · **Size:** S · **Depends on:** PR-11, PR-12, PR-13 — a search result must open the
+note, and the note route belongs to PR-13
 
 - **Create:** `routes/app/search.tsx`, search box in `TopBar` (`Ctrl/Cmd+K` focuses the page link in MVP),
   results list with breadcrumb path + highlighted snippet, keyboard selection, empty/no-result states.
@@ -889,11 +955,18 @@ prepared earlier and rebased)
 - **Create:** `docker/Dockerfile` (stage 1 build all workspaces with dev deps + `pnpm build`; stage 2
   `node:22-slim`, `pnpm deploy --prod` or `npm ci --omit=dev` pruned install, copy `dist`/`migrations`, copy
   `apps/web/dist` into the server's static path, `USER node`, `EXPOSE 3000`, `ENTRYPOINT
-  docker/entrypoint.sh` → `scripts/check-env.ts` → `pnpm db:migrate` → `exec node apps/server/dist/index.js`),
+  `docker/entrypoint.sh` is **only** `exec node apps/server/dist/index.js` — no `pnpm`, no `tsx`, no `.ts` execution in
+  the runtime layer, because stage 2 is a pruned `node:22-slim` install with no dev toolchain. Env checks and
+  migrations run inside the compiled Node bootstrap (`env.ts` + `db/migrate.ts`, wired in PR-01/PR-04, per §6
+  "migrations run at container start before `listen()`"); `scripts/check-env.ts` stays a dev/CI convenience whose
+  rules are enforced at boot by the compiled `env.ts`),
   with `HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 CMD node -e "fetch(…/api/healthz)…"`
   — **no `curl`**: `node:22-slim` does not ship it, and installing it in the runtime layer is out of scope, so the
   probe uses Node's built-in `fetch` (see §10).
-  `docker/compose.yml` (`db` + `app`, `db` published **only** internally, `app.ports: "${PORT:-3000}:3000"`,
+  `docker/compose.yml` (`db` + `app`, `db` published **only** internally,
+  `app.ports: "${HOST_PORT:-3000}:3000"` — the **container** always listens on 3000 (`PORT` is pinned to `3000` in
+  the service `environment:` so the `HEALTHCHECK` and `EXPOSE` stay true), while `HOST_PORT` in the repo-root `.env`
+  is what an operator changes to publish the app elsewhere),
   `depends_on: condition: service_healthy`, named `pgdata` volume, optional `notes-keys` volume for a mounted key
   file, `restart: unless-stopped`, `init: true`, `db` healthcheck via `pg_isready`), `scripts/check-env.ts`,
   `docs/DEPLOY.md`
@@ -989,6 +1062,10 @@ PR-20 (docs)    ← PR-19
 | E — UI | 12, 13, 14, 15, 16, 17 | 08 (+ contract shapes of 09/10) | 12 and 15 overlap: 15 is the small dialog slice, deliberately separable |
 | F — Ship | 18, 19, 20 | merge of D+E | sequential |
 
+- **Extra edges the ASCII graph compresses** (the §12 *Depends on* lines are authoritative): PR-15 and PR-17 both
+  additionally need **PR-13** (their acceptance ends inside the note editor); PR-14 needs the settings API from
+  **PR-09**; PR-16 needs PR-09 + PR-14.
+
 **Suggested milestones (review gates):**
 
 - **M0** after PR-03: repo is clonable, CI real, `pnpm dev` serves something.
@@ -1014,16 +1091,19 @@ on:
   pull_request:
   workflow_dispatch:
 permissions: { contents: read }
-concurrency: { group: ci-${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
+concurrency: { group: "ci-${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }  # quoted, per PR-03 review
 jobs:
-  quality:      # pnpm lint && pnpm typecheck            (~40 s)
-  unit:         # pnpm coverage + artifact              (~60 s)
-  integration:  # services: postgres:16 → pnpm test:integration (~2 min)
-  build:        # pnpm build && docker build (no push)   (~3 min)
-  e2e:          # PR-19: build, start app, Playwright chromium (~4 min)
+  quality:      # pnpm lint && pnpm typecheck            (~40 s)  — PR-03
+  unit:         # pnpm coverage + artifact               (~60 s)  — PR-03
+  build:        # pnpm build                           (~2 min)   — PR-03; gains `docker build` in PR-18
+  integration:  # services: postgres:16 → pnpm test:integration (~2 min) — added by PR-04
+  e2e:          # build, start app, Playwright chromium (~4 min)  — added by PR-19
 ```
 
 Rules:
+
+- Jobs arrive incrementally with the PR that owns the files they run (PR-03 ships `quality`/`unit`/`build`; PR-04 adds
+  `integration`; PR-18 adds the `docker build` step; PR-19 adds `e2e`) — see PR-03/PR-04 in §12.
 
 - `pnpm install --frozen-lockfile` only; lockfile committed; `cache: pnpm` in `actions/setup-node`.
 - Coverage thresholds are declared in each `vitest.config.ts` (not in CI flags) so local runs match CI:
@@ -1055,27 +1135,27 @@ Rules:
 # 1. generate config in the REPO ROOT (this is the file the app and compose both read)
 printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
   'console.log(require("crypto").randomBytes(32).toString("base64"))')" > .env
-# 2. fill in POSTGRES_PASSWORD / DATABASE_URL / PORT in .env (see §16), then — always from the repo root,
+# 2. fill in POSTGRES_PASSWORD / DATABASE_URL / HOST_PORT in .env (see §16), then — always from the repo root,
 #    and always with BOTH flags (see the note below):
-docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${PORT:-3000}
+docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
 # 3. open http://<host>:3000  → /setup → create the first owner
 ```
 
 > **Why the flags are mandatory.** Compose resolves its *project directory* from the compose file's location, so
 > with `-f docker/compose.yml` it auto-loads `.env` from `docker/` — **not** from the repo root. Without
-> `--env-file .env`, `${PORT:-3000}`, `POSTGRES_PASSWORD` and the `DATABASE_URL` handed to the app silently fall
+> `--env-file .env`, `${HOST_PORT:-3000}`, `POSTGRES_PASSWORD` and the `DATABASE_URL` handed to the app silently fall
 > back to defaults/empty. Either always pass `--env-file .env` (recommended, shown above), or keep the file at
 > `docker/.env` and say so in `docs/DEPLOY.md`. `docs/DEPLOY.md` and the `Makefile` must use the identical
 > invocation; `make` targets wrap it so operators cannot get it wrong. `docker/compose.yml` additionally declares
 > `env_file: ../.env` on the `app` service so the container's own environment does not depend on the shell.
 
-- Single published port: `app.ports: ["${PORT:-3000}:3000"]` (set `PORT=8080` in the repo-root `.env` to move the
+- Single published port: `app.ports: ["${HOST_PORT:-3000}:3000"]` (set `HOST_PORT=8080` in the repo-root `.env` to move the
   host side); `db` has **no** published port.
 - Volumes: `pgdata` (Postgres). Optionally mount a key file (`secrets/note-key.txt`) instead of an env var —
-  `check-env.ts` supports `NOTE_ENCRYPTION_KEY_FILE`.
+  the compiled `crypto/keys.ts` (PR-06) resolves `NOTE_ENCRYPTION_KEY_FILE` at boot, so the file can be mounted instead of pasted into the env.
 - Updates: `git pull && docker compose --env-file .env -f docker/compose.yml build && docker compose --env-file .env
-  -f docker/compose.yml up -d` (entrypoint runs migrations first;
+  -f docker/compose.yml up -d` (the Node bootstrap runs migrations before `listen()` — the entrypoint is only `exec node …`;
   migrations must be backward-compatible within one minor release — documented rule).
 - Backups: `docker compose --env-file .env -f docker/compose.yml exec db pg_dump -U notetaker notetaker | gzip > backup.sql.gz`
   **plus the encryption
@@ -1090,17 +1170,18 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 
 | Var | Default | Prod required | Meaning |
 | --- | --- | --- | --- |
-| `NODE_ENV` | `development` | ✔ `production` | enables prod invariants in `check-env.ts` |
+| `NODE_ENV` | `development` | ✔ `production` | enables the prod invariants enforced by the compiled `env.ts` at boot |
 | `HOST` | `0.0.0.0` | — | bind address |
-| `PORT` | `3000` | — | the one published port |
+| `PORT` | `3000` | — | port the container listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid — use `HOST_PORT` to publish elsewhere |
+| `HOST_PORT` | `3000` | — | host side of the single published mapping (`"${HOST_PORT:-3000}:3000"`) — the operator-facing port knob |
 | `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ | Postgres DSN |
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
 | `SESSION_TTL_DAYS` | `30` | — | session cookie + DB expiry |
 | `SECURE_COOKIES` | `false` (dev) | ✔ `true` behind TLS | `Secure` cookie flag |
 | `TRUST_PROXY` | `false` | ✔ if behind a proxy | accurate client IPs for rate limiting |
-| `ALLOW_REGISTRATION` | `false` | — | when false, extra accounts come from `POST /api/users` (owner only) |
+| `ALLOW_REGISTRATION` | `false` | — | when true, `POST /api/auth/register` (PR-07) opens self-service sign-up; when false, accounts come only from `POST /api/users` (owner only) |
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
-| `NOTE_ENCRYPTION_KEY_FILE` | — | alternative | read the key from a mounted file |
+| `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |
 | `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
@@ -1170,7 +1251,7 @@ The MVP is done when **all** of these are true on `main`:
 | "Backend stores saved notes efficiently & securely. 2 way encrypted?" (L23) | PR-06 envelope crypto, §10 | PR-06 tests + e2e assertion that DB rows are ciphertext |
 | "Folders and notes persistence: Raw file system? or database?" (L24) | decided: Postgres — ADR-0001, PR-04 | PR-04 integration tests |
 | "Folders and filenames can be renamed" (L25) | PR-09 (`PATCH /api/folders/:id`, `PATCH /api/notes/:id`) + PR-12/PR-15 dialogs | PR-09 tests, e2e #3 |
-| "Auto-save can be enabled (default on)" (L26) | PR-14 (engine, default on), PR-16 (setting) | PR-14 unit tests, e2e #5 |
+| "Auto-save can be enabled (default on)" (L26) | PR-14 (engine, default on), PR-09 (settings API), PR-16 (setting UI) | PR-14 unit tests, e2e #5 |
 | "File names auto generated as `new-file-<msepoch>.md` … ask for file name … extension not editable" (L27) | `contracts/names.ts` (PR-05), `NewNoteDialog` (PR-15) | PR-05 + PR-15 tests, e2e #2 |
 | "Provide a text editor UI producing markdown" (L29) | PR-13 (editor + preview) | PR-13 tests, e2e #2 |
 | "'word' style with toolbar **OR** raw markdown + preview" (L30-32) | raw Markdown + toolbar + preview — ADR-0003, PR-13 | PR-13 transform tests; WYSIWYG deferred to PR-22 |
@@ -1190,7 +1271,7 @@ The MVP is done when **all** of these are true on `main`:
 | R7 | Tailwind v4 / CodeMirror API churn | Rework | Pinned versions, thin wrappers (`components/ui`, `lib/markdown.ts`), textarea fallback documented in PR-13 |
 | R8 | `pnpm` lockfile not committed → `--frozen-lockfile` fails in CI | Red CI forever | PR-01 commits `pnpm-lock.yaml`; PR-03 uses `--frozen-lockfile` |
 | R9 | Two sources of truth if someone adds FS writes later | Corrupt tree | ADR-0001 + `AGENTS.md` rule (PR-20); FS export only as read-only (PR-24) |
-| R10 | Session fixation / cookie leak on plain HTTP | Account takeover | Rotation on login, `Secure` behind TLS enforced by `check-env.ts`, `SameSite=Lax` + CSRF token (PR-07, PR-18) |
+| R10 | Session fixation / cookie leak on plain HTTP | Account takeover | Rotation on login, `Secure` behind TLS enforced by the compiled `env.ts`, `SameSite=Lax` + CSRF token (PR-07, PR-18) |
 | R11 | Scope creep (passkeys, WYSIWYG, trash) delaying MVP | Ship risk | §3.2 explicit non-goals + Track G frozen until PR-20 |
 
 ---
@@ -1201,14 +1282,16 @@ Defaults in §4 are already implemented by the PRs; these only need a *no* to ch
 
 1. **License** — MIT assumed (PR-01 adds `LICENSE`). Prefer ISC/AGPL/none?
 2. **Single-owner vs multi-user** — MVP assumes one owner created at `/setup`, extra accounts only via
-   `POST /api/users` (`ALLOW_REGISTRATION=false`). Should open registration be the default for a personal box?
+   `POST /api/users` (`ALLOW_REGISTRATION=false`, which makes `POST /api/auth/register` answer 403). Should open
+   registration be the default for a personal box? PR-07/PR-08 support either default; only the flag default changes.
 3. **Folder delete semantics** — hard delete + typed confirmation (MVP) vs soft-delete/trash (PR-23). Hard delete
    keeps the MVP small; is that acceptable?
 4. **Editor** — raw Markdown + toolbar + live preview accepted? If "Word-style" is the *primary* desire, PR-22 must
    be promoted into the MVP (+3–4 days, and PR-13 shrinks).
 5. **Unencrypted dev mode** — plaintext allowed only when `NODE_ENV=development`. OK, or should encryption be
    mandatory everywhere?
-6. **Port** — `3000` published by default; any host-port convention you want in `docs/DEPLOY.md` (e.g. `8080`)?
+6. **Port** — the container listens on `3000`; the host mapping comes from `HOST_PORT` (default `3000`). Any convention
+   you want as the documented default in `docs/DEPLOY.md` (e.g. `HOST_PORT=8080`)?
 7. **Theme/branding** — system light/dark only, or a brand color/font pass? (affects PR-08 tokens)
 8. **Password reset** — none in the MVP (no email); recovery = "delete the user row and re-run setup" documented, or
    should an admin reset flow be added (+½ day, PR-16 extension)?

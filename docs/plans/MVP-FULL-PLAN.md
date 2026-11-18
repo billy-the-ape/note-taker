@@ -194,7 +194,7 @@ exist are marked *(exists)*.
 ```
 note-taker/
 ├── README.md                                  (exists) rewritten in PR-20 (usage + self-host + roadmap)
-├── AGENTS.md / CLAUDE.md / .clinerules/*       (exists) untouched except PR-20 doc pass
+├── AGENTS.md / CLAUDE.md / .clinerules/*       (exists) — each PR that changes a command/layout updates AGENTS.md in that same PR (§1 rule); PR-20 does the consolidation pass
 ├── .github/
 │   └── workflows/
 │       ├── CI.yml                             (exists, placeholder) REPLACED in PR-03
@@ -289,7 +289,7 @@ note-taker/
     │       ├── routes/settings.routes.ts      PR-09 (consumed by PR-16 UI)
     │       ├── routes/*.test.ts               integration through `buildApp` + `app.inject()`
     │       ├── domain/errors.ts               PR-05 typed domain errors
-    │       ├── domain/name.ts                 server-side wrapper around contracts `names.ts`
+    │       ├── domain/name.ts                 PR-09 server-side wrapper around contracts `names.ts`
     │       └── test/                          PR-04 helpers: `withDb()`, `withApp()`, `fixtures.ts`
     └── web/                                   Vite + React SPA
         ├── package.json  tsconfig.json  vite.config.ts  index.html  vitest.config.ts   PR-01
@@ -359,6 +359,10 @@ CREATE TABLE users (
   updated_at        timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX users_username_lower_uidx ON users (lower(username));
+-- Exactly one owner, enforced by the DB instead of a read-then-insert race: a second concurrent /setup attempt (or a
+-- second operator who guessed the URL) hits this index and gets CONFLICT, so two owners are impossible even under a
+-- race. Owned by PR-04's schema; PR-07's acceptance includes the concurrent-setup test.
+CREATE UNIQUE INDEX users_one_owner_uidx ON users (role) WHERE role = 'owner';
 
 CREATE TABLE sessions (
   token_hash  bytea PRIMARY KEY,                         -- sha256(session_token); raw token only in the cookie
@@ -373,7 +377,7 @@ CREATE INDEX sessions_user_idx ON sessions(user_id);
 CREATE TABLE folders (
   id         uuid PRIMARY KEY,
   user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  parent_id  uuid REFERENCES folders(id) ON DELETE CASCADE,   -- NULL = root; cycle check in service layer
+  parent_id  uuid REFERENCES folders(id) ON DELETE CASCADE,   -- NULL = root; the cycle check (PR-09) runs inside a transaction that locks the moved folder and its new parent - two sibling-unique indexes cannot see a cycle, and an unlocked check loses to a concurrent move
   name       text NOT NULL CHECK (name <> ''),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -421,7 +425,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 
 | Invariant | Enforcement |
 | --- | --- |
-| Every folder/note belongs to exactly one user | `user_id` NOT NULL + `WHERE user_id = auth.userId` on **every** repository query; cross-user access returns `404`, never `403` (no enumeration). **This applies to ids arriving in bodies too** (`POST /api/notes {folderId}`, `POST /api/folders {parentId}`, `PATCH … {parentId|folderId}`): the FKs (`notes.folder_id → folders.id`, `folders.parent_id → folders.id`) do **not** carry `user_id`, so the service must load the target folder scoped to `auth.userId` and answer `404 NOT_FOUND` before inserting/moving — otherwise user A could attach rows into user B's tree, probe folder ids through FK violations, and lose rows in B's cascade delete. (Backlog alternative: composite `(user_id, id)` unique + FKs — see §12 PR-09 create list.) |
+| Every folder/note belongs to exactly one user | `user_id` NOT NULL + `WHERE user_id = auth.userId` on **every** repository query; cross-user access returns `404`, never `403` (no enumeration). **This applies to ids arriving in bodies too** (`POST /api/notes {folderId}`, `POST /api/folders {parentId}`, `PATCH … {parentId\|folderId}`): the FKs (`notes.folder_id → folders.id`, `folders.parent_id → folders.id`) do **not** carry `user_id`, so the service must load the target folder scoped to `auth.userId` and answer `404 NOT_FOUND` before inserting/moving — otherwise user A could attach rows into user B's tree, probe folder ids through FK violations, and lose rows in B's cascade delete. (Backlog alternative: composite `(user_id, id)` unique + FKs — see §12 PR-09 create list.) |
 | Sibling names unique (case-sensitive, trimmed, no `/`, no control chars, ≤ 120 chars) | DB unique index + Zod refinements in `contracts` |
 | Note name never contains the `.md` extension in the DB | `stripMd()` in `contracts/names.ts` (display adds it back via `withMd()`), applied in `note.service.ts` |
 | A folder cannot be moved inside itself | `folder.service.ts` CTE ancestor walk → `CONFLICT` |
@@ -461,7 +465,7 @@ PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` fr
 | --- | --- | --- | --- | --- | --- |
 | 1 | `GET /api/health` | none | — | `{status:'ok', db:'ok', version}` | also `GET /api/healthz` for the Docker `HEALTHCHECK` |
 | 2 | `GET /api/auth/status` | none | — | `{needsSetup:boolean, registrationOpen:boolean}` | `needsSetup` true iff `users` is empty → client routes to `/setup`; `registrationOpen` mirrors `ALLOW_REGISTRATION` → `/login` can offer "Create account" |
-| 3 | `POST /api/auth/setup` | none, **only when `needsSetup`** | `registerSchema {username, password, displayName?}` | `200 {user}` + session cookie | first-run bootstrap that creates the `owner`; returns `CONFLICT` once a user exists |
+| 3 | `POST /api/auth/setup` | none, **only when `needsSetup`** | `registerSchema {username, password, displayName?}` | `200 {user}` + session cookie | first-run bootstrap that creates the `owner`; returns `CONFLICT` once a user exists — the guarantee is the DB, not the `needsSetup` read: `users_one_owner_uidx` (§8) makes a concurrent second setup impossible |
 | 4 | `POST /api/auth/register` | none, **only when `ALLOW_REGISTRATION=true`** | `registerSchema` (no `displayName`) | `201 {user}` + session cookie | public self-sign-up, creates `role='member'`; `FORBIDDEN` when the flag is false; rate-limited + `auth_attempts` like login; cannot create an `owner` |
 | 5 | `POST /api/auth/login` | none | `{username, password}` | `200 {user}` + `note_session` cookie | argon2id verify, timing-safe dummy hash, rate-limited |
 | 6 | `POST /api/auth/logout` | yes | — | `204` | deletes session row, clears cookie |
@@ -509,6 +513,15 @@ home/LAN/VM network, possibly behind a reverse proxy.
 - Session token: 32 random bytes, base64url; DB stores `sha256(token)` only ⇒ a DB dump cannot authenticate.
 - CSRF: non-`GET` `/api/*` requests require `X-CSRF-Token` matching a non-HttpOnly `note_csrf` cookie
   (double-submit) + `Origin`/`Sec-Fetch-Site` check. SPA reads the CSRF cookie on boot (`lib/api.ts`).
+  **Lifetime, rotation and re-issue (the rules the first draft omitted — a cookie with no expiry and one issuer strands a
+  tab that outlives its token):** `note_csrf` is `SameSite=Lax`, `Path=/`, non-`HttpOnly`, `Max-Age = 1 day` (shorter
+  than the session), value = 32 random bytes base64url, and it is (re-)issued by `GET /api/auth/status` **and** by every
+  `setup`/`login`/`register`/`logout` response, so it is never older than the browser session carrying it. It stays
+  unbound to a specific `sessions` row by design — the double-submit equality plus the `Origin`/`Sec-Fetch-Site` check is
+  what does the binding in a single-instance MVP, and adding a `sessions.csrf` column is backlog. On a `403 FORBIDDEN`
+  from any mutation, `lib/api.ts` re-fetches `/api/auth/status` **once** and replays the mutation **once** before
+  surfacing the error, so a long-open tab recovers instead of failing forever (the retry rule belongs to PR-07, which
+  owns both the guard and the client contract in `contracts`).
 - Security headers via `@fastify/helmet`: `CSP` for the SPA (no `unsafe-eval`; inline styles only via nonce if
   needed), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`.
 - Markdown preview is **sanitized** (`rehype-sanitize`): no raw HTML, no `javascript:` URLs, `rel="noopener"`.
@@ -719,8 +732,12 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`), `biome.json`,
   `.editorconfig`, `.gitignore`, `.dockerignore`, `.nvmrc`, `LICENSE` (MIT — confirm in §21), `.env.example`,
   `apps/server/{package.json,tsconfig.json,vitest.config.ts,src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}}`,
-  `apps/web/{package.json,tsconfig.json,vite.config.ts,index.html,src/{main.tsx,routes/__root.tsx,styles/globals.css}}`,
+  `apps/web/{package.json,tsconfig.json,vite.config.ts,vitest.config.ts,index.html,src/{main.tsx,routes/__root.tsx,styles/globals.css}}`,
   minimal `apps/web/src/routes/index.tsx` placeholder that renders a "coming soon" card.
+  **`AGENTS.md` is updated here, not deferred:** the commands it lists for this repo become the real ones this PR
+  introduces (`pnpm i / dev / build / lint / typecheck / test`), because §1's same-PR doc rule — inherited from
+  `AGENTS.md` itself — forbids leaving it stale while PR-20 waits at the end. PR-20 then *consolidates* the accumulated
+  edits; it is not the first PR allowed to touch the file.
 - **Acceptance:** **from a bare clone with no `.env` file present**, `pnpm i && pnpm dev` boots and
   `GET /api/health` returns `{status:'ok'}` — i.e. the dev path supplies `NODE_ENV=development` on its own. The guard is
   proven **without** going through the dev script (whose inline `NODE_ENV=development` assignment would defeat any
@@ -802,7 +819,9 @@ merge with the placeholder still in place — see "Jobs added later" below)
   prove: sibling uniqueness (folder & note), **root-level rows work** (`folders.parent_id IS NULL` and
   `notes.folder_id IS NULL` insert, and two root notes with the same name collide while a root note and a note inside
   a folder do not), cascade delete of nested folders, `notes.version` conditional update
-  returns 0 rows on stale `baseVersion`, cross-user select returns nothing.
+  returns 0 rows on stale `baseVersion`, cross-user select returns nothing, and **`users_one_owner_uidx` rejects a second
+  `role='owner'` row** (a raw two-row insert raises a unique violation) — the invariant PR-07's setup-race test relies
+  on, proven here at the schema layer where it actually lives.
 - **Tests:** ≥ 15 integration assertions; the `apps/server/src/db` row of the §14 table (≥ 80% lines) is enforced here
   for the first time — by **`pnpm coverage:integration`** in the `integration` job, since these files are only exercised
   against a real DB.
@@ -930,6 +949,13 @@ merge with the placeholder still in place — see "Jobs added later" below)
   that ⇒ `CONFLICT`; login success/failure (uniform 401 `UNAUTHORIZED` message); cookie flags asserted in responses;
   logout invalidates (subsequent `GET /api/auth/session` → `user:null`); password change kills other sessions;
   11th bad login in 15 min ⇒ 429; missing CSRF header on a mutation ⇒ 403; session expiry honored.
+  **First-run race:** two `POST /api/auth/setup` calls issued concurrently against an empty DB ⇒ exactly one `200` + one
+  `CONFLICT`, and `SELECT count(*) FROM users WHERE role='owner'` is **1** (the loser is caught by
+  `users_one_owner_uidx`, §8 — proving the guard is the index and not the `needsSetup` read).
+  **CSRF lifetime/re-issue (§10):** a stale or missing `note_csrf` cookie is re-issued by `GET /api/auth/status` and by
+  every `setup`/`login`/`register`/`logout` response (assert the `Set-Cookie` on each), the cookie carries `Max-Age=1 day`,
+  and a mutation that fails the check gets `403` — with the client's one-shot refresh-and-replay covered as a unit test
+  against the shared `lib/api.ts` contract.
   Registration matrix (the flag must have an implementation): with `ALLOW_REGISTRATION=false`,
   `POST /api/auth/register` ⇒ 403 and accounts can only be created by the owner via `POST /api/users`; with
   `ALLOW_REGISTRATION=true`, `register` creates a `member` + session, `registrationOpen=true` in the status payload,
@@ -993,6 +1019,10 @@ decrypt it)
   `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
   `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
   subtree is byte-identical afterwards (§8; no FK-violation `500`, no existence oracle).
+  **Move-cycle race:** with folders `A → B` (B inside A), fire `PATCH /api/folders/A {parentId: B}` and
+  `PATCH /api/folders/B {parentId: A}` through `Promise.all`. Exactly one commit may land; afterwards the `GET /api/tree`
+  walk terminates, both folders are still reachable, and no row has the other as both ancestor and descendant — the test
+  that fails if the cycle check is a plain read-then-write instead of a locked transaction (behavior bullet above).
   **The route-level crypto assertions live here, not in PR-06** — this is the first PR whose routes make them
   measurable: `POST /api/notes` with no content stores a real envelope and `GET /api/notes/:id` answers `content: ''`
   (PR-06's empty-string seal, proven over HTTP); and a row whose ciphertext fails authentication — forced by rewriting the
@@ -1075,6 +1105,12 @@ decrypt it)
   Unload path (§11.4): a 40 KiB dirty buffer on `pagehide` ⇒ exactly one `fetch(…, {keepalive:true})` `PUT` with the
   CSRF header; a 200 KiB dirty buffer ⇒ no unload request attempted, buffer stays dirty, pill stays
   `Unsaved changes`, dirty-guard prompt fires; `navigator.sendBeacon` is never called.
+  **Every row of the A.5 table is asserted**, which means at least: an edit landing *while* a `PUT` is in flight ⇒ still
+  exactly one in-flight request, and a second `PUT` fires afterwards carrying the newest buffer + newest `version`
+  (nothing typed is lost, no two writes ever race each other); `500`/transport error ⇒ `retrying` with the documented
+  backoff then a terminal state; `401` ⇒ autosave stops, the app routes to `/login`, the draft mirror still holds the
+  text; `403` ⇒ one CSRF refresh + one replay, then surface it; `404` ⇒ the "note deleted elsewhere" state with a
+  save-as-new-note escape hatch, never a silent re-create.
 - **Live check (documented in the PR body):** type in two tabs, save in one, observe conflict UI in the other;
   reload immediately after typing and confirm the text is present.
 - **Out of scope:** merge/diff UI (a plain three-way merge is backlog `PR-25`).
@@ -1100,7 +1136,9 @@ new note open in the editor, so `/app/note/$noteId` must already exist
   code here, only a regression test that the flag round-trips into the open editor.
 - **Depends on:** PR-07 (change-password endpoint), PR-09 (settings API), PR-14 (the engine that consumes the flag).
 - **Acceptance:** toggling autosave off takes effect immediately in the open editor (pill + no debounce writes);
-  change-password form validates current password, forces re-login, other sessions invalidated; the "sign out everywhere"
+  change-password form validates the current password; the **current session is rotated and survives** — no forced
+  re-login, per §9.2 #9 ("rotates + deletes all other sessions"), §10 and PR-07 — while every **other** session of that
+  user is deleted, so another tab fails on its next request; the "sign out everywhere"
   control calls `POST /api/auth/logout-all` (§9.2 #7), lands on `/login`, and invalidates every other tab on its next
   request; theme persists across reload and respects `system`.
 - **Out of scope:** user management UI beyond the API from PR-07.
@@ -1157,9 +1195,12 @@ prepared earlier and rebased)
   `NOTE_ENCRYPTION_KEY` is missing in production.
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
   the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
-  notetaker notetaker_restore` — the scratch DB must exist before the pipe can succeed; `gunzip -c backup.sql.gz |
-  docker compose … exec -T db psql -U notetaker -d notetaker_restore`; then the app started against it with a one-off
-  `DATABASE_URL` override and the same `NOTE_ENCRYPTION_KEY`, and a note read back); the
+  "$POSTGRES_USER" "${POSTGRES_DB}_restore"` — the scratch DB must exist before the pipe can succeed; `gunzip -c
+  backup-<date>.sql.gz | docker compose … exec -T db psql -U "$POSTGRES_USER" -d "${POSTGRES_DB}_restore"`; then the app
+  started against it with a one-off `DATABASE_URL` override plus an explicit `-p 127.0.0.1:3100:3000` and `run -d`
+  (because `run` publishes none of the service's ports), the same `NOTE_ENCRYPTION_KEY`, and a note read back at
+  `http://127.0.0.1:3100`) — every command run **after** `set -a; . ./.env; set +a`, because `--env-file` feeds Compose's
+  interpolation and never the shell; the
   key-rotation drill from §15 — edit `.env` (new key + bumped
   `NOTE_ENCRYPTION_KEY_VERSION` + old key appended to `_PREVIOUS`), `up -d`, then
   `docker compose … exec app node apps/server/dist/scripts/rotate-note-key.js --dry-run` → real run → `--verify` exits 0,
@@ -1197,9 +1238,10 @@ prepared earlier and rebased)
   configuration table link, security notes (encryption at rest + key-loss caveat), roadmap link to this plan, and a
   short "what the MVP deliberately does not do" list.
 - **Create:** `docs/adr/0001…0005` (one per decision in §4/§5), `docs/ARCHITECTURE.md` (condensed §6–§11 with the
-  *as-built* deltas), `docs/API.md` final sweep; **update `AGENTS.md`** with the real commands
-  (`pnpm dev/build/lint/typecheck/test/test:integration/coverage`, `make db-up`) and the layout conventions from §7
-  (per `AGENTS.md`'s own rule: docs updated in the same PR as the change).
+  *as-built* deltas), `docs/API.md` final sweep; **consolidate `AGENTS.md`** — every earlier PR already updated the
+  commands it changed (PR-01 seeds that file, per §1's same-PR rule), so this PR reconciles those accumulated edits into
+  one coherent list (`pnpm dev/build/lint/typecheck/test/test:integration/coverage`, `make db-up`) plus the layout
+  conventions from §7.
 - **Acceptance:** every command in the docs was executed successfully in the PR environment; no TODO/placeholder
   left in docs; links between docs resolve (checked with a simple grep for relative links).
 
@@ -1341,7 +1383,9 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
   'console.log(require("crypto").randomBytes(32).toString("base64"))')" > .env
 #    NODE_ENV needs no entry here: the production image bakes ENV NODE_ENV=production into stage 2 and compose
 #    repeats it in the app service's environment block (§16 explains who sets what).
-# 2. fill in POSTGRES_PASSWORD / DATABASE_URL / HOST_PORT in .env (see §16), then — always from the repo root,
+# 2. fill in POSTGRES_PASSWORD / HOST_PORT in .env (DATABASE_URL is derived by compose; see §16), then — always from the repo root,
+#    DATABASE_URL in .env only matters when running the API on the host, outside compose: the app service's
+#    environment: block sets it from the POSTGRES_* values and takes precedence over env_file:.
 #    and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
@@ -1368,22 +1412,34 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 - Updates: `git pull && docker compose --env-file .env -f docker/compose.yml build && docker compose --env-file .env
   -f docker/compose.yml up -d` (the Node bootstrap runs migrations before `listen()` — the entrypoint is only `exec node …`;
   migrations must be backward-compatible within one minor release — documented rule).
-- Backups: `docker compose --env-file .env -f docker/compose.yml exec -T db pg_dump -U notetaker notetaker | gzip > backup.sql.gz` (`-T` is mandatory: `docker compose exec` allocates a TTY by default, which CRLF-translates the dump and corrupts it)
+- **Operator shell convention (applies to every command in this runbook):** `set -a; . ./.env; set +a` **first**.
+  `--env-file .env` feeds Compose's *own* variable interpolation only — it never populates the shell, so a bare
+  `$POSTGRES_PASSWORD` typed at the prompt expands to empty and the DSN silently becomes `postgres://notetaker:@db:5432/…`
+  (auth failure). And **never hardcode `notetaker`** in these commands: `POSTGRES_USER`/`POSTGRES_DB` are configurable
+  (§16), so use `"$POSTGRES_USER"` / `"$POSTGRES_DB"`.
+- Backups: `docker compose --env-file .env -f docker/compose.yml exec -T db pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" | gzip > "backup-$(date +%F).sql.gz"` (`-T` is mandatory: `docker compose exec` allocates a TTY by default, which CRLF-translates the dump and corrupts it)
   **plus the encryption key** (`.env`, or the mounted key file, or `.dev/note-key` in dev). The restore and the
   **key-rotation procedure** are documented in `docs/DEPLOY.md`; the rotation runbook is spelled out below.
-- **Restore drill (PR-18 acceptance, and the procedure `docs/DEPLOY.md` must contain).** The scratch database has to
-  **exist before anything can be piped into it** — `psql -d notetaker_restore` alone dies with
-  `database "notetaker_restore" does not exist`:
-  1. `docker compose --env-file .env -f docker/compose.yml exec -T db createdb -U notetaker notetaker_restore`
-     — same `db` container, never over the live `notetaker` DB. Do **not** try the "rename `POSTGRES_DB`" route: the
+- **Restore drill (PR-18 acceptance, and the procedure `docs/DEPLOY.md` must contain).** After the shell convention
+  above, four ordered steps. The scratch database must **exist before anything is piped into it** — `psql -d …_restore`
+  alone dies with `database "…_restore" does not exist`:
+  1. `docker compose --env-file .env -f docker/compose.yml exec -T db createdb -U "$POSTGRES_USER" "${POSTGRES_DB}_restore"`
+     — same `db` container, never over the live `$POSTGRES_DB`. Do **not** try the "rename `POSTGRES_DB`" route: the
      postgres image reads `POSTGRES_DB` only while initializing an **empty** data directory, so it does nothing to an
      existing `pgdata` volume;
-  2. `gunzip -c backup.sql.gz | docker compose --env-file .env -f docker/compose.yml exec -T db psql -U notetaker -d notetaker_restore -v ON_ERROR_STOP=1`;
-  3. point the **app** at the scratch DB explicitly — `compose.yml` derives `DATABASE_URL` from `$POSTGRES_DB`, so the
-     drill must override it:
-     `docker compose --env-file .env -f docker/compose.yml run --rm -T -e DATABASE_URL=postgres://notetaker:$POSTGRES_PASSWORD@db:5432/notetaker_restore app`
-     (started with the **same** `NOTE_ENCRYPTION_KEY`, or every note decrypts to garbage and the drill proves nothing);
-  4. log in on that throwaway instance and read a note back, then `exec -T db dropdb -U notetaker notetaker_restore`.
+  2. `gunzip -c backup-<date>.sql.gz | docker compose --env-file .env -f docker/compose.yml exec -T db psql -U "$POSTGRES_USER" -d "${POSTGRES_DB}_restore" -v ON_ERROR_STOP=1`;
+  3. start the **app** against the scratch DB. `compose.yml` derives `DATABASE_URL` from `$POSTGRES_DB`, so the drill has
+     to override it — and `docker compose run` **publishes none of the service's `ports:`** by default (that is how it
+     avoids colliding with the live app), so the drill must map a port explicitly with `-p`, and must run **detached**
+     (or in a second terminal) because step 4 needs the process still alive:
+     `docker compose --env-file .env -f docker/compose.yml run -d --rm --name restore-drill -p 127.0.0.1:3100:3000 -e DATABASE_URL="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/${POSTGRES_DB}_restore" app`
+     — with the **same** `NOTE_ENCRYPTION_KEY`, or every note decrypts to garbage and the drill proves nothing. `run -e`
+     overrides the service's `environment:` mapping; confirm that with
+     `docker compose --env-file .env -f docker/compose.yml exec restore-drill printenv DATABASE_URL` before trusting a
+     green run;
+  4. open `http://127.0.0.1:3100`, log in, and read a note back; then `docker compose --env-file .env -f docker/compose.yml stop restore-drill`
+     (`--rm` removes the container) and
+     `docker compose --env-file .env -f docker/compose.yml exec -T db dropdb -U "$POSTGRES_USER" "${POSTGRES_DB}_restore"`.
   The drill must consume exactly the artifact the backup step produces, `gzip` included — an ungzipped or TTY-corrupted
   dump failing at step 2 is the point of the drill.
 
@@ -1425,7 +1481,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; `DATABASE_URL` must embed the same value |
 | `POSTGRES_DB` | `notetaker` | dev compose | database created by the `db` image's first init |
 | `POSTGRES_PORT` | `5432` | — | host port published for the **dev** compose `db` only (`docker/compose.dev.yml`); the prod `db` publishes nothing |
-| `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ | Postgres DSN. In the container stack the host part must be the service name (`…@db:5432/notetaker`) — `docker/compose.yml` sets it in the `app` service `environment:` block (which takes precedence over `env_file:`) so the repo-root value never points at `localhost` inside the container; the `localhost` default is for running the API on the host against the dev compose DB |
+| `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ **only when the API runs outside compose** | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2); the `localhost` default is the value for running the API on the host against the dev compose DB. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB |
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
 | `SESSION_TTL_DAYS` | `30` | — | session cookie + DB expiry |
 | `SECURE_COOKIES` | `false` (dev) | ✔ `true` behind TLS | `Secure` cookie flag |
@@ -1621,8 +1677,22 @@ export function seal(plain: string, noteId: string, keyring: Keyring) {
 nested structure client-side by `features/tree/tree.selectors.ts`.
 
 **A.5 Autosave state machine shape (`lib/autosave.ts`)** — `createAutosaver({debounceMs, maxUnflushedMs, settings,
-save})` returning `{ onEdit(), flush(), state: 'clean'|'dirty'|'saving'|'retrying'|'conflict', conflict }`; the hook
-only subscribes React to it, which is what makes the 6 behaviors in PR-14 unit-testable without a DOM.
+save})` returning `{ onEdit(), flush(), state, conflict, error }`. States and the transitions the first draft left
+implicit (PR-14's unit tests enumerate exactly this table):
+
+| state | entered when | exits to |
+| --- | --- | --- |
+| `clean` | buffer equals the last saved content | `dirty` on `onEdit()` |
+| `dirty` | an edit landed, debounce running | `saving` when the debounce fires or `flush()` is called |
+| `saving` | one `PUT` is in flight carrying `baseVersion = v` | `clean` (200 ⇒ adopt the returned `version`) · `conflict` (`VERSION_CONFLICT`) · `retrying` (5xx / transport) · `error` (401 / 403 / 404) · **`dirty` if `onEdit()` fired while the request was in flight** |
+| `retrying` | 5xx or a transport error | `saving` on the backoff timer; `conflict`/`error` once the retry budget is spent |
+| `conflict` | `VERSION_CONFLICT` — buffer retained, autosave paused | "Keep mine" ⇒ `saving` with the fresh server `version`; "Use server" ⇒ `clean` |
+| `error` | `401` (session gone ⇒ stop autosaving, route to `/login`, the `localStorage` draft mirror keeps the text) · `403` after the one CSRF refresh-and-replay (§10) · `404` (note deleted elsewhere ⇒ offer "save as a new note") | manual retry, or `dirty` on the next edit for the 403 case |
+
+**Two rules that make the table safe:** at most **one** request may be in flight, and an edit arriving during `saving` is
+never dropped and never starts a parallel request — it parks the machine in `dirty`, and the next debounce window opens
+when the in-flight request settles, always sending the newest buffer with the newest known `version`. The hook only
+subscribes React to this machine, which is what keeps every row of the table unit-testable without a DOM.
 
 ---
 

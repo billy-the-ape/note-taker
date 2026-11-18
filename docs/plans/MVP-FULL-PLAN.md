@@ -296,7 +296,8 @@ note-taker/
     └── web/                                   Vite + React SPA
         ├── package.json  tsconfig.json  vite.config.ts  index.html  vitest.config.ts   PR-01
         ├── playwright.config.ts               PR-19
-        ├── e2e/                               PR-19 auth.spec.ts, notes.spec.ts, autosave.spec.ts, folders.spec.ts
+        ├── e2e/                               PR-19 auth.spec.ts, notes.spec.ts, autosave.spec.ts,
+        │                                    folders.spec.ts, db.ts (test-only postgres.js reader, scenario 7)
         └── src/
             ├── main.tsx                       PR-01 (Router + QueryClient + providers)
             ├── styles/globals.css             PR-01 (Tailwind v4 @theme tokens)
@@ -306,7 +307,7 @@ note-taker/
             ├── routes/setup.tsx               PR-08 first-run account creation
             ├── routes/welcome.tsx             PR-08 signed-in placeholder home (deleted by PR-12)
             ├── routes/signup.tsx              PR-08 self-sign-up form (only when `registrationOpen` AND `!needsSetup`)
-            ├── routes/app/__layout.tsx        PR-12 auth guard + AppShell outlet
+            ├── routes/app/route.tsx           PR-12 layout route (auth guard + AppShell outlet)
             ├── routes/app/index.tsx           PR-12 "no note selected" / recent notes
             ├── routes/app/note.$noteId.tsx    PR-13/14 editor page
             ├── routes/app/settings.tsx        PR-16
@@ -629,7 +630,10 @@ home/LAN/VM network, possibly behind a reverse proxy.
 | `/app/settings` | auth | autosave toggle, theme, change password, sign out all sessions |
 | `*` | — | redirect: authed → `/app` (`/welcome` until PR-12 creates it), else → `/login` or `/setup` |
 
-Route guards live in `routes/app/__layout.tsx` (`beforeLoad` reads the session context) — never per-page. Until PR-12
+Route guards live in `routes/app/route.tsx` (`beforeLoad` reads the session context) — never per-page. **That file name is
+TanStack Router's own convention:** in file-based routing a directory's layout route is `route.tsx` inside it
+(`routes/app/route.tsx` wraps `index.tsx`, `note.$noteId.tsx`, `settings.tsx`, `search.tsx`); `__layout.tsx` is the
+Next.js App Router habit and is not what the router's plug-in picks up. Until PR-12
 creates that layout, the authed redirect target is `/welcome` (created in PR-08, replaced in PR-12), which keeps
 PR-08's acceptance testable on its own.
 
@@ -1071,7 +1075,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   note written with a generated key is unreadable after the key file is deleted, which is the documented dev caveat.
 - **Tests:** ≥ 12 unit assertions (including AAD mismatch across two note ids ⇒ `decrypt()` fails) **plus the
   rotation-concurrency integration test**, driven through the layer this PR actually has: two writers against a real DB,
-  `rotate-note-key.ts` running while a second writer calls the **repository's conditional update** (the A.2 shape —
+  `rotate-note-key.ts` running as a **tsx subprocess — not `dist/scripts/rotate-note-key.js`**, because the `integration`
+  job runs `pnpm build:packages` only (§14) and the compiled form is not on disk there; the compiled `.js` is asserted
+  where a real build exists (the `build` job, and PR-18's image copy). The race itself: `rotate-note-key.ts` runs while a
+  second writer calls the **repository's conditional update** (the A.2 shape —
   `UPDATE notes SET … WHERE id=$1 AND version=$2`, the very statement PR-10's route will wrap) on the same row. Assert
   the note's final content is the *writer's* (not the script's stale buffer), sealed at the current `key_version`,
   `notes.version` incremented exactly once, and `--verify` exits 0 afterwards. Without the row lock / conditional write
@@ -1132,7 +1139,9 @@ merge with the placeholder still in place — see "Jobs added later" below)
   transaction — and a user insert that is rolled back leaves no orphan settings row behind. Asserted here, not in PR-09:
   PR-07 owns every account-creating path and merges first, while PR-09's `GET /api/settings`, PR-14's autosave flag and
   PR-16's UI are the consumers that assume the row already exists.
-  `reset-password.ts` (executed as a subprocess against the test DB): unknown username ⇒ non-zero exit and no writes;
+  `reset-password.ts` (executed as a **tsx subprocess** against the test DB — same integration-job build rule as PR-06's
+  rotation test, §14: `build:packages` only, so nothing here may assume `dist/scripts/`): unknown username ⇒ non-zero
+  exit and no writes;
   success ⇒ the new password logs in, **all** of that user's sessions are gone, and that user's
   `folders`/`notes`/`settings` rows are untouched — the regression guard against anyone "simplifying" recovery into
   deleting the user row.
@@ -1159,7 +1168,7 @@ merge with the placeholder still in place — see "Jobs added later" below)
   lands on `/welcome`; with the flag false, `/signup` is not reachable from the UI and a direct visit redirects to `/login`;
   on a **fresh install** (flag true, `needsSetup: true`) the link is hidden too and a direct `/signup` visit redirects to
   `/setup` — the UI mirror of PR-07's 403, so nobody can walk into the no-owner dead end through the browser.
-- **Out of scope:** the `/app` shell, `routes/app/__layout.tsx` and every `/app` assertion (PR-12, which also deletes
+- **Out of scope:** the `/app` shell, `routes/app/route.tsx` and every `/app` assertion (PR-12, which also deletes
   `routes/welcome.tsx`), settings page (PR-16).
 
 #### PR-09 — Folders & notes CRUD API + tree
@@ -1272,7 +1281,7 @@ decrypt it)
 **Branch:** `feat/pr-12-tree-ui` · **Size:** L · **Depends on:** PR-08, PR-09
 *(Mocks acceptable: `msw`-style handlers built from `packages/contracts` let this start right after PR-09.)*
 
-- **Create:** `routes/app/{__layout,index}.tsx`, `components/layout/{AppShell,Sidebar,TopBar,StatusBar}.tsx`,
+- **Create:** `routes/app/{route,index}.tsx`, `components/layout/{AppShell,Sidebar,TopBar,StatusBar}.tsx`,
   `components/tree/*`, `features/tree/*`, `components/notes/{RenameDialog,MoveDialog,DeleteConfirm}.tsx`
   (shared dialog forms), `plugins/static-spa.ts` on the server so a built SPA is served from the API port. This PR also
   **deletes `routes/welcome.tsx`** and repoints every authed landing/redirect at `/app` — the hand-off from PR-08's
@@ -1386,7 +1395,10 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   with `HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 CMD node -e "fetch(…/api/healthz)…"`
   — **no `curl`**: `node:22-slim` does not ship it, and installing it in the runtime layer is out of scope, so the
   probe uses Node's built-in `fetch` (see §10).
-  `docker/compose.yml` (`db` + `app`, `db` published **only** internally,
+  `docker/compose.yml` (`db` + `app`, `db` published **only** internally, the `app` service carrying
+  `NOTE_ENCRYPTION_KEY: ${NOTE_ENCRYPTION_KEY:?set NOTE_ENCRYPTION_KEY in the repo-root .env}` so a missing key makes
+  `docker compose config` fail at parse time with that sentence instead of handing the container an empty value — this
+  is what §15 step 2b's toolchain-free preflight runs on, and it also arms the §10 boot guard by construction,
   `app.ports: "${HOST_PORT:-3000}:3000"` — the **container** always listens on 3000 (`PORT` is pinned to `3000` in
   the service `environment:` so the `HEALTHCHECK` and `EXPOSE` stay true), while `HOST_PORT` in the repo-root `.env`
   is what an operator changes to publish the app elsewhere),
@@ -1410,8 +1422,13 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
   `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
-  `NOTE_ENCRYPTION_KEY` is missing in production. Also asserted on the host side: `pnpm check:env` — defined as
-  `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero listing the same missing
+  `NOTE_ENCRYPTION_KEY` is missing in production — **and** on that same clean VM, with nothing on it but Docker,
+  `docker compose --env-file .env -f docker/compose.yml config` exits non-zero naming the variable without creating a
+  single container: that is the form §15 step 2b runs, backed by `${NOTE_ENCRYPTION_KEY:?…}` in the app service. The
+  dev/CI form is asserted **in the CI `build` job**, where the repo toolchain exists and never from the runbook: `pnpm
+  check:env`, run against two fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
+  environment — defined as `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero
+  listing the same missing
   variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. Two details make that
   exit-0 reachable and are asserted explicitly: the `.env` under test has **no `NODE_ENV` entry** (the preflight's mode
   comes from its script line, §16) and **no `DATABASE_URL` line** — the runbook's file carries the `POSTGRES_*` trio,
@@ -1449,7 +1466,13 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   inherits an unset `NODE_ENV` dies on the §10 boot guard before any spec runs,
   `NOTE_ENCRYPTION_KEY` a non-secret test constant supplied as **job env in CI** — exactly as §17 says — and, for local
   runs only, via a gitignored `.env.test` carrying that same throwaway value),
-  `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, CI `e2e` job.
+  `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, CI `e2e` job, and **`e2e/db.ts`** — a
+  test-only Postgres reader for scenario 7, written against **`postgres` (postgres.js), the driver §4 already chose and
+  PR-04 put in `apps/server`'s dependencies** — not a second `pg` client. Because pnpm does not expose one workspace's
+  dependencies to another, PR-19 declares `postgres` as a **devDependency of `apps/web` at the version PR-04 pinned**, so
+  the assertion cannot drift onto a different driver and nothing production-facing gains a DB client. Playwright specs run
+  in Node, so it connects directly to the same throwaway `notetaker_test` DSN the `webServer` is given (§17); it is
+  read-only and is never imported by app code.
 - **Scenarios (the MVP acceptance proof):**
   1. first run → `/setup` → owner created → lands on `/app`; sign out → `/login` → sign in.
   2. create folder → create note (assert prefilled `new-file-<ms>.md` and immutable `.md`) → type a heading + a
@@ -1459,7 +1482,17 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   5. autosave: pause 1.5 s after typing — deliberately past the 1200 ms debounce (§11.4) — status pill shows `Saved`; toggle autosave off in settings ⇒ pill shows
      `Unsaved changes` until `Ctrl+S`.
   6. two pages, same note ⇒ conflict UI in the stale page, no silent overwrite.
-- **Acceptance:** green in CI on `ubuntu-24.04` with the `postgres` service; retries ≤ 1 and the suite is proven
+  7. **at-rest ciphertext — the DB leg of §17's MVP proof, and the only place the README's "encrypted" requirement is
+     checked end-to-end:** after scenario 2's body has saved, read that note's row through `e2e/db.ts` and assert the
+     typed marker string appears **nowhere** in `content_cipher` (compared as raw bytes, since it is `bytea`), that
+     `content_cipher` is non-empty and `content_iv` is exactly 12 bytes (§8), and that `key_version` equals the current
+     `NOTE_ENCRYPTION_KEY_VERSION`. Then re-save an unchanged body and assert the ciphertext **changed** — the fresh
+     per-write IV (§10) — which is what stops this scenario passing by comparing a stored copy of the plaintext. It
+     asserts the accepted opposite too: `notes.name` stays plaintext on purpose (§10's search limitation), so a reader
+     of this spec sees both halves of the guarantee instead of one of them silently.
+- **Acceptance:** green in CI on `ubuntu-24.04` with the `postgres` service; scenario 7 is the row §19 cites for
+  "DB rows are ciphertext" and the §17 proof's DB leg, so it may not be skipped or marked fixme — a run where it does
+  not execute is a red build; retries ≤ 1 and the suite is proven
   non-flaky across 3 consecutive runs; the after-PR-19 column of the §14 table is applied to **both** coverage configs —
   the unit thresholds in `pnpm coverage` and the DB-backed ones in the `integration` job's `pnpm coverage:integration`.
 
@@ -1652,10 +1685,14 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
 #    DATABASE_URL needs no entry — the app service's environment: block derives it from these same values and takes
 #    precedence over env_file:. On the host the same derivation happens in env.ts's databaseUrl() when the variable
 #    is unset (§16); writing DATABASE_URL into this file freezes it against later POSTGRES_* edits.
-# 2b. preflight the file before touching Docker — reads .env, takes its mode from its own script line, and
-#     accepts either DATABASE_URL or the complete POSTGRES_* trio above (§10, §16). Exits non-zero with
-#     operator-facing text if the key or the DSN inputs are missing.
-pnpm check:env
+# 2b. preflight the file with Docker alone. §3 keeps scripts/ dev/CI-only, and this host may have no Node at all
+#     (step 1 uses `docker run node:22-slim` for exactly that reason), so the check is Compose's own: the app
+#     service demands the key with ${NOTE_ENCRYPTION_KEY:?…} (§15's compose note), so a missing key fails here,
+#     before any container is created, naming the variable. It resolves the whole file — interpolation, the
+#     POSTGRES_* trio, quoting — but NOT the semantic rules (DSN shape, TTL, cookie flags); those belong to the
+#     boot guard, and if the container below ever fails to come up healthy, its operator-facing text is one
+#     `docker compose --env-file .env -f docker/compose.yml logs app` away.
+docker compose --env-file .env -f docker/compose.yml config >/dev/null
 #    Then — always from the repo root, and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
@@ -1672,7 +1709,13 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 > service `environment:` block sets `DATABASE_URL` to
 > `postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB`, so the DSN is derived from the same `POSTGRES_*`
 > values the `db` container initializes with — host is the service name `db` (never `localhost`, which only exists on a
-> developer machine). `NODE_ENV=production` is set in the same block, so the three `POSTGRES_*` values the operator writes
+> developer machine). `NODE_ENV=production` is set in the same block, and so is
+> `NOTE_ENCRYPTION_KEY: ${NOTE_ENCRYPTION_KEY:?set NOTE_ENCRYPTION_KEY in the repo-root .env}` — required, no default,
+> which is what turns §15 step 2b's `docker compose config` into a real preflight on a host with no Node: Compose
+> refuses to resolve the file instead of handing the container an empty key. (The mounted-key-file variant below is
+> already an edit to this file — volume plus `NOTE_ENCRYPTION_KEY_FILE` — and removing this `:?` line is part of that
+> edit, because an either/or is not something Compose interpolation can express.) So the three `POSTGRES_*` values
+> the operator writes
 > into `.env` (plus `NOTE_ENCRYPTION_KEY` and, optionally, `HOST_PORT`) are the entire compose-level contract; §16
 > lists who sets what — `NODE_ENV` is **not** one of them, the image and the `app` service set it.
 > `POSTGRES_PORT` is **dev-only** — it appears solely in `docker/compose.dev.yml`, never in the prod file.
@@ -1864,6 +1907,8 @@ the plan states the mechanism instead of leaving it implicit:
 **The MVP proof (must be demonstrated, PR-19):** open the app → set up → create nested folders → create a note
 (auto-named) → write Markdown using the toolbar → see the preview → close the tab mid-edit → reopen → the text is
 there → the DB contains only ciphertext for that note → rename/move/delete behave → logout/login restores state.
+The middle step is not a screenshot: it is PR-19's **scenario 7**, which reads the row over a test-only postgres.js
+connection, and it is the only end-to-end evidence for the README's "securely / 2-way encrypted" requirement (§19).
 
 Determinism rules: `test/helpers/db.ts` truncates in dependency-safe order between tests; time-dependent tests use
 `vi.useFakeTimers()`; e2e uses a dedicated `notetaker_test` DB and a fixed test `NOTE_ENCRYPTION_KEY` supplied by
@@ -1905,7 +1950,7 @@ The MVP is done when **all** of these are true on `main`:
 | "very basic authentication, username+password" (L19) | PR-07 (core) + PR-08 (UI) | PR-07 integration tests, PR-19 e2e #1 |
 | "passkey as alternative … not needed for mvp" (L20) | deferred → PR-21, schema leaves room via `role`/credential tables | backlog recorded |
 | "Manage markdown notes, saving them in a folder structure" (L22) | PR-04 (`folders`/`notes`), PR-09 (API), PR-12 (tree UI) | PR-09 + PR-19 e2e #2/#3/#4 |
-| "Backend stores saved notes efficiently & securely. 2 way encrypted?" (L23) | PR-06 envelope crypto, §10 | PR-06 tests + e2e assertion that DB rows are ciphertext |
+| "Backend stores saved notes efficiently & securely. 2 way encrypted?" (L23) | PR-06 envelope crypto, §10 | PR-06 unit/integration tests + **PR-19 scenario 7** (row read through `e2e/db.ts`: no plaintext in `content_cipher`, 12-byte IV, current `key_version`, ciphertext changes on re-seal) |
 | "Folders and notes persistence: Raw file system? or database?" (L24) | decided: Postgres — ADR-0001, PR-04 | PR-04 integration tests |
 | "Folders and filenames can be renamed" (L25) | PR-09 (`PATCH /api/folders/:id`, `PATCH /api/notes/:id`) + PR-12/PR-15 dialogs | PR-09 tests, e2e #3 |
 | "Auto-save can be enabled (default on)" (L26) | PR-14 (engine, default on), PR-09 (settings API), PR-16 (setting UI) | PR-14 unit tests, e2e #5 |

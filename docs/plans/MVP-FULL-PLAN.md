@@ -1230,7 +1230,10 @@ prepared earlier and rebased)
   backup-<date>.sql.gz | docker compose … exec -T db psql -U "$POSTGRES_USER" -d "${POSTGRES_DB}_restore"`; then the app
   started against it with a one-off `DATABASE_URL` override plus an explicit `-p 127.0.0.1:3100:3000` and `run -d`
   (because `run` publishes none of the service's ports), the same `NOTE_ENCRYPTION_KEY`, and a note read back at
-  `http://127.0.0.1:3100`) — every command run **after** `set -a; . ./.env; set +a`, because `--env-file` feeds Compose's
+  `http://127.0.0.1:3100` — using §15's step-3/step-4 commands **exactly as written**, i.e. plain `docker exec
+  restore-drill …` and `docker stop restore-drill`, because `docker compose exec|stop` take a service name and
+  `docker compose stop app` would stop the live app mid-drill — every command run **after** `set -a; . ./.env; set +a`,
+  because `--env-file` feeds Compose's
   interpolation and never the shell, and run against a `.env` carrying **all three** `POSTGRES_USER`/`POSTGRES_DB`/
   `POSTGRES_PASSWORD` values (§15 step 2): with any of them missing, each `-U "$POSTGRES_USER"` and `${POSTGRES_DB}_restore`
   in the sequence expands to empty and the drill proves nothing; the

@@ -311,7 +311,8 @@ note-taker/
             ├── routes/app/note.$noteId.tsx    PR-13/14 editor page
             ├── routes/app/settings.tsx        PR-16
             ├── routes/app/search.tsx          PR-17
-            ├── lib/api.ts                     PR-05 typed fetch wrapper (+ error mapping, CSRF header)
+            ├── lib/api.ts                     PR-05 typed fetch wrapper (+ error mapping, CSRF header,
+            │                                   one-shot 403 refresh-and-replay per §10; proven in PR-07)
             ├── lib/queryClient.ts             PR-05
             ├── lib/markdown.ts                PR-13 toolbar transforms (pure, unit-tested)
             ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested)
@@ -529,8 +530,10 @@ home/LAN/VM network, possibly behind a reverse proxy.
   unbound to a specific `sessions` row by design — the double-submit equality plus the `Origin`/`Sec-Fetch-Site` check is
   what does the binding in a single-instance MVP, and adding a `sessions.csrf` column is backlog. On a `403 FORBIDDEN`
   from any mutation, `lib/api.ts` re-fetches `/api/auth/status` **once** and replays the mutation **once** before
-  surfacing the error, so a long-open tab recovers instead of failing forever (the retry rule belongs to PR-07, which
-  owns both the guard and the client contract in `contracts`).
+  surfacing the error, so a long-open tab recovers instead of failing forever. Ownership splits along the file, not the
+  idea: **PR-05** implements this client rule inside `apps/web/src/lib/api.ts`, the file it owns (§7), unit-testing it
+  against a mocked `fetch`; **PR-07** owns the server half (the `403` itself and the `note_csrf` re-issue on
+  `/api/auth/status`), and its acceptance is where the two halves are proven together.
 - Security headers via `@fastify/helmet`: `CSP` for the SPA (no `unsafe-eval`; inline styles only via nonce if
   needed), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`.
 - Markdown preview is **sanitized** (`rehype-sanitize`): no raw HTML, no `javascript:` URLs, `rel="noopener"`.
@@ -581,13 +584,20 @@ home/LAN/VM network, possibly behind a reverse proxy.
 - The compiled `env.ts` bootstrap (`index.ts`, PR-01 + PR-06) fails in **every** environment when `NODE_ENV` is unset
   or not one of `development | test | production` — there is **no default**, so a container that forgot to set it cannot
   silently boot in the least-restrictive mode. In `production` it additionally refuses to start when:
-  `DATABASE_URL` unset (the `POSTGRES_*` derivation is a `development`/`test` convenience only, §16),
+  `DATABASE_URL` **unset in the process** (the `POSTGRES_*` derivation is a `development`/`test` convenience only,
+  §16; inside the stack Compose hands the app a composed DSN, so this guard is armed and satisfied there — §15),
   `NOTE_ENCRYPTION_KEY` missing/≠32 bytes **and** `NOTE_ENCRYPTION_KEY_FILE` unset/unreadable,
   `SESSION_TTL_DAYS` > 365, `SECURE_COOKIES=false` while `TRUST_PROXY=true`, or
   `ALLOW_REGISTRATION=true` while `SECURE_COOKIES=false` (public sign-up over plain HTTP). The first account is
   **always** created through `POST /api/auth/setup`; there are no `INITIAL_*` environment credentials.
-  `scripts/check-env.ts` (PR-18) applies the same rules as a dev/CI preflight with operator-facing error text;
-  neither path requires `pnpm`/`tsx` inside the runtime image — the container only runs compiled JS (PR-18).
+  `scripts/check-env.ts` (PR-18) applies the same rules as a dev/CI preflight with operator-facing error text, with
+  **one deliberate difference on the DSN**: the boot guard judges the **process**, where Compose has already composed
+  the DSN, while the preflight judges the **file**, where it has not. So the preflight is satisfied by either a literal
+  `DATABASE_URL` or the complete `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` trio — exactly the inputs
+  `compose.yml` composes into the app service's DSN (§15) — and warns when both forms are present and disagree. A file
+  with neither is the failure it reports. Without that carve-out the documented prod `.env` (trio, no DSN) could never
+  pass its own preflight. Neither path requires `pnpm`/`tsx` inside the runtime image — the container only runs
+  compiled JS (PR-18).
 
 - **There is no plaintext mode** (this replaces the earlier "plaintext in development" idea, which the schema cannot
   represent — `content_cipher`/`content_iv` are NOT NULL and nothing marks a row as plain). In `development`/`test`,
@@ -721,7 +731,7 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 | PR-15 | New-note dialog (`new-file-<ms>.md`) | S | 12, 09, 13 | E |
 | PR-16 | Settings **UI** (autosave toggle, theme, password form) | M | 07, 09, 14 | E |
 | PR-17 | Search UI | S | 11, 12, 13 | E |
-| PR-18 | Production Docker image + compose + deploy docs | M | 01–16 | F Ship |
+| PR-18 | Production Docker image + compose + deploy docs | M | 01–17 | F Ship |
 | PR-19 | Playwright e2e + CI e2e job + coverage ratchet | M | 08–18 | F |
 | PR-20 | Docs pass (README, ADRs, ARCHITECTURE, AGENTS.md) | S | 18, 19 | F |
 
@@ -776,7 +786,13 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   unit run explicitly** — `include: ['src/**/*.test.{ts,tsx}']` plus `exclude: ['**/*.int.test.ts']` — because Vitest's default
   include is `**/*.{test,spec}.*`, which would otherwise pull the DB-backed files PR-04 adds into `pnpm test` and into the
   Postgres-free `unit` job (§14's split rule); stating it here, before any such file exists, is what keeps PR-04 from
-  having to edit PR-01's config.
+  having to edit PR-01's config. The **web** config also sets `passWithNoTests: true`, because PR-01 deliberately ships
+  no web tests and Vitest otherwise exits 1 with "No test files found" — which would break this PR's own `pnpm test`
+  acceptance and PR-03's `unit` job. It is set on the web config only: the server has `env.test.ts`/`app.test.ts` from
+  day one, and an empty server suite should be red. The web config also carries **no `coverage.thresholds`**, because a
+  threshold over a scope with nothing in it is a guaranteed red: the `apps/web/src/lib` row of §14 is armed by **PR-05**
+  (whose mocked-`fetch` tests for `lib/api.ts` are the first web tests) and the overall `apps/web/src` row by **PR-08**
+  (the first components).
   **`AGENTS.md` is updated here, not deferred:** the commands it lists for this repo become the real ones this PR
   introduces (`pnpm i / dev / build / lint / typecheck / test`), because §1's same-PR doc rule — inherited from
   `AGENTS.md` itself — forbids leaving it stale while PR-20 waits at the end. PR-20 then *consolidates* the accumulated
@@ -922,7 +938,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   and iterating on contracts means a fourth terminal running `pnpm --filter @note-taker/contracts build -- --watch`.
   + `docs/API.md` documenting §9 with request/response
   examples; `apps/web/src/lib/api.ts` typed fetch wrapper (`json()`, `ApiError`, CSRF header injection, 401
-  handling hook) and `queryClient.ts`. It also owns the server-side error plumbing the §9.1 envelope needs before any
+  handling hook, **and the §10 one-shot CSRF recovery**: on a `403` from a mutation it re-fetches `/api/auth/status` once
+  and replays **once**, never twice) and `queryClient.ts`. The client rule belongs here because this PR owns the file;
+  the server that answers it is PR-07, so PR-05 pins it with a mocked `fetch` (403 ⇒ exactly one status refetch ⇒
+  exactly one replay ⇒ a second 403 surfaces the error), and PR-07 proves the pair against the real guard. It also owns the server-side error plumbing the §9.1 envelope needs before any
   route exists: `apps/server/src/domain/errors.ts` (typed domain errors: `NotFoundError`, `ConflictError`,
   `VersionConflictError`, …) and `apps/server/src/plugins/error-handler.ts` (Zod / Drizzle / domain error → envelope —
   including Postgres `40001`/`40P01` → `CONFLICT`, §9.1 —
@@ -955,6 +974,12 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `stripMd` shortens), the collision property (two distinct stored names never render to the same `withMd()` display
   string), error envelope typing, `uniquify` sequences (`plan` → `plan-2`, never `plan.md-2`).
 
+- **Tests:** besides the contract unit tests, this PR writes the first **web** unit tests: `apps/web/src/lib/api.ts`
+  driven by a mocked `fetch` — CSRF header echoed from the cookie, `ApiError` shape, the one-shot 403 recovery (exactly
+  one status refetch, exactly one replay, second 403 surfaces the error) and the 401 hook. Those tests are what arm the
+  `apps/web/src/lib` row of §14's threshold table, so PR-05 adds that row's thresholds to
+  `apps/web/vitest.config.ts` and drops PR-01's `passWithNoTests: true` (the overall `apps/web/src` row still waits for
+  PR-08's components).
 - **Coverage:** ≥ 90% lines and ≥ 85% branches in `packages/contracts` (the `packages/contracts` row of the §14
   threshold table: 90/90/85/90 here, ratcheting to 95 across the board after PR-19; pure module, no excuse, and it is a
   `unit`-job scope because contracts needs no DB).
@@ -1062,8 +1087,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `users_one_owner_uidx`, §8 — proving the guard is the index and not the `needsSetup` read).
   **CSRF lifetime/re-issue (§10):** a stale or missing `note_csrf` cookie is re-issued by `GET /api/auth/status` and by
   every `setup`/`login`/`register`/`logout` response (assert the `Set-Cookie` on each), the cookie carries `Max-Age=1 day`,
-  and a mutation that fails the check gets `403` — with the client's one-shot refresh-and-replay covered as a unit test
-  against the shared `lib/api.ts` contract.
+  and a mutation that fails the check gets `403`. PR-07 adds **no `apps/web` files** — the client half of that rule is
+  PR-05's one-shot refresh-and-replay in `apps/web/src/lib/api.ts` (§7, §10) — so the assertion here is that the
+  re-issued cookie actually lets PR-05's replay succeed: a mutation with a stale token gets `403`, the status refetch
+  re-issues `note_csrf`, the single replay then succeeds.
   Registration matrix (the flag must have an implementation): with `ALLOW_REGISTRATION=false`,
   `POST /api/auth/register` ⇒ 403 and accounts can only be created by the owner via `POST /api/users`; with
   `ALLOW_REGISTRATION=true`, `register` creates a `member` + session, `registrationOpen=true` in the status payload,
@@ -1092,7 +1119,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `routes/welcome.tsx` (a minimal signed-in card with the username + a sign-out button: the **placeholder home this PR
   owns**, because the `/app` shell and its guard belong to PR-12), `features/auth/*`,
   `components/ui/*` (Button, Input, Field, Dialog, Menu, Toast, Spinner — Radix primitives + Tailwind),
-  Tailwind theme tokens (light/dark via `prefers-color-scheme` default), global error/not-found boundaries.
+  Tailwind theme tokens (light/dark via `prefers-color-scheme` default), global error/not-found boundaries. It also
+  **arms the rest of the web coverage gate**: it adds the overall `apps/web/src` row of §14's threshold table to
+  `apps/web/vitest.config.ts` (the `apps/web/src/lib` row was armed by PR-05, and PR-01's `passWithNoTests: true` was
+  dropped there — from PR-05 on, an empty web suite is a failure, not a pass).
 - **Acceptance (playwright-able, against routes this PR owns):** unauth visit → `/login`; `needsSetup` → `/setup`;
   wrong password shows the server message; success lands on **`/welcome`**; refresh keeps the session; the sign-out
   control on `/welcome` returns to `/login`; `/login` when authed redirects to `/welcome`; password inputs have labels
@@ -1301,8 +1331,8 @@ note, and the note route belongs to PR-13
 - **Acceptance:** debounce 250 ms, `?q=` in URL (shareable), clicking a result opens the note, snippets escape HTML.
 
 #### PR-18 — Production Docker image + compose + env safety + deploy docs
-**Branch:** `feat/pr-18-docker-prod` · **Size:** M · **Depends on:** PR-01…PR-16 (needs a real app; can be
-prepared earlier and rebased)
+**Branch:** `feat/pr-18-docker-prod` · **Size:** M · **Depends on:** PR-01…PR-17 (needs the whole app — search UI
+included, since PR-17 is what closes M3; the image itself can be drafted at PR-12 and rebased onto PR-17)
 
 - **Create:** `docker/Dockerfile` (stage 1 build all workspaces with dev deps + `pnpm build`; stage 2
   `node:22-slim`, **`ENV NODE_ENV=production`** (the runtime image is production by construction — nobody has to remember it),
@@ -1324,7 +1354,9 @@ prepared earlier and rebased)
   the service `environment:` so the `HEALTHCHECK` and `EXPOSE` stay true), while `HOST_PORT` in the repo-root `.env`
   is what an operator changes to publish the app elsewhere),
   `depends_on: condition: service_healthy`, named `pgdata` volume, optional `notes-keys` volume for a mounted key
-  file, `restart: unless-stopped`, `init: true`, `db` healthcheck via `pg_isready`), `scripts/check-env.ts`,
+  file, `restart: unless-stopped`, `init: true`, `db` healthcheck via `pg_isready`), `scripts/check-env.ts` — wired as the
+  root **`check:env`** script (`NODE_ENV=production tsx scripts/check-env.ts`, §16) and implementing the file-side DSN
+  rule of §10 (accepts `DATABASE_URL` **or** the complete `POSTGRES_*` trio) —,
   `docs/DEPLOY.md`
   (one-port mapping, **exactly how to invoke compose with the env file** (see §15: the stack is started with
   `docker compose --env-file .env -f docker/compose.yml`, because Compose otherwise auto-loads `.env` from
@@ -1343,9 +1375,12 @@ prepared earlier and rebased)
   `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production. Also asserted on the host side: `pnpm check:env` — defined as
   `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero listing the same missing
-  variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. The `.env` used by both
-  runs has no `NODE_ENV` entry, which is the proof that the preflight takes its mode from its script line and treats the
-  file strictly as data (§16).
+  variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. Two details make that
+  exit-0 reachable and are asserted explicitly: the `.env` under test has **no `NODE_ENV` entry** (the preflight's mode
+  comes from its script line, §16) and **no `DATABASE_URL` line** — the runbook's file carries the `POSTGRES_*` trio,
+  which is exactly what satisfies the preflight's DSN rule even though the *boot* guard demands a composed
+  `DATABASE_URL` in the process (§10). A third assertion pins the negative case: a `.env` with neither form exits
+  non-zero naming both options.
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
   the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
   "$POSTGRES_USER" "${POSTGRES_DB}_restore"` — the scratch DB must exist before the pipe can succeed; `gunzip -c
@@ -1542,6 +1577,11 @@ Rules:
 - Thresholds only ever ratchet upward; a PR that wants to lower one needs a written justification in its description.
 - The `docker build` **step** inside the `build` job never pushes an image (no registry configured in the MVP).
 - Flaky policy: `retries: 1` for e2e only; a test that fails on re-run gets an immediate follow-up issue/PR.
+- The two `apps/web` rows are armed when the web scope first has tests to measure: **PR-05** turns on
+  `apps/web/src/lib` (mocked-`fetch` tests for `lib/api.ts`) and drops PR-01's `passWithNoTests: true`; **PR-08** turns
+  on the overall `apps/web/src` row with its component tests. Before PR-05 the web config passes with zero files and
+  declares no thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by the PR named in
+  its `enforced by` cell.
 
 ---
 
@@ -1575,6 +1615,10 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
 #    DATABASE_URL needs no entry — the app service's environment: block derives it from these same values and takes
 #    precedence over env_file:. On the host the same derivation happens in env.ts's databaseUrl() when the variable
 #    is unset (§16); writing DATABASE_URL into this file freezes it against later POSTGRES_* edits.
+# 2b. preflight the file before touching Docker — reads .env, takes its mode from its own script line, and
+#     accepts either DATABASE_URL or the complete POSTGRES_* trio above (§10, §16). Exits non-zero with
+#     operator-facing text if the key or the DSN inputs are missing.
+pnpm check:env
 #    Then — always from the repo root, and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
@@ -1695,7 +1739,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
 | `LOG_LEVEL` | `info` | — | pino level |
-| `DOTENV_PATH` | `<repo root>/.env` | — | override for the file `env.ts`'s `loadDevEnvFile()` reads — dev/test only, and only used by tests pointing it at a fixture (§16) |
+| `DOTENV_PATH` | `<repo root>/.env` | — | override for the file `env.ts`'s `loadDevEnvFile()` reads (dev/test only) **and** for `scripts/check-env.ts` (PR-18), which runs in production mode and reads it as data; tests point it at a fixture (§16) |
 | `APP_NAME` | `Note Taker` | — | title shown in the SPA |
 
 `env.ts` (Zod-parsed) fails fast with a readable list of problems; `scripts/check-env.ts` adds the cross-field
@@ -1722,7 +1766,11 @@ the plan states the mechanism instead of leaving it implicit:
   `process.env.DOTENV_PATH ?? <repo root>/.env` **as text with its own parser** and validates it against the rules of the
   mode its own script line declares (`check:env` = `NODE_ENV=production tsx scripts/check-env.ts`). Routing it through the
   loader would be wrong twice over: the loader is a no-op in `production` by design, and a preflight has to see the
-  operator's file whether or not the shell already exports those keys.
+  operator's file whether or not the shell already exports those keys. Its one rule that cannot be copied verbatim from the
+  boot guard is the DSN (§10): the guard fails an unset **process** `DATABASE_URL`, which is right because Compose has
+  already composed it, while the linter sees only the file, where the documented prod `.env` carries the `POSTGRES_*` trio
+  and deliberately no DSN (§15). So the linter accepts **either** form, fails only on a file that has neither, and warns
+  when both are present and disagree — otherwise the runbook's own `.env` could never pass its own preflight.
 - **The file can never supply `NODE_ENV`, so every script that reads env declares its mode inline.** The gate reads the
   value already in the **process** environment, so a stray `.env` cannot turn a production boot into a development one,
   and `env.ts`'s "`NODE_ENV` is required, there is no default" rule (§10, PR-01's acceptance) survives the loader.
@@ -1748,8 +1796,10 @@ the plan states the mechanism instead of leaving it implicit:
      `POSTGRES_PORT` moves both the dev container's published port and every host process, because the DSN is derived
      from the same variable. `drizzle.config.ts`, the integration Vitest setup and `scripts/seed-demo.ts` call this same
      function after `loadDevEnvFile()`; none of them builds its own DSN.
-  3. **Unset and `NODE_ENV=production`** → no derivation and no default: the boot fails naming `DATABASE_URL`
-     (`check-env.ts`, PR-18, says the same thing earlier). In the Compose stack the value is never missing, because the
+  3. **Unset and `NODE_ENV=production`** → no derivation and no default: the boot fails naming `DATABASE_URL`. The
+     `check-env.ts` preflight (PR-18) deliberately does **not** mirror that literal — it reads the file, where the prod
+     runbook writes the `POSTGRES_*` trio instead of a DSN, so a complete trio satisfies its rule (§10). In the Compose
+     stack the value is never missing, because the
      `app` service's `environment:` block sets it from the same `POSTGRES_*` values with host `db` (§15). A production
      process pointed at `localhost` is therefore always an explicit choice, never an accident.
   In `development`/`test`, when an explicit `DATABASE_URL` disagrees with the `POSTGRES_*` values in the same file

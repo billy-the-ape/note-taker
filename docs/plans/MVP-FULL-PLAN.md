@@ -74,7 +74,7 @@ Non-functional targets:
 | Deployment | One Docker image + Postgres, single port (default `3000`) |
 | Cold start | Container healthy and serving in < 10 s (excluding first DB init) |
 | Persistence | No lost keystrokes within the autosave window; crash-safe (server is the source of truth) |
-| Security | Passwords hashed with argon2id; session cookies `HttpOnly`/`Secure`/`SameSite=Lax`; note bodies encrypted at rest (AES-256-GCM); ownership enforced on every query |
+| Security | Passwords hashed with argon2id; session cookies `HttpOnly`/`SameSite=Lax`, plus `Secure` behind TLS (`SECURE_COOKIES=true`: off by default in dev, refused by the boot guard when `TRUST_PROXY=true` or registration is open — §10/§16); note bodies encrypted at rest (AES-256-GCM); ownership enforced on every query |
 | Code quality | 100% typechecked (TS `strict`), zero lint errors, unit + integration tests with enforced coverage floor |
 | Data scale assumption | Single-user / small-team: thousands of notes, ~10⁴ folders; in-process search is acceptable |
 
@@ -355,8 +355,11 @@ CREATE TABLE users (
   username          text NOT NULL,                       -- compared case-insensitively via unique index
   password_hash     text NOT NULL,                       -- argon2id encoded string
   display_name      text,
-  role              text NOT NULL DEFAULT 'owner'        -- 'owner' | 'member' (multi-user later)
-                    CHECK (role IN ('owner','member')),
+  role              text NOT NULL DEFAULT 'member'     -- 'owner' | 'member' (multi-user later).
+                    CHECK (role IN ('owner','member')), -- LEAST-privilege on purpose: with the one-owner
+                                                       -- index below, an insert that forgets the column must
+                                                       -- never mint an owner (or a second such row would die on
+                                                       -- that index). Only /setup writes 'owner', explicitly.
   password_set_at   timestamptz NOT NULL DEFAULT now(),
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now()
@@ -364,7 +367,10 @@ CREATE TABLE users (
 CREATE UNIQUE INDEX users_username_lower_uidx ON users (lower(username));
 -- Exactly one owner, enforced by the DB instead of a read-then-insert race: a second concurrent /setup attempt (or a
 -- second operator who guessed the URL) hits this index and gets CONFLICT, so two owners are impossible even under a
--- race. Owned by PR-04's schema; PR-07's acceptance includes the concurrent-setup test.
+-- race. Owned by PR-04's schema; PR-07's acceptance includes the concurrent-setup test. This index is also why the
+-- column default above is 'member': a DEFAULT 'owner' would turn every role-less insert (fixtures, register,
+-- POST /api/users) into an owner attempt, so the second one would fail with a unique violation that looks like a
+-- bug in the index rather than a missing column. Services still pass `role` explicitly and never lean on the default.
 CREATE UNIQUE INDEX users_one_owner_uidx ON users (role) WHERE role = 'owner';
 
 CREATE TABLE sessions (
@@ -482,7 +488,7 @@ reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 | 7 | `POST /api/auth/logout-all` | yes | — | `204` | deletes **every** session row for the user and clears the cookie (the settings page's "sign out everywhere", §11.1); implemented in **PR-07**, consumed by **PR-16** |
 | 8 | `GET /api/auth/session` | optional | — | `{user\|null, expiresAt?}` | used on boot to rehydrate UI |
 | 9 | `POST /api/auth/password` | yes | `{currentPassword, newPassword}` | `204` | rotates + deletes all other sessions |
-| 10 | `POST /api/users` | owner | `{username, password}` | `201 {user}` | owner-created account; **the only way to add an account when `ALLOW_REGISTRATION=false`**, and still available when it is true |
+| 10 | `POST /api/users` | owner | `{username, password}` | `201 {user}` | owner-created account, always `role='member'` (only `/setup` writes `'owner'`, §8); **the only way to add an account when `ALLOW_REGISTRATION=false`**, and still available when it is true |
 | 11 | `GET /api/users` | owner | — | `{users:[{id,username,role,createdAt}]}` | minimal admin surface |
 | 12 | `GET /api/tree` | yes | — | `{folders:[FolderNode], notes:[NoteNode]}` | full tree metadata, **no content**; single query via recursive CTE; sized for MVP scale |
 | 13 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash |
@@ -490,7 +496,7 @@ reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 | 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
 | 16 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root); `content` omitted → `seal('')`, never empty cipher/iv columns |
 | 17 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
-| 18 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server content; unknown/other-user id ⇒ `404` (the write also filters `user_id`, so the service re-reads to tell the two apart — A.2) |
+| 18 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server `content` + `version` (the client compares them with its buffer before calling it a conflict — §11.4); unknown/other-user id ⇒ `404` (the write also filters `user_id`, so the service re-reads to tell the two apart — A.2) |
 | 19 | `PATCH /api/notes/:id` | yes | `{name?, folderId\|null}` | `200 NoteNode` | rename / move (`folderId: null` = move to root); `notes.name` stays extension-free |
 | 20 | `DELETE /api/notes/:id` | yes | — | `204` | |
 | 21 | `GET /api/search?q=&limit=` | yes | — | `{results:[{noteId,name,folderPath,snippet,score}]}` | name match in SQL + body match after decrypt (cap 500 candidates) |
@@ -657,8 +663,26 @@ Explicit state machine, unit-tested with fake timers:
 ```
 clean ──edit──▶ dirty ──debounce 1200ms──▶ saving ──200──▶ clean
                                    └──5xx/transport──▶ retry(backoff 1s,2s,4s,8s,30s) ──▶ saving
-saving/clean ──VERSION_CONFLICT──▶ conflict ──(user picks)──▶ overwrite | loadServer
+saving ──VERSION_CONFLICT──▶ (payload == the snapshot we sent ? clean | dirty : conflict)
+                                     conflict ──(user picks)──▶ overwrite | loadServer
 ```
+
+**The `VERSION_CONFLICT` fork is what makes a retry safe, and it is not optional.** A `PUT` that the server committed
+but whose response never arrived (connection reset, proxy `502`/`504`, client timeout) is indistinguishable, from the
+client's seat, from a `PUT` that never reached the server. So the retry replays with the old `baseVersion`, the
+conditional `UPDATE` in A.2 matches 0 rows, and a client that treats every conflict as a collision shows
+`ConflictBanner` and pauses autosave on a note whose server content **already equals the buffer** — a phantom
+conflict the user cannot resolve except by clicking through their own text. **That is why the engine keeps the exact
+payload it put on the wire** — the in-flight snapshot, not a reference to the live buffer, which A.5 lets a later keystroke
+change. Rule: on `VERSION_CONFLICT`, compare the `content` the error payload carries (§9.2 #18) with that snapshot.
+Equal ⇒ the write landed, only the reply was lost ⇒ adopt the payload's `version` and continue with no banner and no
+pause: to `clean` if the live buffer still equals the snapshot, to `dirty` if the user typed meanwhile (the next debounce
+then writes the newer buffer against the adopted `version`). Different ⇒ a real second writer ⇒ `conflict`.
+Comparison is on the plaintext buffer before sealing, not on ciphertext: the seal is randomized
+(`crypto/envelope.ts`, §10), so two seals of one string never compare byte-equal. A per-request idempotency key was
+considered and rejected for the MVP: it needs a dedupe table plus an expiry policy and still has to answer "same
+request or new edit?" the moment the user types during the retry, which is the same question the content comparison
+answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 write path.
 
 - Flush triggers: debounce (default 1200 ms), `maxUnflushedMs = 10 000`, `Ctrl/Cmd+S`, note switch, folder
   rename/move affecting the open note, `window blur`, and `visibilitychange → hidden` / `pagehide` via
@@ -872,7 +896,9 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `db/migrate.ts` (+ wire into `index.ts` bootstrap), first migration in `migrations/`, `test/helpers/db.ts`
   (spin/truncate against `DATABASE_URL`, transaction-per-test or truncate-all fixture), `test/helpers/app.ts`,
   `test/fixtures.ts` (creates users with raw schema inserts — the auth-shaped `users.repo.ts`/`sessions.repo.ts` come
-  in PR-07, per §7), `docs/DATA-MODEL.md`, repositories for `folders` and `notes`
+  in PR-07, per §7 — and it needs **two** users for the cross-user cases: one `role='owner'`, one `role='member'`, both
+  written explicitly, because a fixture that omits `role` twice under §8's one-owner index is an accident waiting to
+  collide rather than a test), `docs/DATA-MODEL.md`, repositories for `folders` and `notes`
   (the notes repo stores **opaque** `content_cipher`/`content_iv`/`key_version` triples supplied by its caller — it never
   sees plaintext, because the schema has no plaintext representation; PR-04's tests insert fixed test blobs, and PR-06
   plugs the real `crypto/envelope.ts` in behind the same interface). It also **adds the scripts** the PR-01 contract
@@ -913,8 +939,9 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `notes.folder_id IS NULL` insert, and two root notes with the same name collide while a root note and a note inside
   a folder do not), cascade delete of nested folders, `notes.version` conditional update
   returns 0 rows on stale `baseVersion`, cross-user select returns nothing, and **`users_one_owner_uidx` rejects a second
-  `role='owner'` row** (a raw two-row insert raises a unique violation) — the invariant PR-07's setup-race test relies
-  on, proven here at the schema layer where it actually lives.
+  `role='owner'` row** (a raw two-row insert that states `role` raises a unique violation) — the invariant PR-07's
+  setup-race test relies on, proven here at the schema layer where it actually lives. And the §8 default itself: a raw
+  insert that omits `role` lands as `'member'`, so two role-less fixture users coexist and neither is an owner.
 - **Tests:** ≥ 15 integration assertions; the `apps/server/src/db` row of the §14 table (≥ 80% lines) is enforced here
   for the first time — by **`pnpm coverage:integration`** in the `integration` job, since these files are only exercised
   against a real DB.
@@ -1010,7 +1037,7 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/rotate-note-key.js`
   (same DB connection, same keyring, no extra network exposure — the prod `db` publishes no port).
   **The script runs against a live app, so it must not lose concurrent edits** (autosave is writing the whole time; §11.4
-  autosaves within 1.5 s, and step 3 of §15 puts the app back into service *before* the rewrite runs). Per batch, in one
+  autosaves within 1.2 s — the §11.4 debounce — and step 3 of §15 puts the app back into service *before* the rewrite runs). Per batch, in one
   transaction: `SELECT id, version, key_version, content_cipher, content_iv FROM notes WHERE key_version < $current
   ORDER BY id LIMIT $batch FOR UPDATE` — the row lock is what makes the read-and-reseal atomic — then the write is
   conditional, exactly the A.2 shape:
@@ -1059,7 +1086,8 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `routes/auth.routes.ts` (§9.2 #2–#9: status/setup/**register**/login/logout/**logout-all**/session/password),
   `routes/users.routes.ts` (§9.2 #10/#11),
   `plugins/auth-guard.ts`, `plugins/csrf.ts`, `http/rate-limit.ts`, argon2 hashing utils, `auth_attempts` writes.
-  **Every account-creating path (`setup`, `register`, `POST /api/users`) inserts the default `settings` row in the same
+  **Every account-creating path (`setup`, `register`, `POST /api/users`) writes `role` explicitly — `setup` is the only `'owner'` writer, the other two
+  are always `'member'` and never left to the column default (§8) — and inserts the default `settings` row in the same
   transaction as the `users` insert** — `settings.user_id` is the PK (§8), there is no trigger, and PR-07 is the PR that
   owns user creation, so the row cannot be left to PR-09 (which merges later) or to the settings UI (PR-16): an owner
   created here would otherwise have no row for `GET /api/settings` to read and `PATCH /api/settings` would match zero
@@ -1218,7 +1246,8 @@ decrypt it)
   `PAYLOAD_TOO_LARGE`, concurrent-write test with `Promise.all`. The read side (`GET /api/notes/:id`, §9.2 #17) already
   ships in PR-09; this PR owns only the write path and re-tests the `ETag` round-trip against it.
 - **Acceptance:** two clients on the same version ⇒ one 200, one `VERSION_CONFLICT` carrying server `content` +
-  `version`; empty-string content allowed (a legitimately emptied note); write with `If-Match` matching a stale
+  `version` — that payload is what lets PR-14 tell a committed-but-unacknowledged write from a real collision (§11.4), so
+  an assertion pins both fields on the 409 body; empty-string content allowed (a legitimately emptied note); write with `If-Match` matching a stale
   ETag ⇒ `VERSION_CONFLICT`; `PUT` against a missing or another user's note ⇒ `404`, never `409` (the follow-up scoped read in A.2); no partial writes when the process is killed mid-request (single statement).
   **Re-test of PR-06's rotation-concurrency guarantee, one layer up:** run `rotate-note-key.ts` while a real
   `PUT /api/notes/:id/content` lands mid-rotation — the note ends with the *client's* content at the current
@@ -1281,6 +1310,14 @@ decrypt it)
   force-flush at 10 s; flush on unmount; backoff schedule exact; `VERSION_CONFLICT` ⇒ conflict state and the
   buffer is retained; "Keep mine" retries with the fresh server `version`; "Use server" replaces the buffer and
   clears the draft mirror; `autosave: false` injected ⇒ zero automatic writes and the pill says so.
+  **Lost-response idempotency (§11.4, the case that makes retry safe):** a `PUT` whose stub commits server-side and then
+  drops the response ⇒ the retry replays the same `baseVersion`, the stub answers `VERSION_CONFLICT` carrying **that
+  same content** and a bumped `version` ⇒ the machine goes to **`clean`**, adopts the version, never enters `conflict`,
+  renders no `ConflictBanner`, and keeps autosaving. Sibling case proving the fork is not a blanket suppress: the same
+  `VERSION_CONFLICT` carrying **different** content ⇒ `conflict`, buffer retained. Third case, the one that proves the
+  comparison runs against the in-flight snapshot and not the live buffer: an edit lands after the lost response ⇒ the
+  payload still matches the snapshot, so the machine adopts the `version` and lands in **`dirty`**, then a second `PUT`
+  writes the newer content — never `conflict`, and nothing typed is lost.
   Unload path (§11.4): a 40 KiB dirty buffer on `pagehide` ⇒ exactly one `fetch(…, {keepalive:true})` `PUT` with the
   CSRF header; a 200 KiB dirty buffer ⇒ no unload request attempted, buffer stays dirty, pill stays
   `Unsaved changes`, dirty-guard prompt fires; `navigator.sendBeacon` is never called.
@@ -1419,7 +1456,7 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
      toolbar bold → preview shows `<strong>` → **reload the page** → text still there.
   3. rename note → tree shows the new name with `.md`; move note to another folder; tree path updates.
   4. folder with a note → delete without typing name is blocked; typed delete removes both.
-  5. autosave: pause 1.5 s after typing, status pill shows `Saved`; toggle autosave off in settings ⇒ pill shows
+  5. autosave: pause 1.5 s after typing — deliberately past the 1200 ms debounce (§11.4) — status pill shows `Saved`; toggle autosave off in settings ⇒ pill shows
      `Unsaved changes` until `Ctrl+S`.
   6. two pages, same note ⇒ conflict UI in the stale page, no silent overwrite.
 - **Acceptance:** green in CI on `ubuntu-24.04` with the `postgres` service; retries ≤ 1 and the suite is proven
@@ -1500,7 +1537,7 @@ PR-20 (docs)    ← PR-19
 **Suggested milestones (review gates):**
 
 - **M0** after PR-03: repo is clonable, CI real, `pnpm dev` serves something.
-- **M1** after PR-08: a user can set up an account, log in, land on the `/welcome` placeholder, and log out — on a real DB, in Docker, in CI (the `/app` shell itself is an M2 deliverable via PR-12).
+- **M1** after PR-08: a user can set up an account, log in, land on the `/welcome` placeholder, and log out — on a real DB, in Docker, in CI (the `/app` shell is **not** in M1: PR-08 lands the `/welcome` placeholder here, and PR-12 builds `/app`, which sits between M2 after PR-11 and M3 after PR-17).
 - **M2** after PR-11: the whole domain is drivable over the API with tests (no UI needed to prove the product logic).
 - **M3** after PR-17: the product is usable end-to-end in a browser.
 - **M4** after PR-20: MVP — one `docker compose up`, e2e-proven, documented.
@@ -1735,7 +1772,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |
 | `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` of **older** keys, kept decrypt-only for as long as any row carries that `key_version`. Written **single-quoted** in `.env` (`='{"1": "…"}'`): Compose strips the surrounding quotes for the container, while the runbook's `set -a; . ./.env; set +a` sources the same file, where unquoted JSON is a shell syntax error (§15, rotation step 2) |
-| `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; the operator bumps it by hand in `.env` (§15 step 2) and `apps/server/src/scripts/rotate-note-key.ts` rewrites every row's `key_version` to that value (§10, PR-06) |
+| `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; the operator bumps it by hand in `.env` (§15, rotation step 2 — not the step-2 of the quick-start list, which is the `POSTGRES_*` entry) and `apps/server/src/scripts/rotate-note-key.ts` rewrites every row's `key_version` to that value (§10, PR-06) |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
 | `LOG_LEVEL` | `info` | — | pino level |
@@ -2011,14 +2048,18 @@ implicit (PR-14's unit tests enumerate exactly this table):
 | --- | --- | --- |
 | `clean` | buffer equals the last saved content | `dirty` on `onEdit()` |
 | `dirty` | an edit landed, debounce running | `saving` when the debounce fires or `flush()` is called |
-| `saving` | one `PUT` is in flight carrying `baseVersion = v` | `clean` (200 ⇒ adopt the returned `version`) · `conflict` (`VERSION_CONFLICT`) · `retrying` (5xx / transport) · `error` (401 / 403 / 404) · **`dirty` if `onEdit()` fired while the request was in flight** |
+| `saving` | one `PUT` is in flight carrying `baseVersion = v`, **remembering the exact payload it sent** | `clean` (200 ⇒ adopt the returned `version`) · `clean` **or** `dirty` **silently** when a `VERSION_CONFLICT` payload equals that in-flight snapshot (the write landed, the reply was lost — §11.4) · `conflict` (same error, different content) · `retrying` (5xx/transport) |
 | `retrying` | 5xx or a transport error | `saving` on the backoff timer; `conflict`/`error` once the retry budget is spent |
-| `conflict` | `VERSION_CONFLICT` — buffer retained, autosave paused | "Keep mine" ⇒ `saving` with the fresh server `version`; "Use server" ⇒ `clean` |
+| `conflict` | `VERSION_CONFLICT` **whose content differs from the in-flight snapshot** (§11.4) — buffer retained, autosave paused | "Keep mine" ⇒ `saving` with the fresh server `version`; "Use server" ⇒ `clean` |
 | `error` | `401` (session gone ⇒ stop autosaving, route to `/login`, the `localStorage` draft mirror keeps the text) · `403` after the one CSRF refresh-and-replay (§10) · `404` (note deleted elsewhere ⇒ offer "save as a new note") | manual retry, or `dirty` on the next edit for the 403 case |
 
-**Two rules that make the table safe:** at most **one** request may be in flight, and an edit arriving during `saving` is
+**Three rules that make the table safe:** at most **one** request may be in flight, an edit arriving during `saving` is
 never dropped and never starts a parallel request — it parks the machine in `dirty`, and the next debounce window opens
-when the in-flight request settles, always sending the newest buffer with the newest known `version`. The hook only
+when the in-flight request settles, always sending the newest buffer with the newest known `version`; and a
+`VERSION_CONFLICT` becomes a `conflict` **only after** the §11.4 comparison shows the payload differs from the exact
+snapshot that request carried, so a committed write whose response was lost settles in `clean` — or `dirty`, if the user
+typed meanwhile — and never reaches the user as a banner. The hook
+only
 subscribes React to this machine, which is what keeps every row of the table unit-testable without a DOM.
 
 ---

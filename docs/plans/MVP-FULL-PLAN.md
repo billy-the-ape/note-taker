@@ -202,7 +202,7 @@ note-taker/
 │       └── claude-review.yml                  (exists) untouched
 ├── .editorconfig  .gitignore  .dockerignore  .nvmrc  LICENSE      PR-01
 ├── package.json  pnpm-workspace.yaml  tsconfig.base.json  biome.json  PR-01
-├── .env.example                               PR-01 (keys added in PR-06)
+├── .env.example                               PR-01 (ships `NODE_ENV=development`; key vars added in PR-06)
 ├── Makefile                                   PR-02 (dev/db/build/test entry points)
 ├── docs/
 │   ├── plans/MVP-FULL-PLAN.md                 (this file)
@@ -415,7 +415,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 
 | Invariant | Enforcement |
 | --- | --- |
-| Every folder/note belongs to exactly one user | `user_id` NOT NULL + `WHERE user_id = auth.userId` on **every** repository query; cross-user access returns `404`, never `403` (no enumeration) |
+| Every folder/note belongs to exactly one user | `user_id` NOT NULL + `WHERE user_id = auth.userId` on **every** repository query; cross-user access returns `404`, never `403` (no enumeration). **This applies to ids arriving in bodies too** (`POST /api/notes {folderId}`, `POST /api/folders {parentId}`, `PATCH … {parentId|folderId}`): the FKs (`notes.folder_id → folders.id`, `folders.parent_id → folders.id`) do **not** carry `user_id`, so the service must load the target folder scoped to `auth.userId` and answer `404 NOT_FOUND` before inserting/moving — otherwise user A could attach rows into user B's tree, probe folder ids through FK violations, and lose rows in B's cascade delete. (Backlog alternative: composite `(user_id, id)` unique + FKs — see §12 PR-09 create list.) |
 | Sibling names unique (case-sensitive, trimmed, no `/`, no control chars, ≤ 120 chars) | DB unique index + Zod refinements in `contracts` |
 | Note name never contains the `.md` extension in the DB | `stripExtension()` in `contracts/names.ts`, applied in `note.service.ts` |
 | A folder cannot be moved inside itself | `folder.service.ts` CTE ancestor walk → `CONFLICT` |
@@ -530,7 +530,12 @@ home/LAN/VM network, possibly behind a reverse proxy.
 - AES-256-GCM, 256-bit master key from `NOTE_ENCRYPTION_KEY` (base64), AAD = `note:<uuid>` so ciphertexts are not
   portable between rows; fresh 12-byte IV per write; `key_version` per row.
 - Keyring supports one *current* key plus N *previous* keys (`NOTE_ENCRYPTION_KEY_PREVIOUS`, JSON map
-  `{"1": "<base64>"}`) so `scripts/rotate-note-key.ts` can read old rows and rewrite them with the new key.
+  `{"1": "<base64>"}`) so `scripts/rotate-note-key.ts` can read old rows and rewrite them with the new key. The current
+  key's version is **its own variable — `NOTE_ENCRYPTION_KEY_VERSION` (integer, default `1`)** — never derived from the
+  `_PREVIOUS` map (deriving it as `max(previous)+1` collapses back to 1 the moment the map is emptied, silently
+  orphaning rows tagged 2). Rotation therefore: set the new key + bump the version, move the old key into `_PREVIOUS`,
+  then rewrite every row (new ciphertext **and** new `key_version`); a row keeps decrypting through `_PREVIOUS` until no
+  row references that version anymore.
 - What is **not** encrypted: usernames, folder/note names, timestamps, sizes — required for tree queries and
   listings without mass decryption. Documented as an accepted MVP limitation in ADR-0002.
 - Data-loss caveat recorded in `docs/DEPLOY.md`: **losing `NOTE_ENCRYPTION_KEY` makes note bodies unrecoverable**;
@@ -792,7 +797,12 @@ merge with the placeholder still in place — see note)
 **Branch:** `feat/pr-06-encryption` · **Size:** M · **Depends on:** PR-04, PR-05
 
 - **Create:** `crypto/keys.ts` (parse `NOTE_ENCRYPTION_KEY` — or read the key from `NOTE_ENCRYPTION_KEY_FILE` when set, so a
-  mounted secret file works without shell interpolation — plus `NOTE_ENCRYPTION_KEY_PREVIOUS`; and, **only** when
+  mounted secret file works without shell interpolation — plus `NOTE_ENCRYPTION_KEY_PREVIOUS` and
+  **`NOTE_ENCRYPTION_KEY_VERSION`** (integer, default `1`): the version tag stamped into `notes.key_version` for the
+  *current* key. It is **explicit, never derived** — computing it as `max(previous)+1` would reset to 1 the moment
+  `_PREVIOUS` is dropped and make version-2 rows undecryptable. The keyring is therefore
+  `{current: {version: NOTE_ENCRYPTION_KEY_VERSION, key}, previous: Map<version, key>}`, which is exactly what A.3's
+  `keyring.current.version` reads; and, **only** when
   `NODE_ENV` is `development`/`test` and neither is set, generate one key on first boot and persist it to
   `.dev/note-key` (mode `0600`, dir created on demand, `.gitignore` + `.env.example` comment updated) so dev/test rows
   survive restarts — production never takes this path, §10), validate 32 bytes,
@@ -802,7 +812,12 @@ merge with the placeholder still in place — see note)
   `scripts/rotate-note-key.ts` (streams rows, re-encrypts, batched in transactions, idempotent, `--dry-run`),
   `.env.example` additions, ADR-0002 stub.
 - **Acceptance:** round-trip test; tamper test (flip a ciphertext byte ⇒ `decrypt` throws ⇒ API surfaces
-  `INTERNAL` + logs note id, never blank content); wrong-key test; `key_version` preserved after rotation;
+  `INTERNAL` + logs note id, never blank content); wrong-key test; **key-version rules**: the current key's version comes
+  from `NOTE_ENCRYPTION_KEY_VERSION` (default `1`) and is written into every new row; `rotate-note-key.ts` bumps that
+  version, moves the old key into `_PREVIOUS`, and **rewrites every row's `key_version` to the new current version**
+  (assert: row count per version before/after — nothing keeps the old tag), while pre-rotation rows stay decryptable as
+  long as their version is still in `_PREVIOUS`; deleting a `_PREVIOUS` entry whose version is still referenced makes
+  exactly those rows unreadable (the lossy case the explicit version prevents);
   server refuses to boot in production when neither `NOTE_ENCRYPTION_KEY` nor a readable `NOTE_ENCRYPTION_KEY_FILE`
   yields 32 bytes; creating a note seals the **empty string** into a valid envelope that decrypts back to the empty
   string (the schema never holds a NULL/empty cipher or iv); **dev-key path**: with `NODE_ENV=development` and no key
@@ -874,11 +889,17 @@ decrypt it)
 - **Behavior:** `GET /api/tree` one recursive CTE (ordered folders-then-notes, `name` collation `C`);
   create/rename/move with sibling-uniqueness ⇒ `CONFLICT` (body carries the conflicting `id`); move-to-self/descendant
   ⇒ `CONFLICT`; delete folder requires `cascade=true` when non-empty; `POST /api/notes` with no `name` generates
-  `new-file-<msepoch>` then `uniquify`; cross-user id in any path/query ⇒ `404`.
+  `new-file-<msepoch>` then `uniquify`; cross-user id in any path, query **or body** ⇒ `404` — a `folderId`/`parentId`
+  pointing at another user's folder is caught by the service's scoped lookup (the FKs do not carry `user_id`, §8), and
+  never surfaces as an FK-violation `500` nor as `403`.
 - **Acceptance:** integration suite covers each behavior above plus: 3-level nesting, rename into a sibling
   occupied name, move folder A under its own child B rejected, cascade delete removes nested notes (and content
   rows), **create at root (`folderId: null`) and move a note back to root both work**, tree depth 50 renders
-  without recursion errors (CTE depth guard at 100).
+  without recursion errors (CTE depth guard at 100). It also covers **the cross-user body-id case the FKs cannot
+  catch**: user A and user B each create a folder, then B sends `POST /api/notes {folderId: A's}`,
+  `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
+  `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
+  subtree is byte-identical afterwards (§8; no FK-violation `500`, no existence oracle).
 - **Tests:** ≥ 25 assertions; `services` coverage ≥ 85%.
 - **Out of scope:** content versioning endpoint (PR-10), search (PR-11), UI (PR-12).
 
@@ -996,7 +1017,7 @@ note, and the note route belongs to PR-13
 prepared earlier and rebased)
 
 - **Create:** `docker/Dockerfile` (stage 1 build all workspaces with dev deps + `pnpm build`; stage 2
-  `node:22-slim`, `pnpm deploy --prod` or `npm ci --omit=dev` pruned install, copy `dist`/`migrations`, copy
+  `node:22-slim`, **`ENV NODE_ENV=production`** (the runtime image is production by construction — nobody has to remember it), `pnpm deploy --prod` or `npm ci --omit=dev` pruned install, copy `dist`/`migrations`, copy
   `apps/web/dist` into the server's static path, `USER node`, `EXPOSE 3000`, `ENTRYPOINT` (
   `docker/entrypoint.sh` is **only** `exec node apps/server/dist/index.js` — no `pnpm`, no `tsx`, no `.ts` execution in
   the runtime layer, because stage 2 is a pruned `node:22-slim` install with no dev toolchain. Env checks and
@@ -1023,7 +1044,10 @@ prepared earlier and rebased)
   browser on `:3000` reaches `/setup`, creates the account, and CRUD survives `docker compose … restart`;
   `${HOST_PORT}` from the repo-root `.env` is honored in the published port mapping (set `HOST_PORT=8080`, prove the app
   answers on `:8080` and nothing is listening on `:3000` — this proves the `HOST_PORT` mapping in `compose.yml` is
-  the one under test; `PORT` itself stays pinned to 3000 inside the container (§16));
+  the one under test; `PORT` itself stays pinned to 3000 inside the container (§16)); the container reports
+  `NODE_ENV=production` — `docker compose --env-file .env -f docker/compose.yml exec app node -e "console.log(process.env.NODE_ENV)"`
+  prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
+  actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
   `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production.
 - **Out of scope:** Kubernetes manifests, TLS termination (documented only), image registry publishing.
@@ -1173,7 +1197,9 @@ Rules:
 ## 15. Docker / self-hosting runbook
 
 **Dev** (PR-02): `make db-up` → Postgres 16 on `localhost:5432` in Docker; the app runs on the host with
-`pnpm dev` (`tsx watch` API on `:3000`, Vite on `:5173` proxying `/api`).
+`pnpm dev` (`tsx watch` API on `:3000`, Vite on `:5173` proxying `/api`). No key setup is needed in dev:
+`.env.example` ships `NODE_ENV=development` (`make dev` copies it to `.env` when missing), and that value is what
+selects the generated-and-persisted dev key path described in §10 — with `NODE_ENV` unset the boot guard fails here too.
 
 **Production** (PR-18):
 
@@ -1181,6 +1207,8 @@ Rules:
 # 1. generate config in the REPO ROOT (this is the file the app and compose both read)
 printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
   'console.log(require("crypto").randomBytes(32).toString("base64"))')" > .env
+#    NODE_ENV needs no entry here: the production image bakes ENV NODE_ENV=production into stage 2 and compose
+#    repeats it in the app service's environment block (§16 explains who sets what).
 # 2. fill in POSTGRES_PASSWORD / DATABASE_URL / HOST_PORT in .env (see §16), then — always from the repo root,
 #    and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
@@ -1198,10 +1226,11 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 > service `environment:` block sets `DATABASE_URL` to
 > `postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB`, so the DSN is derived from the same `POSTGRES_*`
 > values the `db` container initializes with — host is the service name `db` (never `localhost`, which only exists on a
-> developer machine). Those four variables plus `HOST_PORT` are the entire compose-level contract; §16 lists them.
+> developer machine). `NODE_ENV=production` is set in the same block, so the four `POSTGRES_*` variables plus
+> `DATABASE_URL`, `NODE_ENV` and `HOST_PORT` are the entire compose-level contract; §16 lists who sets what.
 
-- Single published port: `app.ports: ["${HOST_PORT:-3000}:3000"]` (set `HOST_PORT=8080` in the repo-root `.env` to move the
-  host side); `db` has **no** published port.
+- Single published port: `app.ports: ["${HOST_PORT:-3000}:3000"]` (set `HOST_PORT=8080` in the repo-root `.env` to move
+  the host side); `db` has **no** published port.
 - Volumes: `pgdata` (Postgres). Optionally mount a key file (`secrets/note-key.txt`) instead of an env var —
   the compiled `crypto/keys.ts` (PR-06) resolves `NOTE_ENCRYPTION_KEY_FILE` at boot, so the file can be mounted instead of pasted into the env.
 - Updates: `git pull && docker compose --env-file .env -f docker/compose.yml build && docker compose --env-file .env
@@ -1210,7 +1239,9 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 - Backups: `docker compose --env-file .env -f docker/compose.yml exec -T db pg_dump -U notetaker notetaker | gzip > backup.sql.gz` (`-T` is mandatory: `docker compose exec` allocates a TTY by default, which CRLF-translates the dump and corrupts it)
   **plus the encryption
   key**; restore + `scripts/rotate-note-key.ts` documented in `docs/DEPLOY.md`. Restore drill is part of PR-18's
-  acceptance criteria (restore with `docker compose … exec -T db psql -U notetaker notetaker < backup.sql` into a scratch compose file, then log in and read a note back).
+  acceptance criteria (restore with `gunzip -c backup.sql.gz | docker compose … exec -T db psql -U notetaker notetaker`
+  into a scratch compose file, then log in and read a note back — the drill must consume exactly the file the backup
+  step produces, gzip included).
 
 ---
 
@@ -1220,7 +1251,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 
 | Var | Default | Prod required | Meaning |
 | --- | --- | --- | --- |
-| `NODE_ENV` | **none — required**: `development`, `test`, or `production` | ✔ `production` | selects the invariant set enforced by the compiled `env.ts` at boot; an unset value fails in every environment (§10) |
+| `NODE_ENV` | **none — required**: `development`, `test`, or `production` | ✔ `production` | selects the invariant set enforced by the compiled `env.ts` at boot; an unset value fails in every environment (§10). Nobody hand-sets it: the production image bakes `ENV NODE_ENV=production` into stage 2, `compose.yml` repeats it in the `app` `environment:` block, and `.env.example` ships `NODE_ENV=development` for `pnpm dev` / `make dev` (CI sets `test`) |
 | `HOST` | `0.0.0.0` | — | bind address |
 | `PORT` | `3000` | — | port the container listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid — use `HOST_PORT` to publish elsewhere |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping (`"${HOST_PORT:-3000}:3000"`) — the operator-facing port knob |
@@ -1236,7 +1267,8 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `ALLOW_REGISTRATION` | `false` | — | when true, `POST /api/auth/register` (PR-07) opens self-service sign-up; when false, accounts come only from `POST /api/users` (owner only) |
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |
-| `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` |
+| `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` of **older** keys, kept decrypt-only for as long as any row carries that `key_version` |
+| `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; `scripts/rotate-note-key.ts` bumps it and rewrites every row's `key_version` (§10, PR-06) |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
 | `LOG_LEVEL` | `info` | — | pino level |

@@ -123,7 +123,7 @@ the *recommended default* is what the PRs implement — see [§21](#21-open-ques
 
 | # | README question | Decision | Rationale / trade-off |
 | --- | --- | --- | --- |
-| Q1 | "Backend stores saved notes efficiently & securely. 2 way encrypted?" | **Yes — authenticated encryption at rest.** `notes.content_cipher` stored as `bytea`, AES-256-GCM, per-record 12-byte random IV, master key from `NOTE_ENCRYPTION_KEY` (base64, 32 bytes), `key_version` column enables rotation. ADR-0002. | Deterministic/simple; decryption only in the API process; ciphertext+tag in one column (tag appended by `node:crypto`). Trade-off: no Postgres `FULLTEXT`/`pg_trgm` on bodies → search decrypts in-process (fine at MVP scale). If `NOTE_ENCRYPTION_KEY` is missing the app **refuses to start**; there is no plaintext mode (§10) — development and test get a generated key persisted to `.dev/note-key` so dev rows survive restarts. |
+| Q1 | "Backend stores saved notes efficiently & securely. 2 way encrypted?" | **Yes — authenticated encryption at rest.** `notes.content_cipher` stored as `bytea`, AES-256-GCM, per-record 12-byte random IV, master key from `NOTE_ENCRYPTION_KEY` (base64, 32 bytes), `key_version` column enables rotation. ADR-0002. | Deterministic/simple; decryption only in the API process; ciphertext+tag in one column (the tag is appended by `seal()` from `cipher.getAuthTag()`; `node:crypto` never appends it itself). Trade-off: no Postgres `FULLTEXT`/`pg_trgm` on bodies → search decrypts in-process (fine at MVP scale). If `NOTE_ENCRYPTION_KEY` is missing the app **refuses to start**; there is no plaintext mode (§10) — development and test get a generated key persisted to `.dev/note-key` so dev rows survive restarts. |
 | Q2 | "Folders and notes persistence: Raw file system? or database?" | **Postgres is the single source of truth** for both metadata and content. FS is only a container volume for Postgres data. ADR-0001. | A folder tree in a DB gives atomic renames/moves, ownership enforcement via `user_id` on every row, no path-traversal surface, no FS permission pain in containers, transactional deletes, trivial backup/restore, and it composes with at-rest encryption. Keeping a real FS tree *and* a DB means two sources of truth and rename races. The "folder structure" mental model is preserved logically (`folders.parent_id`) and can be exported later (`PR-24`). |
 | Q3 | Editor: "word style (toolbar)" **or** "raw markdown + preview" | **Raw Markdown buffer + live preview + Markdown-aware toolbar** (the second option, plus toolbar affordances from the first). ADR-0003. | Single canonical representation (the Markdown text) → no lossy round-trip, autosave is trivial, encryption is trivial, WYSIWYG can be layered on later (`PR-22`) without changing storage. CodeMirror 6 gives selection APIs the toolbar needs. |
 | Q4 | "Auto-save can be enabled (default on)" | Autosave **default on**, debounced 1200 ms, force-flush ≤ every 10 s and on navigation/blur/unload, plus `Ctrl/Cmd+S`; per-user setting; conflict handled with `version` + explicit UI (§11.4). | Meets the README requirement and prevents the classic autosave data-loss mode (two tabs). |
@@ -222,7 +222,7 @@ note-taker/
 │   ├── compose.dev.yml                        PR-02  (db only)
 │   └── entrypoint.sh                          PR-18  (exec node only — env checks + migrations run inside the compiled bootstrap)
 ├── scripts/                                   DEV/CI ONLY — never shipped, never the way an operator does anything
-│   ├── generate-keys.ts                       PR-06  (prints a fresh key to stdout; the operator copies it into `.env`)
+│   ├── generate-keys.ts                       PR-06  (prints a fresh key to stdout; dev/CI only — operators use the §15 `docker run` one-liner)
 │   ├── seed-demo.ts                           PR-09  (demo user + sample tree; guarded by NODE_ENV ≠ production)
 │   └── check-env.ts                           PR-18  (dev/CI fail-fast on missing/prod-unsafe env; the same rules live in the compiled `env.ts` at boot)
 │                                              Operator scripts live under apps/server/src/scripts/ (see below) so they
@@ -252,7 +252,7 @@ note-taker/
     │   └── src/
     │       ├── index.ts                       PR-01 (bootstrap: env → buildApp → migrate → listen → shutdown)
     │       ├── app.ts                         PR-01 factory `buildApp(deps)` — DI so tests never bind a port
-    │       ├── env.ts                         PR-01 zod-parsed process.env, prod invariants
+    │       ├── env.ts                         PR-01 zod-parsed process.env, prod invariants, `loadDevEnvFile()` (§16)
     │       ├── logger.ts                      PR-01 pino
     │       ├── db/schema.ts                   PR-04 drizzle table definitions (single source of truth)
     │       ├── db/client.ts                   PR-04 postgres.js pool + drizzle instance
@@ -405,7 +405,9 @@ CREATE UNIQUE INDEX notes_unique_sib ON notes (user_id, COALESCE(folder_id, '000
 CREATE INDEX notes_user_folder_idx ON notes(user_id, folder_id);
 CREATE INDEX notes_user_content_updated_idx ON notes(user_id, content_updated_at DESC);  -- "recent notes"
 
-CREATE TABLE settings (
+CREATE TABLE settings (                  -- 1 row per user, inserted in the SAME transaction as the users row (PR-07);
+                                         -- settings.service.get() get-or-creates as the belt for rows made outside it
+                                         -- (PR-04 fixtures, seeds, restores). No trigger exists in this schema.
   user_id    uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   autosave   boolean NOT NULL DEFAULT true,
   theme      text NOT NULL DEFAULT 'system' CHECK (theme IN ('system','light','dark')),
@@ -433,6 +435,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 | Deleting a folder removes descendants | `ON DELETE CASCADE`, gated by explicit `?cascade=true` in the API |
 | Notes **and** folders may live at the root of the tree | `notes.folder_id` and `folders.parent_id` are both nullable, `NULL` = root; the `COALESCE`-based unique indexes above keep sibling names unique for root-level rows too |
 | Note content is never stored in plaintext — in **any** environment | `crypto/envelope.ts` is the only writer of `content_cipher`; `env.ts` guarantees a key everywhere (production hard-fails without one, dev/test get a key persisted to `.dev/note-key`, §10). There is no plaintext column, flag, or code path to forget |
+| Every user has exactly **one** `settings` row | Inserted by the same transaction as the `users` insert in every account-creating path (`setup`, `register`, `POST /api/users`) — that is PR-07's job because PR-07 owns them and merges before anything reads settings. `settings.service.get()` then get-or-creates (`INSERT … ON CONFLICT (user_id) DO NOTHING`, then select) as the belt for rows made outside those paths, so `GET /api/settings` can't 404 and `PATCH /api/settings` can't match 0 rows (PR-09); `user_id` being the PK is what makes "exactly one" structural |
 | Every note row has a **decryptable** content triple | `note.service.create` always calls `sealNoteContent(content ?? '')`, so a content-less `POST /api/notes` still stores a real 12-byte IV + 16-byte tag for the empty string; `openNoteContent()` never sees empty `content_cipher`/`content_iv` (a 0-byte IV makes GCM throw and surface as `INTERNAL`) |
 | The install has an **owner** before anyone else can join | `auth.service.ts` refuses `POST /api/auth/register` with `FORBIDDEN` while no `role='owner'` row exists, and `needsSetup` is defined as “no owner row”, so a self-sign-up can never occupy the empty DB and lock `/setup` out (§9.2 #2–#4). `users_one_owner_uidx` keeps the other half: at most one owner |
 
@@ -488,7 +491,7 @@ reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 | 19 | `PATCH /api/notes/:id` | yes | `{name?, folderId\|null}` | `200 NoteNode` | rename / move (`folderId: null` = move to root); `notes.name` stays extension-free |
 | 20 | `DELETE /api/notes/:id` | yes | — | `204` | |
 | 21 | `GET /api/search?q=&limit=` | yes | — | `{results:[{noteId,name,folderPath,snippet,score}]}` | name match in SQL + body match after decrypt (cap 500 candidates) |
-| 22 | `GET /api/settings` / `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | `autosave`, `theme`; lands in **PR-09** (not PR-16) because PR-14 needs the flag — see both PRs |
+| 22 | `GET /api/settings` / `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | `autosave`, `theme`; lands in **PR-09** (not PR-16) because PR-14 needs the flag — see both PRs. The row is created with the user by **PR-07** (§8 invariant) and get-or-created by `settings.service.get()`, so neither endpoint can 404 or silently update zero rows |
 
 Payload cap: 1 MiB note body (Fastify `bodyLimit`, → `PAYLOAD_TOO_LARGE`); UI warns at 900 KiB.
 
@@ -599,6 +602,7 @@ home/LAN/VM network, possibly behind a reverse proxy.
 | --- | --- | --- |
 | `/setup` | only when `needsSetup` | create the first account (README: self-hosted, first-run) |
 | `/login` | redirect away when authed | username + password, error + rate-limit messaging |
+| `/signup` | only when `registrationOpen` **AND** `!needsSetup`; otherwise redirect to `/login` (`/setup` on a fresh install) | self-sign-up form; creates a `member` (route + guard land in PR-08, server guard in PR-07) |
 | `/welcome` | auth | **placeholder home created by PR-08** (signed-in card + sign-out control); deleted by PR-12 when `/app` lands |
 | `/app` | auth | AppShell; default view = recent notes + "New note" |
 | `/app/note/$noteId` | auth | editor + preview for one note |
@@ -738,8 +742,18 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `cross-env NODE_ENV=development …` if the owner develops on Windows — §21). `.env.example` ships
   `NODE_ENV=development`, and the README quick start says `cp .env.example .env` — but PR-01 must boot **without** any
   `.env`, because the Makefile that copies it only arrives in PR-02 and `env.ts` (created here) rejects an unset
-  `NODE_ENV` in every environment (§10, §16). The DB scripts are **not** stubbed here: `db:generate`/`db:migrate` arrive with PR-04
-  and `db:seed` with PR-09, when the runner/script behind them exists. `pnpm-workspace.yaml`, `tsconfig.base.json`
+  `NODE_ENV` in every environment (§10, §16). **Loading `.env` for host processes is a PR-01 artifact too:** `env.ts`
+  exports `loadDevEnvFile()`, which `index.ts` calls before parsing, and PR-04/PR-09 reuse it from
+  `drizzle.config.ts`, the integration Vitest setup and `scripts/seed-demo.ts` (§16's "How the repo-root `.env` reaches
+  a process"). Compose's `--env-file` feeds Compose's interpolation only, so without that function `pnpm dev` here,
+  `pnpm db:migrate`/`drizzle-kit` and `pnpm test:integration` in PR-04, and `db:seed` in PR-09 would each silently
+  ignore the very file the README tells the reader to create. A function, not a repeated flag: plain `node --env-file`
+  hard-fails when the file is missing (verified on 22.22 — exit 9), which contradicts this PR's own bare-clone
+  acceptance, and the softer `--env-file-if-exists=../../.env` would need a different relative path per entry point
+  (`tsx` runs from `apps/server/`, drizzle-kit and Vitest read their own configs, the image runs `dist/…`) and would
+  still have to be added to `db:migrate`, `db:seed` and `test:integration` separately (§16). The DB scripts are
+  **not** stubbed here: `db:generate`/`db:migrate` arrive with PR-04 and `db:seed` with PR-09, when the runner/script
+  behind them exists. `pnpm-workspace.yaml`, `tsconfig.base.json`
   (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`), `biome.json`,
   `.editorconfig`, `.gitignore`, `.dockerignore`, `.nvmrc`, `LICENSE` (MIT — confirm in §21), `.env.example`,
   `apps/server/{package.json,tsconfig.json,vitest.config.ts,src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}}`,
@@ -763,7 +777,7 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `pnpm lint`, `pnpm typecheck`,
   `pnpm test`, `pnpm build` all exit 0; `vite` proxies `/api` to `:3000`; server built with `tsc` (no bundler) to `apps/server/dist`,
   web built to `apps/web/dist`; `env.ts` rejects unknown/missing required vars and is unit-tested; **no `db:*` script is registered yet** (`pnpm db:migrate` fails as an unknown script until PR-04 adds it, and nothing in CI calls it before then).
-- **Tests:** `env.test.ts` (prod invariants), `app.test.ts` (`app.inject('/api/health')` = 200).
+- **Tests:** `env.test.ts` (prod invariants, plus the `.env` loader via `DOTENV_PATH` pointing at a temp fixture: file values appear when the process env lacks them, a value already in the process env wins, a missing file is a silent no-op, a malformed file throws, and with `NODE_ENV=production` the file is never opened at all — §16), `app.test.ts` (`app.inject('/api/health')` = 200).
 - **Out of scope:** any DB code, any real UI.
 
 #### PR-02 — Local dev infrastructure (Postgres in Docker, Make)
@@ -786,7 +800,9 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   and `make dev` serves the hello-world
   app + `GET /api/health` = `ok`. A README "Local development" section documents those commands; no committed
   credentials (dev defaults only); changing `POSTGRES_PORT` in the repo-root `.env` actually changes the host port
-  after `make db-up` (proves the env file is really being read).
+  after `make db-up` (proves the env file is really being read **by Compose** — the other half, the host process reading
+  the same file through PR-01's `loadDevEnvFile()`, is asserted in PR-04, where the first DB-backed command exists).
+
 - **Explicitly not asserted here:** `pnpm db:migrate` / `pnpm db:seed` — they cannot pass before PR-04 (schema,
   drizzle config, migration runner) and PR-09 (demo user + tree). PR-04 owns the first green `db:migrate`, PR-09 owns
   `scripts/seed-demo.ts` + `pnpm db:seed`.
@@ -828,13 +844,20 @@ merge with the placeholder still in place — see "Jobs added later" below)
   (the notes repo stores **opaque** `content_cipher`/`content_iv`/`key_version` triples supplied by its caller — it never
   sees plaintext, because the schema has no plaintext representation; PR-04's tests insert fixed test blobs, and PR-06
   plugs the real `crypto/envelope.ts` in behind the same interface). Also creates **`apps/server/vitest.integration.config.ts`**
-  with `include: ['src/**/*.int.test.ts']` — the only config that reads `DATABASE_URL` — and every DB-backed file it adds
+  with `include: ['src/**/*.int.test.ts']` — the only config that reads `DATABASE_URL` — and one of the two host entry points that must call PR-01's
+  `loadDevEnvFile()` itself (its Vitest setup file, plus the top of `drizzle.config.ts`: neither Vitest nor drizzle-kit
+  imports `env.ts` on its own, so without those calls `pnpm test:integration` and `pnpm db:migrate` would keep using the
+  in-code dev default after anyone edited `.env` — §16) — and every DB-backed file it adds
   (`db/repositories/*.int.test.ts`) carries that suffix, which is what keeps `pnpm test` and the Postgres-free `unit` job
   green from here on (§14's split rule, pre-configured in PR-01).
   Also **modify `.github/workflows/CI.yml`** to add the `integration` job (`services: postgres:16` + `DATABASE_URL` →
   `pnpm test:integration`, and the new `pnpm coverage:integration` step that produces the DB-dependent coverage numbers —
   §14) — this is the PR that makes that job meaningful (see PR-03).
-- **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB; integration tests
+- **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB — and run with **nothing
+  exported in the shell** but the repo-root `.env` a cold clone has: flipping `POSTGRES_PORT` there (and recreating the
+  dev `db`) makes `pnpm db:migrate` follow it, proving PR-01's `loadDevEnvFile()` really runs inside the drizzle-kit path,
+  while an explicitly exported `DATABASE_URL=…` overrides the file (the precedence §16 states, and how the CI `integration`
+  job's value wins); integration tests
   prove: sibling uniqueness (folder & note), **root-level rows work** (`folders.parent_id IS NULL` and
   `notes.folder_id IS NULL` insert, and two root notes with the same name collide while a root note and a note inside
   a folder do not), cascade delete of nested folders, `notes.version` conditional update
@@ -976,6 +999,12 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `routes/auth.routes.ts` (§9.2 #2–#9: status/setup/**register**/login/logout/**logout-all**/session/password),
   `routes/users.routes.ts` (§9.2 #10/#11),
   `plugins/auth-guard.ts`, `plugins/csrf.ts`, `http/rate-limit.ts`, argon2 hashing utils, `auth_attempts` writes.
+  **Every account-creating path (`setup`, `register`, `POST /api/users`) inserts the default `settings` row in the same
+  transaction as the `users` insert** — `settings.user_id` is the PK (§8), there is no trigger, and PR-07 is the PR that
+  owns user creation, so the row cannot be left to PR-09 (which merges later) or to the settings UI (PR-16): an owner
+  created here would otherwise have no row for `GET /api/settings` to read and `PATCH /api/settings` would match zero
+  rows, which is exactly what PR-14's autosave flag and PR-16 then break on. The insert is plain Drizzle on the
+  `settings` table from `db/schema.ts` (PR-04); `settings.repo.ts` itself still lands in PR-09.
   `POST /api/auth/register` exists to make `ALLOW_REGISTRATION` real: 403 when the flag is false, **403 while no
   `role='owner'` row exists** (a fresh DB is bootstrapped by `/setup` only — otherwise the first visitor self-signs-up as a
   `member`, which would flip `needsSetup` and lock `/setup` out, leaving the install with no owner: §8 invariant, §9.2 #2/#4),
@@ -1007,6 +1036,12 @@ merge with the placeholder still in place — see "Jobs added later" below)
   answers 403 and `GET /api/auth/status` still reports `needsSetup: true`; only after `POST /api/auth/setup` does register
   succeed.** Missing that guard leaves an install with zero owners, `/setup` permanently `CONFLICT`, and the owner-only
   `POST /api/users` unreachable (§8, §9.2 #2/#4).
+  **Default `settings` row per account:** after `setup`, after `register` (flag true, owner already exists) and after
+  `POST /api/users`, `SELECT * FROM settings WHERE user_id = <new user>` returns exactly **one** row carrying §8's
+  defaults (`autosave = true`, `theme = 'system'`), because the user insert and the settings insert share one
+  transaction — and a user insert that is rolled back leaves no orphan settings row behind. Asserted here, not in PR-09:
+  PR-07 owns every account-creating path and merges first, while PR-09's `GET /api/settings`, PR-14's autosave flag and
+  PR-16's UI are the consumers that assume the row already exists.
   `reset-password.ts` (executed as a subprocess against the test DB): unknown username ⇒ non-zero exit and no writes;
   success ⇒ the new password logs in, **all** of that user's sessions are gone, and that user's
   `folders`/`notes`/`settings` rows are untouched — the regression guard against anyone "simplifying" recovery into
@@ -1051,8 +1086,12 @@ decrypt it)
   `scripts/seed-demo.ts` (idempotent demo user + tree, guarded by `NODE_ENV !== 'production'`) wired to a new
   `pnpm db:seed` script/target — the earliest point at which a seed can hash a password (PR-07) and write real
   `folders`/`notes` rows.
-- **Settings API lands here, not in PR-16:** `GET /api/settings` + `PATCH /api/settings` (§9.2 #22), with the
-  `settings` row created on user insert. PR-14 must honor `settings.autosave`, and PR-16 depends on PR-14, so an API
+- **Settings API lands here, not in PR-16:** `GET /api/settings` + `PATCH /api/settings` (§9.2 #22). The **row** is not
+  created here: PR-07 inserts it in the same transaction as every `users` insert (PR-07 Create + Acceptance), because
+  that PR owns account creation and merges first. `settings.service.get()` is still **get-or-create** —
+  `INSERT INTO settings (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING` then select — so a user that predates or
+  bypasses PR-07 (PR-04's raw-insert fixtures, the seed script, a hand-restored row) reads §4 defaults instead of a 404,
+  and `PATCH` can never match zero rows. PR-14 must honor `settings.autosave`, and PR-16 depends on PR-14, so an API
   that only lands in PR-16 would be circular. PR-16 keeps the settings **UI** (page, theme, change-password form).
 - **Behavior:** `GET /api/tree` one recursive CTE (ordered folders-then-notes, `name` collation `C`);
   create/rename/move with sibling-uniqueness ⇒ `CONFLICT` (body carries the conflicting `id`); move-to-self/descendant
@@ -1094,6 +1133,12 @@ decrypt it)
   (PR-06's empty-string seal, proven over HTTP); and a row whose ciphertext fails authentication — forced by rewriting the
   stored blob directly — makes `GET /api/notes/:id` answer `INTERNAL` with the note id logged and **never**
   blank-or-garbage content (the mapping `plugins/error-handler.ts` gained in PR-05).
+  **Settings on a user with no row** (the state PR-04's raw-insert fixtures are in, and the belt for anything that
+  bypasses PR-07's transaction): `GET /api/settings` answers §4's defaults with `200` — never `404`, never an empty body —
+  and leaves exactly one `settings` row behind, which a second `GET` then reads back; `PATCH /api/settings {autosave:false}`
+  on such a user updates **one** row and returns the new value, so the zero-row update this endpoint would otherwise be
+  able to produce is asserted impossible here rather than discovered by PR-14's autosave toggle or PR-16's settings page.
+
 - **Tests:** ≥ 25 assertions; `services` coverage ≥ 80% lines (the `{services,db,routes}` row of the §14 table, measured
   by `pnpm coverage:integration` in the `integration` job — it reaches 85% only after PR-19 ratchets the thresholds).
 - **Out of scope:** content versioning endpoint (PR-10), search (PR-11), UI (PR-12).
@@ -1164,7 +1209,7 @@ decrypt it)
   + `useAutosave()` hook, `SaveStatus`, `ConflictBanner`,
   draft mirror in `localStorage`, `visibilitychange`/`pagehide` flush under the §11.4 60 KiB `keepalive` budget
   (never `sendBeacon`). The flag itself is read by the caller from `GET /api/settings` (§9.2 #22, landed in **PR-09**)
-  and injected, so this PR needs no settings UI — PR-16 supplies the real value.
+  and injected, so this PR needs no settings UI — PR-16 supplies the real value. The read is get-or-create (PR-07 creates the row with the user, PR-09 re-creates it if absent), so a missing settings row can never silently flip autosave here.
 - **Acceptance (fake-timer unit tests):** typing 5× in 200 ms ⇒ exactly **one** `PUT`; no write for 2 s idle;
   force-flush at 10 s; flush on unmount; backoff schedule exact; `VERSION_CONFLICT` ⇒ conflict state and the
   buffer is retained; "Keep mine" retries with the fresh server `version`; "Use server" replaces the buffer and
@@ -1462,8 +1507,14 @@ Rules:
 **Dev** (PR-02): `make db-up` → Postgres 16 on `localhost:5432` in Docker; the app runs on the host with
 `pnpm dev` (`tsx watch` API on `:3000`, Vite on `:5173` proxying `/api`). No key setup is needed in dev:
 `.env.example` ships `NODE_ENV=development` plus the dev `POSTGRES_*`/`DATABASE_URL`/`HOST_PORT` defaults, and every compose-facing
-make target depends on a `bootstrap-env` step (`test -f .env || cp .env.example .env`) before it can pass `--env-file .env`. That
-value is what selects the generated-and-persisted dev key path described in §10 — with `NODE_ENV` unset the boot guard fails here too.
+make target depends on a `bootstrap-env` step (`test -f .env || cp .env.example .env`) before it can pass `--env-file .env`.
+The `NODE_ENV` line in that file is what Compose interpolation and `scripts/check-env.ts` see; the **process** gets
+`NODE_ENV` from the dev script (`dev:server`, PR-01) or the container's `environment:` block, never from the file (§16),
+and that process value is what selects the generated-and-persisted dev key path described in §10 — with `NODE_ENV` unset
+the boot guard fails here too. The other values reach a host process through PR-01's `loadDevEnvFile()` (§16): Compose's
+`--env-file .env` feeds Compose's *own* interpolation only, so without that loader `pnpm dev`, `pnpm db:migrate`,
+`pnpm db:seed` and `pnpm test:integration` on the host would ignore the very file `bootstrap-env` has just created.
+
 **Production** (PR-18):
 
 ```bash
@@ -1584,7 +1635,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; `DATABASE_URL` must embed the same value |
 | `POSTGRES_DB` | `notetaker` | ✔ **in `.env` whenever compose is used** | database created by the `db` image's first init; also interpolated into the app's `DATABASE_URL` by `compose.yml` and used as the base for the §15 restore drill's `<db>_restore` — so it must be written in `.env` like `POSTGRES_USER`, not left to Compose's default |
 | `POSTGRES_PORT` | `5432` | — | host port published for the **dev** compose `db` only (`docker/compose.dev.yml`); the prod `db` publishes nothing |
-| `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ **only when the API runs outside compose** | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2); the `localhost` default is the value for running the API on the host against the dev compose DB. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB |
+| `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ **only when the API runs outside compose** | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2); the `localhost` default is the value for running the API on the host against the dev compose DB. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB. On the host this value arrives from the repo-root `.env` through PR-01's `loadDevEnvFile()`, which also carries it as an in-code default in `development`/`test` **only** — never in production (§16) |
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
 | `SESSION_TTL_DAYS` | `30` | — | session cookie + DB expiry |
 | `SECURE_COOKIES` | `false` (dev) | ✔ `true` behind TLS | `Secure` cookie flag |
@@ -1597,11 +1648,46 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
 | `LOG_LEVEL` | `info` | — | pino level |
+| `DOTENV_PATH` | `<repo root>/.env` | — | override for the file `env.ts`'s `loadDevEnvFile()` reads — dev/test only, and only used by tests pointing it at a fixture (§16) |
 | `APP_NAME` | `Note Taker` | — | title shown in the SPA |
 
 `env.ts` (Zod-parsed) fails fast with a readable list of problems; `scripts/check-env.ts` adds the cross-field
 prod rules. **Never** commit a real `.env`; `.gitignore` covers `.env*` except `.env.example`.
 
+**How the repo-root `.env` reaches a process (PR-01 owns this; §15 explains the Compose side).** Compose's
+`--env-file .env` feeds Compose's *own* interpolation only (§15) and `env.ts` reading `process.env` is not a loader, so
+the plan states the mechanism instead of leaving it implicit:
+
+- `apps/server/src/env.ts` exports **`loadDevEnvFile()`**, called at the top of every host-run entry point — `index.ts`
+  (dev server), the Vitest **setup file of `vitest.integration.config.ts`** (PR-04), `drizzle.config.ts` (PR-04, because
+  drizzle-kit never imports `env.ts` on its own), `scripts/seed-demo.ts` (PR-09) and `scripts/check-env.ts` (PR-18). It
+  does nothing unless the **process** `NODE_ENV` is `development` or `test`; then it resolves the file as
+  `process.env.DOTENV_PATH ?? <repo root>/.env`, the repo root being the first directory at or above
+  `import.meta.dirname` that contains `pnpm-workspace.yaml` (a fixed `../../.env` is wrong: from
+  `apps/server/src/env.ts` under `tsx` that lands on `apps/.env`, and the depth changes again once the file is
+  compiled to `apps/server/dist/…`). It calls `process.loadEnvFile(path)` inside a `try` that swallows only `ENOENT`
+  (a missing file is normal — PR-01 boots from a bare clone — while a *malformed* file must fail loudly), and both
+  behaviors are asserted in PR-01's unit tests. Node 22 built-in, so no `dotenv` dependency; `node
+  --env-file-if-exists=…` exists on this Node version too, but it must be repeated in every workspace script, cannot
+  express the `NODE_ENV` gate, and does not run inside `drizzle-kit` or Vitest, so the rule lives in one exported
+  function instead.
+- **The file can never supply `NODE_ENV`.** The gate reads the value already in the **process** environment, so a stray
+  `.env` cannot turn a production boot into a development one and `env.ts`'s "`NODE_ENV` is required, there is no
+  default" rule (§10, PR-01's acceptance) survives the loader. `.env.example`'s `NODE_ENV=development` line is there for
+  Compose interpolation and `scripts/check-env.ts`, not to rescue a host process started outside `pnpm dev`.
+
+- **Precedence: the environment beats the file.** `process.loadEnvFile` does not overwrite already-set keys (verified
+  on Node 22.22), so CI's explicit `DATABASE_URL`, the container environment Compose injects, and a one-off
+  `DATABASE_URL=… pnpm db:migrate` always win over `.env`. The file only fills gaps.
+- **`DATABASE_URL` does have an in-code default — in `development`/`test` only**, exactly the value in the table above
+  (`…@localhost:5432/notetaker`), which is what makes a bare clone usable before PR-02 copies `.env.example` and keeps
+  PR-04's local `test:integration` working against `make db-up`'s published dev `db`. In `production` there is **no
+  default**: `env.ts` fails the boot unless `DATABASE_URL` is set, and in the Compose stack the value comes from the
+  `app` service's `environment:` block, whose host is the service name `db` (§15). A production process pointed at
+  `localhost` is therefore always an explicit choice, never an accident.
+- The consequence PR-02/PR-04 acceptance asserts: editing `POSTGRES_PORT` or `POSTGRES_PASSWORD` in the repo-root `.env`
+  changes **both** what the dev `db` container publishes and what the host API, `pnpm db:migrate` and the integration
+  tests connect to, because both sides read the same file.
 
 ---
 

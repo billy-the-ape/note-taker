@@ -221,11 +221,12 @@ note-taker/
 │   ├── compose.yml                            PR-18  (app + db, one published port)
 │   ├── compose.dev.yml                        PR-02  (db only)
 │   └── entrypoint.sh                          PR-18  (exec node only — env checks + migrations run inside the compiled bootstrap)
-├── scripts/
-│   ├── generate-keys.ts                       PR-06  (NOTE_ENCRYPTION_KEY)
-│   ├── rotate-note-key.ts                     PR-06  (re-encrypt all rows)
-│   ├── seed-demo.ts                           PR-09  (demo user + sample tree; needs auth+repos)
+├── scripts/                                   DEV/CI ONLY — never shipped, never the way an operator does anything
+│   ├── generate-keys.ts                       PR-06  (prints a fresh key to stdout; the operator copies it into `.env`)
+│   ├── seed-demo.ts                           PR-09  (demo user + sample tree; guarded by NODE_ENV ≠ production)
 │   └── check-env.ts                           PR-18  (dev/CI fail-fast on missing/prod-unsafe env; the same rules live in the compiled `env.ts` at boot)
+│                                              Operator scripts live under apps/server/src/scripts/ (see above) so they
+│                                              are compiled into `dist/` and can run inside the production image.
 ├── packages/
 │   └── contracts/                             PR-05  (no runtime deps except zod)
 │       ├── package.json  tsconfig.json  vitest.config.ts
@@ -238,7 +239,7 @@ note-taker/
 │           ├── folders.schemas.ts             createFolderSchema, patchFolderSchema, deleteOptionsSchema
 │           ├── settings.schemas.ts            settingsSchema, patchSettingsSchema
 │           ├── search.schemas.ts              searchQuerySchema, searchResultSchema
-│           ├── names.ts                       NOTE_NAME rules + newFileName(msEpoch) + stripExtension()
+│           ├── names.ts                       NOTE_NAME rules + newFileName(msEpoch) + stripMd()/withMd()
 │           ├── routes.ts                      ROUTES path constants shared by client & server
 │           └── *.test.ts                      unit tests (name rules, uniqueness suffixing, validation edges)
 └── apps/
@@ -264,6 +265,8 @@ note-taker/
     │       ├── crypto/envelope.ts             PR-06 encrypt/decrypt AES-256-GCM
     │       ├── crypto/keys.ts                 PR-06 keyring from env (current + previous versions)
     │       ├── crypto/envelope.test.ts        PR-06 roundtrip, tamper, wrong key, rotation
+    │       ├── scripts/rotate-note-key.ts     PR-06 operator script — compiled into `dist/scripts/`, runs INSIDE the image
+    │       ├── scripts/reset-password.ts      PR-07 operator script — same; the only supported password recovery
     │       ├── plugins/auth-guard.ts          PR-07 session resolution + `requireAuth` preHandler
     │       ├── plugins/error-handler.ts       PR-05 zod/Drizzle/domain errors → envelope
     │       ├── plugins/csrf.ts                PR-07 cookie-to-header double submit
@@ -336,7 +339,9 @@ Rules the map enforces:
 ## 8. Data model
 
 Postgres 16. Drizzle schema is the source of truth; `drizzle-kit generate` produces committed SQL in
-`apps/server/migrations/`. UUIDv7 PKs (`crypto.randomUUID()` is acceptable; keep one helper `newId()`).
+`apps/server/migrations/`. UUID PKs — **UUIDv7 preferred** (one `newId()` helper wrapping `@uuidjs/uuid-v7`);
+Node's `crypto.randomUUID()` is **v4** and is an acceptable fallback because nothing in the MVP orders rows by id.
+Either way there is exactly one `newId()`, and every insert goes through it.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid() fallback for defaults
@@ -417,7 +422,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 | --- | --- |
 | Every folder/note belongs to exactly one user | `user_id` NOT NULL + `WHERE user_id = auth.userId` on **every** repository query; cross-user access returns `404`, never `403` (no enumeration). **This applies to ids arriving in bodies too** (`POST /api/notes {folderId}`, `POST /api/folders {parentId}`, `PATCH … {parentId|folderId}`): the FKs (`notes.folder_id → folders.id`, `folders.parent_id → folders.id`) do **not** carry `user_id`, so the service must load the target folder scoped to `auth.userId` and answer `404 NOT_FOUND` before inserting/moving — otherwise user A could attach rows into user B's tree, probe folder ids through FK violations, and lose rows in B's cascade delete. (Backlog alternative: composite `(user_id, id)` unique + FKs — see §12 PR-09 create list.) |
 | Sibling names unique (case-sensitive, trimmed, no `/`, no control chars, ≤ 120 chars) | DB unique index + Zod refinements in `contracts` |
-| Note name never contains the `.md` extension in the DB | `stripExtension()` in `contracts/names.ts`, applied in `note.service.ts` |
+| Note name never contains the `.md` extension in the DB | `stripMd()` in `contracts/names.ts` (display adds it back via `withMd()`), applied in `note.service.ts` |
 | A folder cannot be moved inside itself | `folder.service.ts` CTE ancestor walk → `CONFLICT` |
 | `note.version` monotonic | conditional `UPDATE … WHERE id = $1 AND version = $2 RETURNING` → 0 rows ⇒ `409` |
 | Deleting a folder removes descendants | `ON DELETE CASCADE`, gated by explicit `?cascade=true` in the API |
@@ -530,7 +535,8 @@ home/LAN/VM network, possibly behind a reverse proxy.
 - AES-256-GCM, 256-bit master key from `NOTE_ENCRYPTION_KEY` (base64), AAD = `note:<uuid>` so ciphertexts are not
   portable between rows; fresh 12-byte IV per write; `key_version` per row.
 - Keyring supports one *current* key plus N *previous* keys (`NOTE_ENCRYPTION_KEY_PREVIOUS`, JSON map
-  `{"1": "<base64>"}`) so `scripts/rotate-note-key.ts` can read old rows and rewrite them with the new key. The current
+  `{"1": "<base64>"}`) so the operator script `apps/server/src/scripts/rotate-note-key.ts` (compiled into
+  `apps/server/dist/scripts/`, run inside the production image — §15) can read old rows and rewrite them with the new key. The current
   key's version is **its own variable — `NOTE_ENCRYPTION_KEY_VERSION` (integer, default `1`)** — never derived from the
   `_PREVIOUS` map (deriving it as `max(previous)+1` collapses back to 1 the moment the map is emptied, silently
   orphaning rows tagged 2). Rotation therefore: set the new key + bump the version, move the old key into `_PREVIOUS`,
@@ -638,7 +644,10 @@ saving/clean ──VERSION_CONFLICT──▶ conflict ──(user picks)──�
   `Autosave off — Ctrl+S to save`.
 - When `settings.autosave === false`: no debounce writes; `Ctrl/Cmd+S` and the explicit Save button still work;
   navigating away with a dirty buffer prompts ("Save / Discard / Stay").
-- Autosave is disabled while a `CONFLICT` state is unresolved.
+- Autosave is disabled while the engine is in its **`conflict`** state (the autosave state machine's own state name,
+  entered when the API answers `VERSION_CONFLICT`). Note the vocabulary: `VERSION_CONFLICT` is the API error code for a
+  stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
+  reacts to the latter.
 
 ### 11.5 UX details that the README implies and must not be skipped
 
@@ -698,15 +707,23 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 - **Goal:** a cloneable repo where `pnpm i && pnpm dev` serves a page and `pnpm build` produces a deployable
   artifact; all quality gates exist from day one so later PRs can only *add* tests, never bolt on tooling.
 - **Create:** `package.json` (root, `packageManager`, workspace scripts: `dev build lint format typecheck test
-  test:integration coverage`) — the DB scripts are **not** stubbed here: `db:generate`/`db:migrate` arrive with PR-04
+  test:integration coverage`) — **and the dev scripts must carry `NODE_ENV` themselves**: `dev` runs `dev:server` +
+  `dev:web`, and `dev:server` is `NODE_ENV=development tsx watch src/index.ts` (POSIX; the Windows-safe variant
+  `cross-env NODE_ENV=development …` if the owner develops on Windows — §21). `.env.example` ships
+  `NODE_ENV=development`, and the README quick start says `cp .env.example .env` — but PR-01 must boot **without** any
+  `.env`, because the Makefile that copies it only arrives in PR-02 and `env.ts` (created here) rejects an unset
+  `NODE_ENV` in every environment (§10, §16). The DB scripts are **not** stubbed here: `db:generate`/`db:migrate` arrive with PR-04
   and `db:seed` with PR-09, when the runner/script behind them exists. `pnpm-workspace.yaml`, `tsconfig.base.json`
   (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`), `biome.json`,
   `.editorconfig`, `.gitignore`, `.dockerignore`, `.nvmrc`, `LICENSE` (MIT — confirm in §21), `.env.example`,
   `apps/server/{package.json,tsconfig.json,vitest.config.ts,src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}}`,
   `apps/web/{package.json,tsconfig.json,vite.config.ts,index.html,src/{main.tsx,routes/__root.tsx,styles/globals.css}}`,
   minimal `apps/web/src/routes/index.tsx` placeholder that renders a "coming soon" card.
-- **Acceptance:** `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build` all exit 0; `GET /api/health` returns
-  `{status:'ok'}`; `vite` proxies `/api` to `:3000`; server built with `tsc` (no bundler) to `apps/server/dist`,
+- **Acceptance:** **from a bare clone with no `.env` file present**, `pnpm i && pnpm dev` boots and
+  `GET /api/health` returns `{status:'ok'}` — i.e. the dev path supplies `NODE_ENV=development` on its own; the same
+  command with `NODE_ENV` explicitly cleared (`env -u NODE_ENV pnpm dev:server`) exits non-zero with the readable
+  `env.ts` complaint, proving the guard is live rather than accidentally satisfied; `pnpm lint`, `pnpm typecheck`,
+  `pnpm test`, `pnpm build` all exit 0; `vite` proxies `/api` to `:3000`; server built with `tsc` (no bundler) to `apps/server/dist`,
   web built to `apps/web/dist`; `env.ts` rejects unknown/missing required vars and is unit-tested; **no `db:*` script is registered yet** (`pnpm db:migrate` fails as an unknown script until PR-04 adds it, and nothing in CI calls it before then).
 - **Tests:** `env.test.ts` (prod invariants), `app.test.ts` (`app.inject('/api/health')` = 200).
 - **Out of scope:** any DB code, any real UI.
@@ -785,7 +802,8 @@ merge with the placeholder still in place — see note)
   registered inside `buildApp()`). Later PRs only *add mapping cases* to those two files — they never re-create them.
 - **Key content:** `names.ts` =
   `NOTE_NAME_MAX=120`, `NOTE_NAME_RE` (no `/ \ : * ? " < > |`, no control chars, no leading/trailing space, no `.`/`..`),
-  `newFileName(msEpoch) => \`new-file-${msEpoch}.md\``, `splitExtension(name)`, `ensureMd(name)`, `uniquify(name, taken)`
+  `newFileName(msEpoch) => \`new-file-${msEpoch}.md\``, `stripMd(name)` (drops a trailing `.md`, case-insensitive),
+  `withMd(name)` (display-only re-append), `uniquify(name, taken)`
   (`…-2.md`, `-3.md`), plus `createNoteSchema.superRefine` enforcing them; folder name rules (no extension handling).
 - **Acceptance:** `pnpm -w typecheck` resolves contracts from both apps; contract unit tests cover name rules
   (unicode, 121 chars, path chars, existing sibling, **and the stripped-name edge cases from A.1: `"..md"` and `"foo .md"` are rejected because every rule runs on `stripMd(name)`**), error envelope typing, `uniquify` sequences.
@@ -799,8 +817,8 @@ merge with the placeholder still in place — see note)
 - **Create:** `crypto/keys.ts` (parse `NOTE_ENCRYPTION_KEY` — or read the key from `NOTE_ENCRYPTION_KEY_FILE` when set, so a
   mounted secret file works without shell interpolation — plus `NOTE_ENCRYPTION_KEY_PREVIOUS` and
   **`NOTE_ENCRYPTION_KEY_VERSION`** (integer, default `1`): the version tag stamped into `notes.key_version` for the
-  *current* key. It is **explicit, never derived** — computing it as `max(previous)+1` would reset to 1 the moment
-  `_PREVIOUS` is dropped and make version-2 rows undecryptable. The keyring is therefore
+  *current* key. It is **explicit, never derived** — deriving it as `max(previous)+1` resets to 1 the moment `_PREVIOUS`
+  is dropped, which silently makes every version-2 row undecryptable. The keyring is therefore
   `{current: {version: NOTE_ENCRYPTION_KEY_VERSION, key}, previous: Map<version, key>}`, which is exactly what A.3's
   `keyring.current.version` reads; and, **only** when
   `NODE_ENV` is `development`/`test` and neither is set, generate one key on first boot and persist it to
@@ -808,15 +826,25 @@ merge with the placeholder still in place — see note)
   survive restarts — production never takes this path, §10), validate 32 bytes,
   expose `keyring`, fingerprint log), `crypto/envelope.ts` (`encrypt(plain, {keyVersion, aad}) → {cipher, iv,
   keyVersion}`, `decrypt(...)`, `sealNoteContent()/openNoteContent()`), refactor `notes.repo.ts` to store
-  `content_cipher/content_iv/key_version/content_bytes/word_count`, `scripts/generate-keys.ts`,
-  `scripts/rotate-note-key.ts` (streams rows, re-encrypts, batched in transactions, idempotent, `--dry-run`),
-  `.env.example` additions, ADR-0002 stub.
+  `content_cipher/content_iv/key_version/content_bytes/word_count`, root `scripts/generate-keys.ts` (dev/CI only — prints
+  a fresh key to stdout; §15 gives the `docker run --rm node:22-slim …` one-liner as the operator-facing equivalent),
+  and **`apps/server/src/scripts/rotate-note-key.ts`** — the operator-facing rotation script. It lives under
+  `apps/server/src/` on purpose: it is TypeScript inside the server workspace, so `pnpm build` (`tsc`) emits
+  `apps/server/dist/scripts/rotate-note-key.js`, which the PR-18 image copies. It has **no dev-only dependency** (only
+  `db/client.ts`, `crypto/*`, `env.ts`), streams rows, re-encrypts, batches in transactions, is idempotent, supports
+  `--dry-run` and `--verify`, and is invoked in production with
+  `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/rotate-note-key.js`
+  (same DB connection, same keyring, no extra network exposure — the prod `db` publishes no port). `.env.example`
+  additions. The ADR-0002 write-up itself belongs to PR-20 (§7 maps every file to one PR); this PR only leaves a
+  `// ADR-0002` comment in `crypto/envelope.ts` pointing at where it will land.
 - **Acceptance:** round-trip test; tamper test (flip a ciphertext byte ⇒ `decrypt` throws ⇒ API surfaces
   `INTERNAL` + logs note id, never blank content); wrong-key test; **key-version rules**: the current key's version comes
-  from `NOTE_ENCRYPTION_KEY_VERSION` (default `1`) and is written into every new row; `rotate-note-key.ts` bumps that
-  version, moves the old key into `_PREVIOUS`, and **rewrites every row's `key_version` to the new current version**
-  (assert: row count per version before/after — nothing keeps the old tag), while pre-rotation rows stay decryptable as
-  long as their version is still in `_PREVIOUS`; deleting a `_PREVIOUS` entry whose version is still referenced makes
+  from `NOTE_ENCRYPTION_KEY_VERSION` (default `1`) and is written into every new row; the **script** re-encrypts rows and
+  stamps them with the current version; the version/key edits in `.env` and the `up -d` restart are **operator steps**
+  (the script cannot change its own container's environment — §15 numbers them), so acceptance drives the script with an
+  env that already carries `NOTE_ENCRYPTION_KEY_VERSION=2` + the old key in `_PREVIOUS`, runs it, then asserts every row
+  now carries version 2 (row counts per `key_version` before/after — none keeps the old tag) and that rows written under
+  version 1 still decrypt while that entry stays in `_PREVIOUS`; removing a still-referenced `_PREVIOUS` entry makes
   exactly those rows unreadable (the lossy case the explicit version prevents);
   server refuses to boot in production when neither `NOTE_ENCRYPTION_KEY` nor a readable `NOTE_ENCRYPTION_KEY_FILE`
   yields 32 bytes; creating a note seals the **empty string** into a valid envelope that decrypts back to the empty
@@ -837,6 +865,14 @@ merge with the placeholder still in place — see note)
   `POST /api/auth/register` exists to make `ALLOW_REGISTRATION` real: 403 when the flag is false, rate-limited like
   login, creates `role='member'`. `GET /api/auth/status` returns `{needsSetup, registrationOpen}` so the SPA knows
   which form to offer.
+  **`apps/server/src/scripts/reset-password.ts`** — the only supported password recovery. It is a compiled server-side
+  script (same rule as `rotate-note-key.ts`: lives under `apps/server/src/`, ships in the image, run with
+  `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/reset-password.js <username>`,
+  reading the new password from `argv` or a prompt, never from the URL) that **only** updates `users.password_hash` +
+  `password_set_at` and `DELETE`s that user's `sessions` rows. It must not touch anything else: every other `user_id` FK
+  is `ON DELETE CASCADE`, so deleting a user row would destroy their folders, notes and settings, and
+  `POST /api/auth/setup` refuses to run once any user exists — deleting-and-re-setting is not a recovery path, it is
+  data destruction followed by a blocked endpoint.
 - **Acceptance:** integration tests: first-run `needsSetup=true` → `setup` creates owner + session; `setup` after
   that ⇒ `CONFLICT`; login success/failure (uniform 401 `UNAUTHORIZED` message); cookie flags asserted in responses;
   logout invalidates (subsequent `GET /api/auth/session` → `user:null`); password change kills other sessions;
@@ -845,6 +881,10 @@ merge with the placeholder still in place — see note)
   `POST /api/auth/register` ⇒ 403 and accounts can only be created by the owner via `POST /api/users`; with
   `ALLOW_REGISTRATION=true`, `register` creates a `member` + session, `registrationOpen=true` in the status payload,
   and `register` still never creates the first `owner` (`/setup` owns that case).
+  `reset-password.ts` (executed as a subprocess against the test DB): unknown username ⇒ non-zero exit and no writes;
+  success ⇒ the new password logs in, **all** of that user's sessions are gone, and that user's
+  `folders`/`notes`/`settings` rows are untouched — the regression guard against anyone "simplifying" recovery into
+  deleting the user row.
 - **Out of scope:** login UI (PR-08), passkeys (backlog), OAuth/2FA.
 
 #### PR-08 — Auth UI (setup, login, sign-up, session context, route guards, UI kit v1)
@@ -1017,7 +1057,7 @@ note, and the note route belongs to PR-13
 prepared earlier and rebased)
 
 - **Create:** `docker/Dockerfile` (stage 1 build all workspaces with dev deps + `pnpm build`; stage 2
-  `node:22-slim`, **`ENV NODE_ENV=production`** (the runtime image is production by construction — nobody has to remember it), `pnpm deploy --prod` or `npm ci --omit=dev` pruned install, copy `dist`/`migrations`, copy
+  `node:22-slim`, **`ENV NODE_ENV=production`** (the runtime image is production by construction — nobody has to remember it), `pnpm deploy --prod` or `npm ci --omit=dev` pruned install, copy `dist`/`migrations` (`dist` includes `dist/scripts/`, which is how the operator scripts in §15 ship), copy
   `apps/web/dist` into the server's static path, `USER node`, `EXPOSE 3000`, `ENTRYPOINT` (
   `docker/entrypoint.sh` is **only** `exec node apps/server/dist/index.js` — no `pnpm`, no `tsx`, no `.ts` execution in
   the runtime layer, because stage 2 is a pruned `node:22-slim` install with no dev toolchain. Env checks and
@@ -1049,6 +1089,16 @@ prepared earlier and rebased)
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
   `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
+  `NOTE_ENCRYPTION_KEY` is missing in production.
+  **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
+  the backup/restore drill above; the key-rotation drill from §15 — edit `.env` (new key + bumped
+  `NOTE_ENCRYPTION_KEY_VERSION` + old key appended to `_PREVIOUS`), `up -d`, then
+  `docker compose … exec app node apps/server/dist/scripts/rotate-note-key.js --dry-run` → real run → `--verify` exits 0,
+  and a note written *before* the rotation still opens in the browser afterwards; and
+  `docker compose … exec app node apps/server/dist/scripts/reset-password.js <username>` lets that user log in again with
+  the new password while their folders, notes and settings are untouched. If either script needs something the image
+  lacks (pnpm, `tsx`, a `.ts` entry, a published DB port), the fix is to move it under `apps/server/src/scripts/` and
+  re-run, not to add dev tooling to stage 2.
   `NOTE_ENCRYPTION_KEY` is missing in production.
 - **Out of scope:** Kubernetes manifests, TLS termination (documented only), image registry publishing.
 
@@ -1238,7 +1288,26 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
   migrations must be backward-compatible within one minor release — documented rule).
 - Backups: `docker compose --env-file .env -f docker/compose.yml exec -T db pg_dump -U notetaker notetaker | gzip > backup.sql.gz` (`-T` is mandatory: `docker compose exec` allocates a TTY by default, which CRLF-translates the dump and corrupts it)
   **plus the encryption
-  key**; restore + `scripts/rotate-note-key.ts` documented in `docs/DEPLOY.md`. Restore drill is part of PR-18's
+  key**; the restore and the **key-rotation procedure** (the compiled `apps/server/dist/scripts/rotate-note-key.js`, run
+  with `docker compose … exec app node …`) are documented in `docs/DEPLOY.md` — see the procedure below. Restore drill is part of PR-18's
+
+- **Key rotation (the operator procedure `docs/DEPLOY.md` must contain, PR-18; the script itself is PR-06).** The script
+  is compiled into the image, so it runs where the DB and the keyring already are — no pnpm, no `tsx`, no second DB
+  port:
+  1. back up first (previous bullet) — a rotation without a fresh backup is unsupported;
+  2. edit the repo-root `.env` **by hand** (the script cannot change a running container's environment): append the old
+     key to `NOTE_ENCRYPTION_KEY_PREVIOUS` as `{"<old version>": "<old base64>"}`, set the new `NOTE_ENCRYPTION_KEY`,
+     bump `NOTE_ENCRYPTION_KEY_VERSION` to `<old>+1`;
+  3. `docker compose --env-file .env -f docker/compose.yml up -d` so the app process picks the new keyring up (old rows
+     still decrypt through `_PREVIOUS` from this moment on);
+  4. `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/rotate-note-key.js --dry-run`
+     (reports the per-`key_version` row counts it is about to rewrite), then the same command without `--dry-run`;
+  5. `… rotate-note-key.js --verify` ⇒ exit 0 means every row's `key_version` is the current one and every row decrypts;
+  6. only once `--verify` is green may the old entry be removed from `_PREVIOUS` on the next edit of `.env`.
+- **Password recovery:** `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/reset-password.js <username>`
+  (PR-07). It changes the hash and that user's sessions and nothing else. **Never** delete a `users` row to "reset" an
+  account: the `user_id` FKs cascade over sessions/folders/notes/settings and `POST /api/auth/setup` stays blocked while
+  any user exists.
   acceptance criteria (restore with `gunzip -c backup.sql.gz | docker compose … exec -T db psql -U notetaker notetaker`
   into a scratch compose file, then log in and read a note back — the drill must consume exactly the file the backup
   step produces, gzip included).
@@ -1380,8 +1449,16 @@ Defaults in §4 are already implemented by the PRs; these only need a *no* to ch
 6. **Port** — the container listens on `3000`; the host mapping comes from `HOST_PORT` (default `3000`). Any convention
    you want as the documented default in `docs/DEPLOY.md` (e.g. `HOST_PORT=8080`)?
 7. **Theme/branding** — system light/dark only, or a brand color/font pass? (affects PR-08 tokens)
-8. **Password reset** — none in the MVP (no email); recovery = "delete the user row and re-run setup" documented, or
-   should an admin reset flow be added (+½ day, PR-16 extension)?
+8. **Password reset** — no self-service reset in the MVP (no email). The supported recovery is the operator script from
+   PR-07: `docker compose … exec app node apps/server/dist/scripts/reset-password.js <username>` re-hashes the password
+   and drops that user's sessions, and `docs/DEPLOY.md` (PR-18) documents it under troubleshooting. **Deleting the user
+   row is never a recovery path** — every other `user_id` FK is `ON DELETE CASCADE` (sessions, folders, notes, settings),
+   so it destroys the account's data, and `POST /api/auth/setup` then refuses to run because other users still exist.
+   Open question: add an owner-facing reset in the UI (+½ day, PR-16 extension), or keep the CLI-only path?
+9. **Passkey timing** — confirm PR-21 stays post-MVP (recommended: yes).
+10. **Dev host OS** — the dev scripts in PR-01 set `NODE_ENV=development` inline (`NODE_ENV=development tsx watch …`),
+    which assumes a POSIX shell. Windows-only contributors would need `cross-env` in the root `package.json`
+    (+one dependency, no other change). Add it now, or keep the scripts POSIX-only and let WSL be the documented path?
 9. **Passkey timing** — confirm PR-21 stays post-MVP (recommended: yes).
 
 ---

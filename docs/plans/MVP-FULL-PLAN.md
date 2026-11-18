@@ -202,7 +202,8 @@ note-taker/
 │       └── claude-review.yml                  (exists) untouched
 ├── .editorconfig  .gitignore  .dockerignore  .nvmrc  LICENSE      PR-01
 ├── package.json  pnpm-workspace.yaml  tsconfig.base.json  biome.json  PR-01
-├── .env.example                               PR-01 (ships `NODE_ENV=development`; key vars added in PR-06)
+├── .env.example                               PR-01 (ships `NODE_ENV=development`), extended by PR-02
+│                                            (dev DB vars) and PR-06/PR-18 (key + prod vars) — §16
 ├── Makefile                                   PR-02 (dev/db/build/test entry points)
 ├── docs/
 │   ├── plans/MVP-FULL-PLAN.md                 (this file)
@@ -741,8 +742,10 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   leading build is a no-op until PR-05 creates `packages/`, after which it is what lets `tsx`/`vite` resolve
   `@note-taker/contracts` at all — §14), each app's `dev` is its own script, and `apps/server`'s is
   `NODE_ENV=development tsx watch src/index.ts` (POSIX; the Windows-safe variant
-  `cross-env NODE_ENV=development …` if the owner develops on Windows — §21). `.env.example` ships
-  `NODE_ENV=development`, and the README quick start says `cp .env.example .env` — but PR-01 must boot **without** any
+  `cross-env NODE_ENV=development …` if the owner develops on Windows — §21; the rule covers every host script that
+  touches env, listed below). `.env.example` ships `NODE_ENV=development` — that line is for Compose interpolation and
+  for the human editing the file; **no Node process takes its mode from it** (§16) — and the README quick start says
+  `cp .env.example .env`, but PR-01 must boot **without** any
   `.env`, because the Makefile that copies it only arrives in PR-02 and `env.ts` (created here) rejects an unset
   `NODE_ENV` in every environment (§10, §16). **Loading `.env` for host processes is a PR-01 artifact too:** `env.ts`
   exports `loadDevEnvFile()` **and** `databaseUrl()` — the single DSN resolver (§16: a set `DATABASE_URL` is used
@@ -757,7 +760,14 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   (`tsx` runs from `apps/server/`, drizzle-kit and Vitest read their own configs, the image runs `dist/…`) and would
   still have to be added to `db:migrate`, `db:seed` and `test:integration` separately (§16). The DB scripts are
   **not** stubbed here: `db:generate`/`db:migrate` arrive with PR-04 and `db:seed` with PR-09, when the runner/script
-  behind them exists. `pnpm-workspace.yaml`, `tsconfig.base.json`
+  behind them exists. **Every one of those scripts declares its mode inline, exactly as `dev` does** — a PR-01 contract
+  the later PRs implement, because `loadDevEnvFile()` and `databaseUrl()` gate on the *process* `NODE_ENV` (§16) and a
+  `.env` line can never supply it: `db:generate`/`db:migrate` are `NODE_ENV=development drizzle-kit …` (PR-04),
+  `db:seed` is `NODE_ENV=development tsx scripts/seed-demo.ts` (PR-09), `test:integration`/`coverage:integration` are
+  `NODE_ENV=test vitest run --config …` (PR-04), and `check:env` is `NODE_ENV=production tsx scripts/check-env.ts`
+  (PR-18). POSIX form, with the `cross-env` variant under §21 item 10. A script that forgets the assignment dies on
+  §10's missing-`NODE_ENV` message rather than silently choosing a mode — which is the whole point of the gate, so no
+  script may paper over it with a default. `pnpm-workspace.yaml`, `tsconfig.base.json`
   (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`), `biome.json`,
   `.editorconfig`, `.gitignore`, `.dockerignore`, `.nvmrc`, `LICENSE` (MIT — confirm in §21), `.env.example`,
   `apps/server/{package.json,tsconfig.json,vitest.config.ts,src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}}`,
@@ -849,7 +859,13 @@ merge with the placeholder still in place — see "Jobs added later" below)
   in PR-07, per §7), `docs/DATA-MODEL.md`, repositories for `folders` and `notes`
   (the notes repo stores **opaque** `content_cipher`/`content_iv`/`key_version` triples supplied by its caller — it never
   sees plaintext, because the schema has no plaintext representation; PR-04's tests insert fixed test blobs, and PR-06
-  plugs the real `crypto/envelope.ts` in behind the same interface). Also creates **`apps/server/vitest.integration.config.ts`**
+  plugs the real `crypto/envelope.ts` in behind the same interface). It also **adds the scripts** the PR-01 contract
+  requires: `db:generate` = `NODE_ENV=development drizzle-kit generate`, `db:migrate` =
+  `NODE_ENV=development drizzle-kit migrate` (apps/server, root passthrough), and `test:integration` /
+  `coverage:integration` = `NODE_ENV=test vitest run --config vitest.integration.config.ts`. Without the inline
+  `NODE_ENV` these commands would hit §10's missing-`NODE_ENV` failure or run with the loader disabled, and the
+  acceptance below could not pass (PR-01's rule, §16's gate). It also creates
+  **`apps/server/vitest.integration.config.ts`**
   with `include: ['src/**/*.int.test.ts']` — the only config that reads `DATABASE_URL` — and one of the two host entry points that must call PR-01's
   `loadDevEnvFile()` + `databaseUrl()` themselves (its Vitest setup file, plus the top of `drizzle.config.ts`: neither
   Vitest nor drizzle-kit imports `env.ts` on its own, so without those calls `pnpm test:integration` and
@@ -860,9 +876,17 @@ merge with the placeholder still in place — see "Jobs added later" below)
   Also **modify `.github/workflows/CI.yml`** to add the `integration` job (`services: postgres:16` + `DATABASE_URL` →
   `pnpm test:integration`, and the new `pnpm coverage:integration` step that produces the DB-dependent coverage numbers —
   §14) — this is the PR that makes that job meaningful (see PR-03).
-- **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB — and run with **nothing
-  exported in the shell** but the repo-root `.env` a cold clone has (`cp .env.example .env`, which ships `POSTGRES_*`
-  and `HOST_PORT` but **no** `DATABASE_URL`, §16). Two assertions, because a DSN and its parts are different levers:
+- **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB — run from a shell with
+  **nothing exported** (`env -u NODE_ENV -u DATABASE_URL -u POSTGRES_USER … pnpm db:migrate`, or the same via a
+  `env -i` subshell with only `PATH`), against the repo-root `.env` a cold clone has (`cp .env.example .env`, which
+  ships `POSTGRES_*` and `HOST_PORT` but **no** `DATABASE_URL`, §16). That command succeeds **only because** the
+  script itself contributes `NODE_ENV=development` — the inline assignment beats an empty or absent parent value, which is
+  exactly why the negative half of the test matters: running the tool **without** the script
+  (`env -u NODE_ENV pnpm exec drizzle-kit migrate`, and pnpm injects no `NODE_ENV` of its own — verified on pnpm 12.3.4
+  with Node 22.22) must exit non-zero with §10's missing-`NODE_ENV` message. That pair is the regression test the loader
+  needs: without it a future edit that drops the inline mode silently disables `loadDevEnvFile()` and this whole block
+  goes vacuously green. Two further assertions, because a DSN and its
+  parts are different levers:
   (a) flip `POSTGRES_PORT` there (and recreate the dev `db`) and `pnpm db:migrate` follows it — true only because
   `env.ts`'s `databaseUrl()` derives the DSN from `POSTGRES_*` when `DATABASE_URL` is unset, which is what makes
   `loadDevEnvFile()` visible inside the drizzle-kit path at all;
@@ -882,7 +906,7 @@ merge with the placeholder still in place — see "Jobs added later" below)
 
 #### PR-05 — Shared contracts (Zod DTOs, error envelope, typed client)
 **Branch:** `feat/pr-05-contracts` · **Size:** M · **Depends on:** PR-01
-*(Unblocks PR-07…PR-17; land it as early as possible — it is the contract the parallel tracks build against.)*
+*(Unblocks PR-06…PR-17 — PR-06 imports the contracts to seal/unseal — land it as early as possible; it is the contract the parallel tracks build against.)*
 
 - **Create:** the whole `packages/contracts` package per §7 — **with a real build/export story, not just TS sources**:
   `packages/contracts/package.json` (`"type": "module"`, `"main"`/`"types"` and `"exports"` all pointing at `./dist/index.js`
@@ -1095,7 +1119,9 @@ decrypt it)
   `POST /api/notes` always seals through `crypto/envelope.ts` (PR-06) — `seal(content ?? '')` — so a note created
   without content still stores a valid 12-byte IV + 16-byte tag.
   `scripts/seed-demo.ts` (idempotent demo user + tree, guarded by `NODE_ENV !== 'production'`) wired to a new
-  `pnpm db:seed` script/target — the earliest point at which a seed can hash a password (PR-07) and write real
+  `pnpm db:seed` script — `NODE_ENV=development tsx scripts/seed-demo.ts`, the inline mode PR-01's rule requires so
+  the loader and `databaseUrl()` are actually active when it runs (§16) — the earliest point at which a seed can hash a
+  password (PR-07) and write real
   `folders`/`notes` rows.
 - **Settings API lands here, not in PR-16:** `GET /api/settings` + `PATCH /api/settings` (§9.2 #22). The **row** is not
   created here: PR-07 inserts it in the same transaction as every `users` insert (PR-07 Create + Acceptance), because
@@ -1315,7 +1341,11 @@ prepared earlier and rebased)
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
   `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
-  `NOTE_ENCRYPTION_KEY` is missing in production.
+  `NOTE_ENCRYPTION_KEY` is missing in production. Also asserted on the host side: `pnpm check:env` — defined as
+  `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero listing the same missing
+  variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. The `.env` used by both
+  runs has no `NODE_ENV` entry, which is the proof that the preflight takes its mode from its script line and treats the
+  file strictly as data (§16).
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
   the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
   "$POSTGRES_USER" "${POSTGRES_DB}_restore"` — the scratch DB must exist before the pipe can succeed; `gunzip -c
@@ -1342,7 +1372,9 @@ prepared earlier and rebased)
 #### PR-19 — Playwright e2e suite + CI e2e job + coverage ratchet
 **Branch:** `test/pr-19-e2e` · **Size:** M · **Depends on:** PR-08…PR-18
 
-- **Create:** `apps/web/playwright.config.ts` (webServer: build + start API against a throwaway Postgres DB,
+- **Create:** `apps/web/playwright.config.ts` (webServer: build + start the **compiled** API against a throwaway
+  Postgres DB with `NODE_ENV=test node apps/server/dist/index.js` — the inline-mode rule again, §16: a webServer that
+  inherits an unset `NODE_ENV` dies on the §10 boot guard before any spec runs,
   `NOTE_ENCRYPTION_KEY` a non-secret test constant supplied as **job env in CI** — exactly as §17 says — and, for local
   runs only, via a gitignored `.env.test` carrying that same throwaway value),
   `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, CI `e2e` job.
@@ -1520,8 +1552,9 @@ Rules:
 `.env.example` ships `NODE_ENV=development` plus the dev `POSTGRES_*`/`HOST_PORT` defaults and **no** `DATABASE_URL`
 line (the DSN is derived from `POSTGRES_*` by `env.ts`, §16), and every compose-facing
 make target depends on a `bootstrap-env` step (`test -f .env || cp .env.example .env`) before it can pass `--env-file .env`.
-The `NODE_ENV` line in that file is what Compose interpolation and `scripts/check-env.ts` see; the **process** gets
-`NODE_ENV` from the dev script (`dev:server`, PR-01) or the container's `environment:` block, never from the file (§16),
+The `NODE_ENV` line in that file is what Compose interpolation reads, and what `scripts/check-env.ts` validates when it
+lints the file as data (§16); a running Node process gets its mode from the script that starts it (`NODE_ENV=development
+tsx watch src/index.ts` in `apps/server`, PR-01) or from the container's `environment:` block, never from the file (§16),
 and that process value is what selects the generated-and-persisted dev key path described in §10 — with `NODE_ENV` unset
 the boot guard fails here too. The other values reach a host process through PR-01's `loadDevEnvFile()` (§16): Compose's
 `--env-file .env` feeds Compose's *own* interpolation only, so without that loader `pnpm dev`, `pnpm db:migrate`,
@@ -1559,7 +1592,8 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 > `postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB`, so the DSN is derived from the same `POSTGRES_*`
 > values the `db` container initializes with — host is the service name `db` (never `localhost`, which only exists on a
 > developer machine). `NODE_ENV=production` is set in the same block, so the three `POSTGRES_*` values the operator writes
-> into `.env` (plus `NODE_ENV` and `HOST_PORT`) are the entire compose-level contract; §16 lists who sets what.
+> into `.env` (plus `NOTE_ENCRYPTION_KEY` and, optionally, `HOST_PORT`) are the entire compose-level contract; §16
+> lists who sets what — `NODE_ENV` is **not** one of them, the image and the `app` service set it.
 > `POSTGRES_PORT` is **dev-only** — it appears solely in `docker/compose.dev.yml`, never in the prod file.
 
 - Single published port: `app.ports: ["${HOST_PORT:-3000}:3000"]` (set `HOST_PORT=8080` in the repo-root `.env` to move
@@ -1640,7 +1674,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 
 | Var | Default | Prod required | Meaning |
 | --- | --- | --- | --- |
-| `NODE_ENV` | **none — required**: `development`, `test`, or `production` | ✔ `production` | selects the invariant set enforced by the compiled `env.ts` at boot; an unset value fails in every environment (§10). Nobody hand-sets it: the production image bakes `ENV NODE_ENV=production` into stage 2, `compose.yml` repeats it in the `app` `environment:` block, and `.env.example` ships `NODE_ENV=development` for `pnpm dev` / `make dev` (CI sets `test`) |
+| `NODE_ENV` | **none — required**: `development`, `test`, or `production` | ✔ `production` | selects the invariant set enforced by the compiled `env.ts` at boot; an unset value fails in every environment (§10). Nobody hand-sets it in production: the image bakes `ENV NODE_ENV=production` into stage 2 and `compose.yml` repeats it in the `app` `environment:` block. Locally and in CI the value comes from the **script line** (`NODE_ENV=development tsx …`, `NODE_ENV=development drizzle-kit …`, `NODE_ENV=test vitest …` — PR-01's rule), never from the shell or from reading the file; `.env.example`'s `NODE_ENV=development` is the value Compose interpolates and `check-env.ts` lints. CI therefore needs no `NODE_ENV` of its own for `pnpm test:integration` (§14) |
 | `HOST` | `0.0.0.0` | — | bind address |
 | `PORT` | `3000` | — | port the container listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid — use `HOST_PORT` to publish elsewhere |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping (`"${HOST_PORT:-3000}:3000"`) — the operator-facing port knob |
@@ -1671,10 +1705,10 @@ prod rules. **Never** commit a real `.env`; `.gitignore` covers `.env*` except `
 `--env-file .env` feeds Compose's *own* interpolation only (§15) and `env.ts` reading `process.env` is not a loader, so
 the plan states the mechanism instead of leaving it implicit:
 
-- `apps/server/src/env.ts` exports **`loadDevEnvFile()`**, called at the top of every host-run entry point — `index.ts`
-  (dev server), the Vitest **setup file of `vitest.integration.config.ts`** (PR-04), `drizzle.config.ts` (PR-04, because
-  drizzle-kit never imports `env.ts` on its own), `scripts/seed-demo.ts` (PR-09) and `scripts/check-env.ts` (PR-18). It
-  does nothing unless the **process** `NODE_ENV` is `development` or `test`; then it resolves the file as
+- `apps/server/src/env.ts` exports **`loadDevEnvFile()`**, called at the top of every host-run entry point that *boots*
+  something — `index.ts` (dev server), the Vitest **setup file of `vitest.integration.config.ts`** (PR-04),
+  `drizzle.config.ts` (PR-04, because drizzle-kit never imports `env.ts` on its own) and `scripts/seed-demo.ts` (PR-09).
+  It does nothing unless the **process** `NODE_ENV` is `development` or `test`; then it resolves the file as
   `process.env.DOTENV_PATH ?? <repo root>/.env`, the repo root being the first directory at or above
   `import.meta.dirname` that contains `pnpm-workspace.yaml` (a fixed `../../.env` is wrong: from
   `apps/server/src/env.ts` under `tsx` that lands on `apps/.env`, and the depth changes again once the file is
@@ -1684,10 +1718,20 @@ the plan states the mechanism instead of leaving it implicit:
   --env-file-if-exists=…` exists on this Node version too, but it must be repeated in every workspace script, cannot
   express the `NODE_ENV` gate, and does not run inside `drizzle-kit` or Vitest, so the rule lives in one exported
   function instead.
-- **The file can never supply `NODE_ENV`.** The gate reads the value already in the **process** environment, so a stray
-  `.env` cannot turn a production boot into a development one and `env.ts`'s "`NODE_ENV` is required, there is no
-  default" rule (§10, PR-01's acceptance) survives the loader. `.env.example`'s `NODE_ENV=development` line is there for
-  Compose interpolation and `scripts/check-env.ts`, not to rescue a host process started outside `pnpm dev`.
+- **`scripts/check-env.ts` (PR-18) is the deliberate exception — a linter, not a boot path.** It reads
+  `process.env.DOTENV_PATH ?? <repo root>/.env` **as text with its own parser** and validates it against the rules of the
+  mode its own script line declares (`check:env` = `NODE_ENV=production tsx scripts/check-env.ts`). Routing it through the
+  loader would be wrong twice over: the loader is a no-op in `production` by design, and a preflight has to see the
+  operator's file whether or not the shell already exports those keys.
+- **The file can never supply `NODE_ENV`, so every script that reads env declares its mode inline.** The gate reads the
+  value already in the **process** environment, so a stray `.env` cannot turn a production boot into a development one,
+  and `env.ts`'s "`NODE_ENV` is required, there is no default" rule (§10, PR-01's acceptance) survives the loader.
+  Consequence — the reason PR-01 states it as a contract the later PRs implement: each host entry point puts the
+  assignment in its own script line: `dev` (PR-01), `db:generate`/`db:migrate` and
+  `test:integration`/`coverage:integration` (PR-04), `db:seed` (PR-09), `check:env` (PR-18). Running one of them with no
+  mode in the environment is not a mode, it is §10's missing-`NODE_ENV` failure, and PR-04 asserts that pair.
+  `.env.example`'s `NODE_ENV=development` line exists for Compose interpolation and as a value
+  `scripts/check-env.ts` lints **as data**; it never rescues a host process started outside `pnpm dev`.
 
 - **Precedence: the environment beats the file.** `process.loadEnvFile` does not overwrite already-set keys (verified
   on Node 22.22), so CI's explicit `DATABASE_URL`, the container environment Compose injects, and a one-off
@@ -1829,8 +1873,10 @@ Defaults in §4 are already implemented by the PRs; these only need a *no* to ch
    Open question: add an owner-facing reset in the UI (+½ day, PR-16 extension), or keep the CLI-only path?
 
 9. **Passkey timing** — confirm PR-21 stays post-MVP (recommended: yes).
-10. **Dev host OS** — the dev scripts in PR-01 set `NODE_ENV=development` inline (`NODE_ENV=development tsx watch …`),
-    which assumes a POSIX shell. Windows-only contributors would need `cross-env` in the root `package.json`
+10. **Dev host OS** — every script that reads env sets its mode inline (§16's rule: `NODE_ENV=development tsx watch …`,
+    `NODE_ENV=development drizzle-kit …`, `NODE_ENV=test vitest …`, `NODE_ENV=production tsx scripts/check-env.ts`),
+    which assumes a POSIX shell. Windows-only contributors would need `cross-env` on **all** of them, not just `dev` —
+    the DB/seed/test/preflight scripts are exactly where a missing mode becomes a hard boot failure
     (+one dependency, no other change). Add it now, or keep the scripts POSIX-only and let WSL be the documented path?
 
 ---
@@ -1929,4 +1975,3 @@ subscribes React to this machine, which is what keeps every row of the table uni
 
 *End of plan. Slice tasks in the order of §12/§13; keep this file updated whenever a decision in §4 or the task
 list changes.*
-

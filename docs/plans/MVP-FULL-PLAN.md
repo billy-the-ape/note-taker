@@ -494,7 +494,7 @@ reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 | 11 | `GET /api/users` | owner | — | `{users:[{id,username,role,createdAt}]}` | minimal admin surface |
 | 12 | `GET /api/tree` | yes | — | `{folders:[FolderNode], notes:[NoteNode]}` | full tree metadata, **no content**; single query via recursive CTE; sized for MVP scale |
 | 13 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash; 400 `VALIDATION` if the new folder would sit at depth 100 (root is depth 0 — the PR-09 create/move depth cap, §12) |
-| 14 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard; same depth cap as #13 |
+| 14 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard; same depth cap as #13, but for a move the check is `depth(newParent) + 1 + height(moved subtree) ≤ 99` — a deep subtree re-parented under a shallow root is rejected too (PR-09) |
 | 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
 | 16 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root); `content` omitted → `seal('')`, never empty cipher/iv columns |
 | 17 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
@@ -1210,9 +1210,13 @@ decrypt it)
   that only lands in PR-16 would be circular. PR-16 keeps the settings **UI** (page, theme, change-password form).
 - **Behavior:** `GET /api/tree` one recursive CTE (ordered folders-then-notes, `name` collation `C`);
   create/rename/move with sibling-uniqueness ⇒ `CONFLICT` (body carries the conflicting `id`); move-to-self/descendant
-  ⇒ `CONFLICT`. **Depth cap:** the tree is capped at 100 levels — root folders sit at depth 0, and any create or move
-  that would place a folder at depth 100 answers `VALIDATION` naming the cap, checked on the same ancestor walk as the
-  cycle guard (inside the per-user advisory lock below). That cap is what makes the A.4 CTE's `depth < 100` guard a
+  ⇒ `CONFLICT`. **Depth cap:** the tree is capped at 100 levels — root folders sit at depth 0, legal folders occupy
+  depths 0…99, and any create or move that would put a folder below depth 99 answers `VALIDATION` naming the cap
+  (checked inside the per-user advisory lock below). A *create* needs only the destination parent's depth — the same
+  upward ancestor walk as the cycle guard. A *move* must also measure what it carries: the check is
+  **`depth(newParent) + 1 + height(moved subtree) ≤ 99`**, the height coming from a **downward** recursive walk from
+  the moved folder, because the upward walk alone would pass a whole deep subtree re-parented under a shallow root
+  and drop its tail below the CTE's guard. That cap is what makes the A.4 CTE's `depth < 100` guard a
   runaway belt rather than a silent truncation: no folder the API ever accepted can sit where the CTE stops walking,
   so `GET /api/tree` can never drop a legal subtree with its notes.
   **Every folder mutation (create / rename / move / delete) opens its transaction with
@@ -1231,8 +1235,10 @@ decrypt it)
   rows), **create at root (`folderId: null`) and move a note back to root both work**, a 99-deep chain (the cap's
   last legal level) renders **complete** through `GET /api/tree` — every folder and note present, nothing truncated at
   the CTE's `depth < 100` guard — and **the cap is an error, not a silent drop**: `POST /api/folders` under the deepest
-  folder and a move that would re-parent a subtree past the cap both answer `VALIDATION` naming the limit, and the tree
-  is byte-identical afterwards. It also covers **the cross-user body-id case the FKs cannot
+  folder answers `VALIDATION` naming the limit, and so does the case a destination-depth check alone cannot see —
+  root folder `F` whose subtree reaches depth 99 moved under a **different root** folder `R` (the upward walk finds `R`
+  at depth 0, yet `F`'s tail would land at depth 100): the subtree-height check rejects it and the tree is
+  byte-identical afterwards. It also covers **the cross-user body-id case the FKs cannot
   catch**: user A and user B each create a folder, then B sends `POST /api/notes {folderId: A's}`,
   `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
   `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
@@ -1712,7 +1718,7 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
 #    every command in the runbook below silently degrades to `pg_dump -U "" ""` and `createdb … "_restore"`.
 #    POSTGRES_PASSWORD must be URL-safe — generate it with `openssl rand -hex 32`. The app's DSN is composed from
 #    these values **raw** (the `app` service's `environment:` block below; `databaseUrl()` on the host — §16), and
-#    nothing percent-encodes on the way, so `@`, `:`, `/`, `+`, `%` or `?` in a password silently corrupt the URL.
+#    nothing percent-encodes on the way, so `@`, `:`, `/`, `+`, `%`, `?` or `#` in a password silently corrupt the URL.
 #    DATABASE_URL needs no entry — the app service's environment: block derives it from these same values and takes
 #    precedence over env_file:. On the host the same derivation happens in env.ts's databaseUrl() when the variable
 #    is unset (§16); writing DATABASE_URL into this file freezes it against later POSTGRES_* edits.

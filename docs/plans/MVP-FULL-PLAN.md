@@ -89,7 +89,7 @@ Non-functional targets:
 - Session-based auth with DB-backed sessions and cookie transport.
 - Folder tree: create, rename, move, delete (with explicit cascade confirmation), unlimited nesting, cycle-safe.
 - Notes: create (name prompt with `new-file-<msepoch>.md` prefill, fixed `.md`), rename, move, delete.
-- Markdown editing: raw Markdown buffer + toolbar that inserts/wraps Markdown, live preview pane (toggle: split / edit-only / preview-only).
+- Markdown editing: raw Markdown buffer + toolbar that inserts/wraps Markdown, live preview pane (toggle: split / write / preview).
 - Autosave on by default, with per-user setting, dirty/saved/conflict status, offline-ish buffering of the last unsaved buffer.
 - Optimistic-concurrency on note content (`version`) so two tabs do not silently overwrite each other.
 - Encryption of note bodies at rest (AES-256-GCM, envelope with `key_version`), key generation + rotation scripts.
@@ -225,7 +225,7 @@ note-taker/
 │   ├── generate-keys.ts                       PR-06  (prints a fresh key to stdout; the operator copies it into `.env`)
 │   ├── seed-demo.ts                           PR-09  (demo user + sample tree; guarded by NODE_ENV ≠ production)
 │   └── check-env.ts                           PR-18  (dev/CI fail-fast on missing/prod-unsafe env; the same rules live in the compiled `env.ts` at boot)
-│                                              Operator scripts live under apps/server/src/scripts/ (see above) so they
+│                                              Operator scripts live under apps/server/src/scripts/ (see below) so they
 │                                              are compiled into `dist/` and can run inside the production image.
 ├── packages/
 │   └── contracts/                             PR-05  (no runtime deps except zod)
@@ -262,7 +262,7 @@ note-taker/
     │       ├── db/repositories/folders.repo.ts     PR-04 (harness) → final form in PR-09
     │       ├── db/repositories/notes.repo.ts       PR-04 (opaque bytea triples) → crypto wired in PR-06/09
     │       ├── db/repositories/settings.repo.ts    PR-09
-    │       ├── db/repositories/*.test.ts      integration (real DB)
+    │       ├── db/repositories/*.int.test.ts  integration (real DB) — the `.int.` suffix is what keeps it out of `pnpm test` (§14)
     │       ├── crypto/envelope.ts             PR-06 encrypt/decrypt AES-256-GCM
     │       ├── crypto/keys.ts                 PR-06 keyring from env (current + previous versions)
     │       ├── crypto/envelope.test.ts        PR-06 roundtrip, tamper, wrong key, rotation
@@ -287,7 +287,7 @@ note-taker/
     │       ├── routes/notes.routes.ts         PR-09 + PR-10
     │       ├── routes/search.routes.ts        PR-11
     │       ├── routes/settings.routes.ts      PR-09 (consumed by PR-16 UI)
-    │       ├── routes/*.test.ts               integration through `buildApp` + `app.inject()`
+    │       ├── routes/*.int.test.ts           integration through `buildApp` + `app.inject()`
     │       ├── domain/errors.ts               PR-05 typed domain errors
     │       ├── domain/name.ts                 PR-09 server-side wrapper around contracts `names.ts`
     │       └── test/                          PR-04 helpers: `withDb()`, `withApp()`, `fixtures.ts`
@@ -303,7 +303,7 @@ note-taker/
             ├── routes/login.tsx               PR-08
             ├── routes/setup.tsx               PR-08 first-run account creation
             ├── routes/welcome.tsx             PR-08 signed-in placeholder home (deleted by PR-12)
-            ├── routes/signup.tsx              PR-08 self-sign-up form (only when `registrationOpen`)
+            ├── routes/signup.tsx              PR-08 self-sign-up form (only when `registrationOpen` AND `!needsSetup`)
             ├── routes/app/__layout.tsx        PR-12 auth guard + AppShell outlet
             ├── routes/app/index.tsx           PR-12 "no note selected" / recent notes
             ├── routes/app/note.$noteId.tsx    PR-13/14 editor page
@@ -377,7 +377,7 @@ CREATE INDEX sessions_user_idx ON sessions(user_id);
 CREATE TABLE folders (
   id         uuid PRIMARY KEY,
   user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  parent_id  uuid REFERENCES folders(id) ON DELETE CASCADE,   -- NULL = root. The cycle check (PR-09) runs in a transaction that FIRST takes pg_advisory_xact_lock(hashtext('folder_move), hashtext(user_id::text)) — one lock per user serializes folder create/move/delete. Locking only the two affected rows is not enough: two moves can lock disjoint pairs (X→Y and Z→W), each pass its own ancestor walk, and commit a cycle
+  parent_id  uuid REFERENCES folders(id) ON DELETE CASCADE,   -- NULL = root. The cycle check (PR-09) runs in a transaction that FIRST takes pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text)) — one lock per user serializes folder create/move/delete. Locking only the two affected rows is not enough: two moves can lock disjoint pairs (X→Y and Z→W), each pass its own ancestor walk, and commit a cycle
   name       text NOT NULL CHECK (name <> ''),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -434,6 +434,7 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 | Notes **and** folders may live at the root of the tree | `notes.folder_id` and `folders.parent_id` are both nullable, `NULL` = root; the `COALESCE`-based unique indexes above keep sibling names unique for root-level rows too |
 | Note content is never stored in plaintext — in **any** environment | `crypto/envelope.ts` is the only writer of `content_cipher`; `env.ts` guarantees a key everywhere (production hard-fails without one, dev/test get a key persisted to `.dev/note-key`, §10). There is no plaintext column, flag, or code path to forget |
 | Every note row has a **decryptable** content triple | `note.service.create` always calls `sealNoteContent(content ?? '')`, so a content-less `POST /api/notes` still stores a real 12-byte IV + 16-byte tag for the empty string; `openNoteContent()` never sees empty `content_cipher`/`content_iv` (a 0-byte IV makes GCM throw and surface as `INTERNAL`) |
+| The install has an **owner** before anyone else can join | `auth.service.ts` refuses `POST /api/auth/register` with `FORBIDDEN` while no `role='owner'` row exists, and `needsSetup` is defined as “no owner row”, so a self-sign-up can never occupy the empty DB and lock `/setup` out (§9.2 #2–#4). `users_one_owner_uidx` keeps the other half: at most one owner |
 
 No soft-delete/trash in the MVP (backlog `PR-23`); deletes are hard, guarded by a typed confirmation dialog
 (type the folder/note name) so accidental cascade deletes require deliberate typing.
@@ -467,9 +468,9 @@ reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 | # | Method + path | Auth | Request (contract schema) | Success response | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `GET /api/health` | none | — | `{status:'ok', db:'ok', version}` | also `GET /api/healthz` for the Docker `HEALTHCHECK` |
-| 2 | `GET /api/auth/status` | none | — | `{needsSetup:boolean, registrationOpen:boolean}` | `needsSetup` true iff `users` is empty → client routes to `/setup`; `registrationOpen` mirrors `ALLOW_REGISTRATION` → `/login` can offer "Create account" |
-| 3 | `POST /api/auth/setup` | none, **only when `needsSetup`** | `registerSchema {username, password, displayName?}` | `200 {user}` + session cookie | first-run bootstrap that creates the `owner`; returns `CONFLICT` once a user exists — the guarantee is the DB, not the `needsSetup` read: `users_one_owner_uidx` (§8) makes a concurrent second setup impossible |
-| 4 | `POST /api/auth/register` | none, **only when `ALLOW_REGISTRATION=true`** | `registerSchema` (no `displayName`) | `201 {user}` + session cookie | public self-sign-up, creates `role='member'`; `FORBIDDEN` when the flag is false; rate-limited + `auth_attempts` like login; cannot create an `owner` |
+| 2 | `GET /api/auth/status` | none | — | `{needsSetup:boolean, registrationOpen:boolean}` | `needsSetup` true iff **no `role='owner'` row** exists (not merely “`users` is empty”: a stray `member` must not flip it, see #4) → client routes to `/setup`; `registrationOpen` mirrors `ALLOW_REGISTRATION` → `/login` can offer "Create account" |
+| 3 | `POST /api/auth/setup` | none, **only when `needsSetup`** | `registerSchema {username, password, displayName?}` | `200 {user}` + session cookie | first-run bootstrap that creates the `owner`; returns `CONFLICT` once an **owner** exists (the guard is the owner row, not the table being non-empty) — the guarantee is the DB, not the `needsSetup` read: `users_one_owner_uidx` (§8) makes a concurrent second setup impossible |
+| 4 | `POST /api/auth/register` | none, **only when `ALLOW_REGISTRATION=true` AND an owner already exists** | `registerSchema` (no `displayName`) | `201 {user}` + session cookie | public self-sign-up, creates `role='member'`; `FORBIDDEN` when the flag is false **or while no `role='owner'` row exists** — without that guard the first visitor on a fresh DB creates a `member`, which flips `needsSetup` to false and locks `/setup` out forever, leaving an install with no owner and no way to get one except editing the DB by hand (§8, PR-07); rate-limited + `auth_attempts` like login; cannot create an `owner` |
 | 5 | `POST /api/auth/login` | none | `{username, password}` | `200 {user}` + `note_session` cookie | argon2id verify, timing-safe dummy hash, rate-limited |
 | 6 | `POST /api/auth/logout` | yes | — | `204` | deletes session row, clears cookie |
 | 7 | `POST /api/auth/logout-all` | yes | — | `204` | deletes **every** session row for the user and clears the cookie (the settings page's "sign out everywhere", §11.1); implemented in **PR-07**, consumed by **PR-16** |
@@ -638,7 +639,7 @@ Explicit state machine, unit-tested with fake timers:
 
 ```
 clean ──edit──▶ dirty ──debounce 1200ms──▶ saving ──200──▶ clean
-                                   └────429/network──▶ retry(backoff 1s,2s,4s,8s,30s) ──▶ saving
+                                   └──5xx/transport──▶ retry(backoff 1s,2s,4s,8s,30s) ──▶ saving
 saving/clean ──VERSION_CONFLICT──▶ conflict ──(user picks)──▶ overwrite | loadServer
 ```
 
@@ -683,8 +684,9 @@ saving/clean ──VERSION_CONFLICT──▶ conflict ──(user picks)──�
 
 ## 12. Work breakdown — pull requests
 
-Total MVP estimate: **~26–32 engineer-days** serial; **~3 weeks calendar** with 2 engineers using the parallel
-tracks in [§13](#13-dependency-graph--parallel-execution-tracks).
+Total MVP estimate: **~26–42 engineer-days** serial — the sum of the §1 size bands over the 20 PRs below
+(4 × `S` ≤ ½ day = ~2, 12 × `M` = 1–2 days = 12–24, 4 × `L` = 3–4 days = 12–16); **~3–4 weeks calendar** with 2 engineers
+using the parallel tracks in [§13](#13-dependency-graph--parallel-execution-tracks).
 
 Global PR rules (apply to every task below, not repeated): conventional-commit titles
 (`feat:`, `fix:`, `chore:`, `test:`, `docs:`); PR body starts with `Task: PR-NN`; CI must be green; every PR
@@ -728,8 +730,11 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `packages/` only appears in PR-05, so PR-03's CI steps can call it from day one; while nothing matches the filter it is a
   no-op, and §14 explains why every typecheck/test job needs it. `coverage:integration` is registered later, by PR-04,
   together with the integration config
-  it needs (§14)) — **and the dev scripts must carry `NODE_ENV` themselves**: `dev` runs `dev:server` +
-  `dev:web`, and `dev:server` is `NODE_ENV=development tsx watch src/index.ts` (POSIX; the Windows-safe variant
+  it needs (§14)) — **and the dev scripts must carry `NODE_ENV` themselves**: `dev` is
+  `pnpm build:packages && pnpm -r --parallel --filter './apps/**' dev` (pnpm's own parallel runner, no extra dependency; the
+  leading build is a no-op until PR-05 creates `packages/`, after which it is what lets `tsx`/`vite` resolve
+  `@note-taker/contracts` at all — §14), each app's `dev` is its own script, and `apps/server`'s is
+  `NODE_ENV=development tsx watch src/index.ts` (POSIX; the Windows-safe variant
   `cross-env NODE_ENV=development …` if the owner develops on Windows — §21). `.env.example` ships
   `NODE_ENV=development`, and the README quick start says `cp .env.example .env` — but PR-01 must boot **without** any
   `.env`, because the Makefile that copies it only arrives in PR-02 and `env.ts` (created here) rejects an unset
@@ -739,7 +744,11 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `.editorconfig`, `.gitignore`, `.dockerignore`, `.nvmrc`, `LICENSE` (MIT — confirm in §21), `.env.example`,
   `apps/server/{package.json,tsconfig.json,vitest.config.ts,src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}}`,
   `apps/web/{package.json,tsconfig.json,vite.config.ts,vitest.config.ts,index.html,src/{main.tsx,routes/__root.tsx,styles/globals.css}}`,
-  minimal `apps/web/src/routes/index.tsx` placeholder that renders a "coming soon" card.
+  minimal `apps/web/src/routes/index.tsx` placeholder that renders a "coming soon" card. **Both Vitest configs scope the
+  unit run explicitly** — `include: ['src/**/*.test.{ts,tsx}']` plus `exclude: ['**/*.int.test.ts']` — because Vitest's default
+  include is `**/*.{test,spec}.*`, which would otherwise pull the DB-backed files PR-04 adds into `pnpm test` and into the
+  Postgres-free `unit` job (§14's split rule); stating it here, before any such file exists, is what keeps PR-04 from
+  having to edit PR-01's config.
   **`AGENTS.md` is updated here, not deferred:** the commands it lists for this repo become the real ones this PR
   introduces (`pnpm i / dev / build / lint / typecheck / test`), because §1's same-PR doc rule — inherited from
   `AGENTS.md` itself — forbids leaving it stale while PR-20 waits at the end. PR-20 then *consolidates* the accumulated
@@ -818,7 +827,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   in PR-07, per §7), `docs/DATA-MODEL.md`, repositories for `folders` and `notes`
   (the notes repo stores **opaque** `content_cipher`/`content_iv`/`key_version` triples supplied by its caller — it never
   sees plaintext, because the schema has no plaintext representation; PR-04's tests insert fixed test blobs, and PR-06
-  plugs the real `crypto/envelope.ts` in behind the same interface).
+  plugs the real `crypto/envelope.ts` in behind the same interface). Also creates **`apps/server/vitest.integration.config.ts`**
+  with `include: ['src/**/*.int.test.ts']` — the only config that reads `DATABASE_URL` — and every DB-backed file it adds
+  (`db/repositories/*.int.test.ts`) carries that suffix, which is what keeps `pnpm test` and the Postgres-free `unit` job
+  green from here on (§14's split rule, pre-configured in PR-01).
   Also **modify `.github/workflows/CI.yml`** to add the `integration` job (`services: postgres:16` + `DATABASE_URL` →
   `pnpm test:integration`, and the new `pnpm coverage:integration` step that produces the DB-dependent coverage numbers —
   §14) — this is the PR that makes that job meaningful (see PR-03).
@@ -845,7 +857,12 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `@note-taker/contracts`; at runtime that must resolve to **compiled JS**, because PR-18's stage 2 never executes `.ts`.
   Root `pnpm build` therefore builds workspaces in dependency order (`pnpm -r --filter './packages/**' build && pnpm -r
   --filter './apps/**' build`, or `pnpm -r build` once every workspace has a `build` script);
-  `pnpm -w typecheck` still typechecks the sources directly. + `docs/API.md` documenting §9 with request/response
+  `pnpm -w typecheck` resolves `@note-taker/contracts` through those same `exports`, so it only succeeds **after**
+  `pnpm build:packages` — the root script PR-01 defines and PR-03 wires into every typecheck/test job (§14). Nothing aliases
+  the package to its sources (no `paths` mapping, no Vitest alias, no `development` export condition), so the dist-backed
+  resolution is identical in dev, CI, and the production image; `pnpm dev` rebuilds packages on start for the same reason,
+  and iterating on contracts means a fourth terminal running `pnpm --filter @note-taker/contracts build -- --watch`.
+  + `docs/API.md` documenting §9 with request/response
   examples; `apps/web/src/lib/api.ts` typed fetch wrapper (`json()`, `ApiError`, CSRF header injection, 401
   handling hook) and `queryClient.ts`. It also owns the server-side error plumbing the §9.1 envelope needs before any
   route exists: `apps/server/src/domain/errors.ts` (typed domain errors: `NotFoundError`, `ConflictError`,
@@ -867,13 +884,19 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `pnpm -w typecheck` resolves contracts from both apps **only after `pnpm build:packages` has run** — this PR turns that
   PR-03 step from a no-op into a requirement, and the acceptance includes the negative control: with `packages/contracts/dist`
   deleted, `pnpm -w typecheck` fails to resolve `@note-taker/contracts` (proof that `exports`→`dist` is what CI is relying
-  on, §14); contract unit tests cover name rules
+  on, §14) — and the positive half of the same check: **`pnpm i && pnpm dev` from a bare clone still boots** now that the
+  server really imports the package, which only holds because `dev` runs `build:packages` first (PR-01). Without that
+  prefix `tsx`/`vite` fail to resolve `@note-taker/contracts` on a fresh checkout, i.e. the dev path and the CI path are
+  kept honest by the same assertion; contract unit tests cover name rules
   (unicode, 121 chars, path chars, existing sibling, **and the stripped-name edge cases from A.1: `"..md"` and `"foo .md"`
   are rejected because every rule runs on `stripMd(name)`, while `"foo.md.md"` and `"foo.md.MD"` are rejected because the
   stripped result *still* ends in `.md`** — the case that would otherwise store `foo.md` and render it identically to the
-  stored note `foo`), the round-trip property (`isValidNoteName(n) ⇒ stripMd(n) === n`, and two distinct stored names never
-  render to the same `withMd()` display string), error envelope typing, `uniquify` sequences (`plan` → `plan-2`, never
-  `plan.md-2`).
+  stored note `foo`), the **strip-idempotence** property (`isValidNoteName(n) ⇒ stripMd(stripMd(n)) === stripMd(n)`,
+  equivalently `!endsInMd(stripMd(n))`; stated over already-stored names that is `stripMd(stored) === stored`. It is
+  deliberately **not** `isValidNoteName(n) ⇒ stripMd(n) === n` — that is false for `Draft.md`, which A.1 accepts and
+  `stripMd` shortens), the collision property (two distinct stored names never render to the same `withMd()` display
+  string), error envelope typing, `uniquify` sequences (`plan` → `plan-2`, never `plan.md-2`).
+
 - **Coverage:** ≥ 90% lines and ≥ 85% branches in `packages/contracts` (the `packages/contracts` row of the §14
   threshold table: 90/90/85/90 here, ratcheting to 95 across the board after PR-19; pure module, no excuse, and it is a
   `unit`-job scope because contracts needs no DB).
@@ -953,16 +976,18 @@ merge with the placeholder still in place — see "Jobs added later" below)
   `routes/auth.routes.ts` (§9.2 #2–#9: status/setup/**register**/login/logout/**logout-all**/session/password),
   `routes/users.routes.ts` (§9.2 #10/#11),
   `plugins/auth-guard.ts`, `plugins/csrf.ts`, `http/rate-limit.ts`, argon2 hashing utils, `auth_attempts` writes.
-  `POST /api/auth/register` exists to make `ALLOW_REGISTRATION` real: 403 when the flag is false, rate-limited like
-  login, creates `role='member'`. `GET /api/auth/status` returns `{needsSetup, registrationOpen}` so the SPA knows
-  which form to offer.
+  `POST /api/auth/register` exists to make `ALLOW_REGISTRATION` real: 403 when the flag is false, **403 while no
+  `role='owner'` row exists** (a fresh DB is bootstrapped by `/setup` only — otherwise the first visitor self-signs-up as a
+  `member`, which would flip `needsSetup` and lock `/setup` out, leaving the install with no owner: §8 invariant, §9.2 #2/#4),
+  rate-limited like login, creates `role='member'`. `GET /api/auth/status` returns `{needsSetup, registrationOpen}`, with
+  `needsSetup` meaning “no owner row”, so the SPA offers the signup form only when `registrationOpen && !needsSetup`.
   **`apps/server/src/scripts/reset-password.ts`** — the only supported password recovery. It is a compiled server-side
   script (same rule as `rotate-note-key.ts`: lives under `apps/server/src/`, ships in the image, run with
   `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/reset-password.js <username>`,
   reading the new password from `argv` or a prompt, never from the URL) that **only** updates `users.password_hash` +
   `password_set_at` and `DELETE`s that user's `sessions` rows. It must not touch anything else: every other `user_id` FK
   is `ON DELETE CASCADE`, so deleting a user row would destroy their folders, notes and settings, and
-  `POST /api/auth/setup` refuses to run once any user exists — deleting-and-re-setting is not a recovery path, it is
+  `POST /api/auth/setup` refuses to run once an **owner** exists — deleting-and-re-setting is not a recovery path, it is
   data destruction followed by a blocked endpoint.
 - **Acceptance:** integration tests: first-run `needsSetup=true` → `setup` creates owner + session; `setup` after
   that ⇒ `CONFLICT`; login success/failure (uniform 401 `UNAUTHORIZED` message); cookie flags asserted in responses;
@@ -978,7 +1003,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   Registration matrix (the flag must have an implementation): with `ALLOW_REGISTRATION=false`,
   `POST /api/auth/register` ⇒ 403 and accounts can only be created by the owner via `POST /api/users`; with
   `ALLOW_REGISTRATION=true`, `register` creates a `member` + session, `registrationOpen=true` in the status payload,
-  and `register` still never creates the first `owner` (`/setup` owns that case).
+  and `register` still never creates the first `owner`: **on an empty DB with the flag true, `POST /api/auth/register`
+  answers 403 and `GET /api/auth/status` still reports `needsSetup: true`; only after `POST /api/auth/setup` does register
+  succeed.** Missing that guard leaves an install with zero owners, `/setup` permanently `CONFLICT`, and the owner-only
+  `POST /api/users` unreachable (§8, §9.2 #2/#4).
   `reset-password.ts` (executed as a subprocess against the test DB): unknown username ⇒ non-zero exit and no writes;
   success ⇒ the new password logs in, **all** of that user's sessions are gone, and that user's
   `folders`/`notes`/`settings` rows are untouched — the regression guard against anyone "simplifying" recovery into
@@ -999,8 +1027,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   wrong password shows the server message; success lands on **`/welcome`**; refresh keeps the session; the sign-out
   control on `/welcome` returns to `/login`; `/login` when authed redirects to `/welcome`; password inputs have labels
   + autocomplete attrs; Vitest component tests for the form validation + error rendering. With
-  `ALLOW_REGISTRATION=true` the login page links `/signup` and the form creates a member + lands on `/welcome`; with
-  the flag false, `/signup` is not reachable from the UI and a direct visit redirects to `/login`.
+  `ALLOW_REGISTRATION=true` **and an owner already exists** the login page links `/signup` and the form creates a member +
+  lands on `/welcome`; with the flag false, `/signup` is not reachable from the UI and a direct visit redirects to `/login`;
+  on a **fresh install** (flag true, `needsSetup: true`) the link is hidden too and a direct `/signup` visit redirects to
+  `/setup` — the UI mirror of PR-07's 403, so nobody can walk into the no-owner dead end through the browser.
 - **Out of scope:** the `/app` shell, `routes/app/__layout.tsx` and every `/app` assertion (PR-12, which also deletes
   `routes/welcome.tsx`), settings page (PR-16).
 
@@ -1045,21 +1075,27 @@ decrypt it)
   `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
   `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
   subtree is byte-identical afterwards (§8; no FK-violation `500`, no existence oracle).
-  **Move-cycle race — two cases, not one.** (a) *Adjacent pair:* with folders `A → B` (B inside A), fire
-  `PATCH /api/folders/A {parentId: B}` and `PATCH /api/folders/B {parentId: A}` through `Promise.all`; exactly one commit
-  may land, and afterwards the `GET /api/tree` walk terminates, both folders are reachable, and no row has the other as
-  both ancestor and descendant. (b) *Disjoint locks — the case (a) does not catch:* four folders with `Y ⊂ Z` and
-  `W ⊂ X`, fired as `PATCH /api/folders/X {parentId: Y}` and `PATCH /api/folders/W {parentId: Z}` concurrently. They share
-  no row, so a design that locks only the moved folder plus its new parent lets both ancestor walks pass and commits the
-  cycle `X→Y→Z→W→X`; with the per-user advisory lock the second transaction waits, then its walk sees the committed state
-  and answers `CONFLICT`. Assert that neither interleaving leaves a cycle, and that the loser gets `CONFLICT` — never an
-  unmapped `40P01`/`INTERNAL`.
+  **Move-cycle race — two cases, not one.** (a) *Adjacent pair, started as siblings:* folders `A` and `B` **both at root**,
+  then `PATCH /api/folders/A {parentId: B}` and `PATCH /api/folders/B {parentId: A}` fired through `Promise.all`. Each move
+  is legal alone and illegal together, so “exactly one commit lands, the other answers `CONFLICT`” is a meaningful
+  assertion; start them nested (`B` inside `A`) and the first request is rejected by the plain cycle check without any
+  locking, which tests nothing. Afterwards the `GET /api/tree` walk must terminate and both folders stay reachable.
+  (b) *Disjoint locks — the case (a) does not catch:* four folders with `Y ⊂ Z` and `W ⊂ X`, fired as
+  `PATCH /api/folders/X {parentId: Y}` and `PATCH /api/folders/Z {parentId: W}` concurrently. The first re-parents `X`
+  under `Y` (chain `X→Y→Z`), the second re-parents `Z` under its own descendant `W` (`Z→W→X`); together that closes
+  `X→Y→Z→W→X`, and it is exactly the pair that a design locking only the moved folder plus its new parent lets through —
+  the two lock sets share no row, so both ancestor walks pass against committed state and both commit. (Moving `W` instead
+  of `Z` — `PATCH …/W {parentId: Z}` — only re-parents `W` and leaves a legal tree, so it cannot be this test.) With the
+  per-user advisory lock the second transaction waits, then its walk sees the committed state and answers `CONFLICT`.
+  Assert that neither interleaving leaves a cycle, that exactly one write lands in each case, and that the loser gets
+  `CONFLICT` — never an unmapped `40P01`/`INTERNAL`.
   **The route-level crypto assertions live here, not in PR-06** — this is the first PR whose routes make them
   measurable: `POST /api/notes` with no content stores a real envelope and `GET /api/notes/:id` answers `content: ''`
   (PR-06's empty-string seal, proven over HTTP); and a row whose ciphertext fails authentication — forced by rewriting the
   stored blob directly — makes `GET /api/notes/:id` answer `INTERNAL` with the note id logged and **never**
   blank-or-garbage content (the mapping `plugins/error-handler.ts` gained in PR-05).
-- **Tests:** ≥ 25 assertions; `services` coverage ≥ 85%.
+- **Tests:** ≥ 25 assertions; `services` coverage ≥ 80% lines (the `{services,db,routes}` row of the §14 table, measured
+  by `pnpm coverage:integration` in the `integration` job — it reaches 85% only after PR-19 ratchets the thresholds).
 - **Out of scope:** content versioning endpoint (PR-10), search (PR-11), UI (PR-12).
 
 #### PR-10 — Note content read/write with versioning + autosave-safe writes
@@ -1376,6 +1412,14 @@ jobs:
 
 Rules:
 
+- **Unit and integration files never share a glob.** DB-backed tests are named **`*.int.test.ts`**; the unit configs
+  (`apps/server/vitest.config.ts`, `apps/web/vitest.config.ts`, `packages/contracts/vitest.config.ts`) set
+  `exclude: ['**/*.int.test.ts']`, and `apps/server/vitest.integration.config.ts` (PR-04) sets
+  `include: ['src/**/*.int.test.ts']` and is the only config that reads `DATABASE_URL`. Vitest's default include is
+  `**/*.{test,spec}.?(c|m)[jt]s?(x)`, so without that exclusion the repository/route tests PR-04 adds would be collected
+  by `pnpm test` and by the Postgres-free `unit` job, and fail on the missing DB. The coverage-scope table below controls
+  what is *measured*, not what is *run* — it cannot substitute for this rule.
+
 - Jobs arrive incrementally with the PR that owns the files they run (PR-03 ships `quality`/`unit`/`build`; PR-04 adds
   `integration`; PR-18 adds the `docker build` step; PR-19 adds `e2e`) — see PR-03/PR-04 in §12.
 - **`pnpm build:packages` (`pnpm -r --filter './packages/**' build`) runs in every job that typechecks or tests app
@@ -1408,7 +1452,7 @@ Rules:
   `coverage-integration/`. A directory never appears in a config that does not exercise it, and the `routes`/`services`/
   `db` numbers come only from the integration run.
 - Thresholds only ever ratchet upward; a PR that wants to lower one needs a written justification in its description.
-- `docker build` job never pushes an image (no registry configured in the MVP).
+- The `docker build` **step** inside the `build` job never pushes an image (no registry configured in the MVP).
 - Flaky policy: `retries: 1` for e2e only; a test that fails on re-run gets an immediate follow-up issue/PR.
 
 ---
@@ -1437,7 +1481,7 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
 #    Then — always from the repo root, and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
-# 3. open http://<host>:3000  → /setup → create the first owner
+# 3. open http://<host>:<HOST_PORT> (3000 by default)  → /setup → create the first owner
 ```
 
 > **Why the flags are mandatory.** Compose resolves its *project directory* from the compose file's location, so
@@ -1450,8 +1494,9 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 > service `environment:` block sets `DATABASE_URL` to
 > `postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB`, so the DSN is derived from the same `POSTGRES_*`
 > values the `db` container initializes with — host is the service name `db` (never `localhost`, which only exists on a
-> developer machine). `NODE_ENV=production` is set in the same block, so the four `POSTGRES_*` variables plus
-> `DATABASE_URL`, `NODE_ENV` and `HOST_PORT` are the entire compose-level contract; §16 lists who sets what.
+> developer machine). `NODE_ENV=production` is set in the same block, so the three `POSTGRES_*` values the operator writes
+> into `.env` (plus `NODE_ENV` and `HOST_PORT`) are the entire compose-level contract; §16 lists who sets what.
+> `POSTGRES_PORT` is **dev-only** — it appears solely in `docker/compose.dev.yml`, never in the prod file.
 
 - Single published port: `app.ports: ["${HOST_PORT:-3000}:3000"]` (set `HOST_PORT=8080` in the repo-root `.env` to move
   the host side); `db` has **no** published port.
@@ -1501,7 +1546,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 - **Key rotation (the operator procedure `docs/DEPLOY.md` must contain, PR-18; the script itself is PR-06).** The script
   is compiled into the image, so it runs where the DB and the keyring already are — no pnpm, no `tsx`, no second DB
   port:
-  1. back up first (previous bullet) — a rotation without a fresh backup is unsupported;
+  1. back up first — the **Backups** bullet above, not the restore-drill list below it — a rotation without a fresh backup is unsupported;
   2. edit the repo-root `.env` **by hand** (the script cannot change a running container's environment): append the old
      key to `NOTE_ENCRYPTION_KEY_PREVIOUS` as `{"<old version>": "<old base64>"}`, set the new `NOTE_ENCRYPTION_KEY`,
      bump `NOTE_ENCRYPTION_KEY_VERSION` to `<old>+1`. **Write that value single-quoted** —
@@ -1521,7 +1566,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 - **Password recovery:** `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/reset-password.js <username>`
   (PR-07). It changes the hash and that user's sessions and nothing else. **Never** delete a `users` row to "reset" an
   account: the `user_id` FKs cascade over sessions/folders/notes/settings and `POST /api/auth/setup` stays blocked while
-  any user exists.
+  an owner row exists (the guard is the owner, not the table: §9.2 #3).
 
 ---
 
@@ -1548,7 +1593,6 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |
 | `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` of **older** keys, kept decrypt-only for as long as any row carries that `key_version`. Written **single-quoted** in `.env` (`='{"1": "…"}'`): Compose strips the surrounding quotes for the container, while the runbook's `set -a; . ./.env; set +a` sources the same file, where unquoted JSON is a shell syntax error (§15, rotation step 2) |
-
 | `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; the operator bumps it by hand in `.env` (§15 step 2) and `apps/server/src/scripts/rotate-note-key.ts` rewrites every row's `key_version` to that value (§10, PR-06) |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
@@ -1565,8 +1609,8 @@ prod rules. **Never** commit a real `.env`; `.gitignore` covers `.env*` except `
 
 | Layer | Tooling | Command | Lives in | Owner PR |
 | --- | --- | --- | --- | --- |
-| Pure unit (name rules, markdown transforms, autosave machine, crypto, tree selectors, env parsing) | Vitest + `@testing-library/react` (components) | `pnpm test` / `pnpm coverage` | `*.test.ts(x)` next to sources | every PR |
-| API integration (real Postgres, `app.inject()` — no port binding) | Vitest + Drizzle | `pnpm test:integration` (and `pnpm coverage:integration`, which produces the DB-backed coverage numbers the §14 table enforces in the `integration` job) | `apps/server/src/{routes,db,services}/*.test.ts` | PR-04 onward |
+| Pure unit (name rules, markdown transforms, autosave machine, crypto, tree selectors, env parsing) | Vitest + `@testing-library/react` (components) | `pnpm test` / `pnpm coverage` | `*.test.ts(x)` next to sources, **never** a `*.int.test.ts` file (the §14 exclusion) | every PR |
+| API integration (real Postgres, `app.inject()` — no port binding) | Vitest + Drizzle | `pnpm test:integration` (and `pnpm coverage:integration`, which produces the DB-backed coverage numbers the §14 table enforces in the `integration` job) | `apps/server/src/{routes,db,services}/**/*.int.test.ts` — the suffix is the split rule, §14 | PR-04 onward |
 | Contract tests | Schemas exercised from both apps; a route that drifts from `contracts` fails typecheck | `pnpm typecheck` | `packages/contracts` | PR-05 |
 | e2e (browser, real app, real DB, encryption on) | Playwright chromium | `pnpm test:e2e` | `apps/web/e2e/*.spec.ts` | PR-19 |
 | Manual acceptance (only for things automation can see poorly: feel of autosave, preview fidelity) | checklist below | — | PR body screenshots/video | PR-13, PR-14 |
@@ -1665,8 +1709,10 @@ Defaults in §4 are already implemented by the PRs; these only need a *no* to ch
    PR-07: `docker compose … exec app node apps/server/dist/scripts/reset-password.js <username>` re-hashes the password
    and drops that user's sessions, and `docs/DEPLOY.md` (PR-18) documents it under troubleshooting. **Deleting the user
    row is never a recovery path** — every other `user_id` FK is `ON DELETE CASCADE` (sessions, folders, notes, settings),
-   so it destroys the account's data, and `POST /api/auth/setup` then refuses to run because other users still exist.
+   so it destroys the account's data, and if the deleted row was the owner it also re-opens `POST /api/auth/setup` (§9.2 #3 gates
+   on the owner row), letting the next visitor claim ownership — a takeover, never a recovery path.
    Open question: add an owner-facing reset in the UI (+½ day, PR-16 extension), or keep the CLI-only path?
+
 9. **Passkey timing** — confirm PR-21 stays post-MVP (recommended: yes).
 10. **Dev host OS** — the dev scripts in PR-01 set `NODE_ENV=development` inline (`NODE_ENV=development tsx watch …`),
     which assumes a POSIX shell. Windows-only contributors would need `cross-env` in the root `package.json`
@@ -1697,6 +1743,8 @@ export const isValidNoteName = (raw: string): boolean => {
     // that breaks the §8 "no .md in the DB" invariant, makes the stored rows `foo` and `foo.md` render
     // identically (withMd turns both into "foo.md"), and loses characters when a rename prefill strips again.
     // Rejecting is deliberate: silently stripping twice would make "foo.md.md" collide with "foo" instead.
+    // This is also what makes stripMd idempotent over valid input — the property PR-05 tests:
+    //   isValidNoteName(n) ⇒ stripMd(stripMd(n)) === stripMd(n)
     !endsInMd(base);
 };
 // Works on the extension-free base, because that is what is stored: "plan" → "plan-2" → "plan-3".

@@ -87,7 +87,8 @@ Non-functional targets:
 - Username + password auth (first-run `/setup`, owner-created accounts via `POST /api/users`, and — only when
   `ALLOW_REGISTRATION=true` — self-service sign-up via `POST /api/auth/register`), login, logout, change password.
 - Session-based auth with DB-backed sessions and cookie transport.
-- Folder tree: create, rename, move, delete (with explicit cascade confirmation), unlimited nesting, cycle-safe.
+- Folder tree: create, rename, move, delete (with explicit cascade confirmation), nesting up to a server-enforced
+  100-level cap (enforced at create/move, not silently truncated — §9.2 #13/#14, PR-09), cycle-safe.
 - Notes: create (name prompt with `new-file-<msepoch>.md` prefill, fixed `.md`), rename, move, delete.
 - Markdown editing: raw Markdown buffer + toolbar that inserts/wraps Markdown, live preview pane (toggle: split / write / preview).
 - Autosave on by default, with per-user setting, dirty/saved/conflict status, offline-ish buffering of the last unsaved buffer.
@@ -492,8 +493,8 @@ reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 | 10 | `POST /api/users` | owner | `{username, password}` | `201 {user}` | owner-created account, always `role='member'` (only `/setup` writes `'owner'`, §8); **the only way to add an account when `ALLOW_REGISTRATION=false`**, and still available when it is true |
 | 11 | `GET /api/users` | owner | — | `{users:[{id,username,role,createdAt}]}` | minimal admin surface |
 | 12 | `GET /api/tree` | yes | — | `{folders:[FolderNode], notes:[NoteNode]}` | full tree metadata, **no content**; single query via recursive CTE; sized for MVP scale |
-| 13 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash |
-| 14 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard |
+| 13 | `POST /api/folders` | yes | `{name, parentId\|null}` | `201 FolderNode` | 409 on sibling clash; 400 `VALIDATION` if the new folder would sit at depth 100 (root is depth 0 — the PR-09 create/move depth cap, §12) |
+| 14 | `PATCH /api/folders/:id` | yes | `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard; same depth cap as #13, but for a move the check is `depth(newParent) + 1 + height(moved subtree) ≤ 99` — a deep subtree re-parented under a shallow root is rejected too (PR-09) |
 | 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
 | 16 | `POST /api/notes` | yes | `{name?, folderId\|null, content?}` | `201 NoteWithContent` | `name` omitted → server generates `new-file-<msepoch>` and uniquifies it (`folderId: null` = root); `content` omitted → `seal('')`, never empty cipher/iv columns |
 | 17 | `GET /api/notes/:id` | yes | — | `{…NoteNode, content, version}` | decrypts; `ETag: W/"v<version>"` |
@@ -650,8 +651,9 @@ No global client store (no Redux/Zustand) in the MVP — Query + Router cover it
 
 ### 11.3 Editor (Q3)
 
-- `MarkdownEditor`: CodeMirror 6 with the Markdown language extension, soft wrap, `Cmd/Ctrl+B/I/K` shortcuts,
-  line numbers off, `aria-label="note content"`.
+- `MarkdownEditor`: CodeMirror 6 with the Markdown language extension, soft wrap, `Cmd/Ctrl+B/I/K` shortcuts — the
+  keymap is **scoped to the editor**, so while it has focus `Cmd/Ctrl+K` inserts a link there and the shell's global
+  search-link chord (§11.5) does not fire — line numbers off, `aria-label="note content"`.
 - `EditorToolbar` buttons: H1/H2/H3, bold, italic, strikethrough, inline code, code block, blockquote, bullet list,
   numbered list, task list, link, table, horizontal rule. Each button is a **pure transform** in
   `lib/markdown.ts`: `(selection, text) => {text, selection}` — unit-tested without a DOM, and applied to the CodeMirror
@@ -720,7 +722,13 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   uniqueness check against the tree cache, no extra endpoint).
 - Rename dialogs reuse the same component with the current name and the same fixed `.md` suffix for notes.
 - Everything reachable by keyboard: tree arrow-key navigation, `Enter` to open, `F2` rename, `Delete` delete,
-  `Ctrl/Cmd+N` new note, `Ctrl/Cmd+K` (search *page* link in MVP, palette is backlog).
+  `Ctrl/Cmd+K` (search *page* link in MVP, palette is backlog). Two chord rules keep this collision-free:
+  **`Ctrl/Cmd+K` is editor-scoped against shell-scoped** — while the CodeMirror editor has focus, its keymap owns the
+  chord and inserts a link (§11.3), and the shell's global handler (PR-17) checks whether the editor is focused before
+  acting, so the search-link focus never fires mid-edit and link insertion never leaves the editor;
+  **`Ctrl/Cmd+N` is deliberately *not* bound** — Chromium opens a new window/tab before any page handler sees the key
+  (Firefox/Edge reserve it likewise), so the app cannot reliably intercept it; new-note stays keyboard-reachable
+  through its `TopBar`/tree-context-menu buttons (PR-15), and a chord for it belongs with the palette backlog (§3.2).
 - Destructive actions (folder with children, note delete) require typing the item name.
 - Toasts on every failed mutation with the server `error.message`.
 
@@ -775,7 +783,9 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `packages/` only appears in PR-05, so PR-03's CI steps can call it from day one; while nothing matches the filter it is a
   no-op, and §14 explains why every typecheck/test job needs it. `coverage:integration` is registered later, by PR-04,
   together with the integration config
-  it needs (§14)) — **and the dev scripts must carry `NODE_ENV` themselves**: `dev` is
+  it needs (§14), and `test:e2e` later still, by **PR-19**, together with the Playwright config it runs — §17's e2e row
+  names that command, and no script may be invoked before the PR that creates the files it runs owns it
+  (§14's job rule, applied to scripts) — **and the dev scripts must carry `NODE_ENV` themselves**: `dev` is
   `pnpm build:packages && pnpm -r --parallel --filter './apps/**' dev` (pnpm's own parallel runner, no extra dependency; the
   leading build is a no-op until PR-05 creates `packages/`, after which it is what lets `tsx`/`vite` resolve
   `@note-taker/contracts` at all — §14), each app's `dev` is its own script, and `apps/server`'s is
@@ -821,8 +831,9 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   threshold over a scope with nothing in it is a guaranteed red: the `apps/web/src/lib` row of §14 is armed by **PR-05**
   (whose mocked-`fetch` tests for `lib/api.ts` are the first web tests) and the overall `apps/web/src` row by **PR-08**
   (the first components).
-  **`AGENTS.md` is updated here, not deferred:** the commands it lists for this repo become the real ones this PR
-  introduces (`pnpm i / dev / build / lint / typecheck / test`), because §1's same-PR doc rule — inherited from
+  **`AGENTS.md` is updated here, not deferred:** the file lists **no commands today**, so this PR **adds** the real
+  ones it introduces (`pnpm i / dev / build / lint / typecheck / test`) — the file's first-ever command list —
+  because §1's same-PR doc rule — inherited from
   `AGENTS.md` itself — forbids leaving it stale while PR-20 waits at the end. PR-20 then *consolidates* the accumulated
   edits; it is not the first PR allowed to touch the file.
 - **Acceptance:** **from a bare clone with no `.env` file present**, `pnpm i && pnpm dev` boots and
@@ -835,7 +846,7 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `pnpm lint`, `pnpm typecheck`,
   `pnpm test`, `pnpm build` all exit 0; `vite` proxies `/api` to `:3000`; server built with `tsc` (no bundler) to `apps/server/dist`,
   web built to `apps/web/dist`; `env.ts` rejects unknown/missing required vars and is unit-tested; **no `db:*` script is registered yet** (`pnpm db:migrate` fails as an unknown script until PR-04 adds it, and nothing in CI calls it before then).
-- **Tests:** `env.test.ts` — prod invariants; the `.env` loader via `DOTENV_PATH` pointing at a temp fixture (file values appear when the process env lacks them, a value already in the process env wins, a missing file is a silent no-op, a malformed file throws, and with `NODE_ENV=production` the file is never opened at all); and `databaseUrl()` as a pure function with no DB involved (a set `DATABASE_URL` comes back verbatim; with it unset the DSN is composed from `POSTGRES_*`, so changing `POSTGRES_PORT` changes the string every host tool will use; with `NODE_ENV=production` and no `DATABASE_URL` it fails as a missing required var) — all §16. Plus `app.test.ts` (`app.inject('/api/health')` = 200).
+- **Tests:** `env.test.ts` — prod invariants; the `.env` loader via `DOTENV_PATH` pointing at a temp fixture (file values appear when the process env lacks them, a value already in the process env wins, a missing file is a silent no-op, a malformed file throws, and with `NODE_ENV=production` the file is never opened at all); and `databaseUrl()` as a pure function with no DB involved (a set `DATABASE_URL` comes back verbatim; with it unset the DSN is composed from `POSTGRES_*`, so changing `POSTGRES_PORT` changes the string every host tool will use; with `NODE_ENV=production` and no `DATABASE_URL` it fails as a missing required var; a `POSTGRES_PASSWORD` containing a reserved URL character (`@ : / + % ? #`) fails with a readable error naming the variable instead of returning a mangled composed DSN) — all §16. Plus `app.test.ts` (`app.inject('/api/health')` = 200).
 - **Out of scope:** any DB code, any real UI.
 
 #### PR-02 — Local dev infrastructure (Postgres in Docker, Make)
@@ -1199,7 +1210,16 @@ decrypt it)
   that only lands in PR-16 would be circular. PR-16 keeps the settings **UI** (page, theme, change-password form).
 - **Behavior:** `GET /api/tree` one recursive CTE (ordered folders-then-notes, `name` collation `C`);
   create/rename/move with sibling-uniqueness ⇒ `CONFLICT` (body carries the conflicting `id`); move-to-self/descendant
-  ⇒ `CONFLICT`. **Every folder mutation (create / rename / move / delete) opens its transaction with
+  ⇒ `CONFLICT`. **Depth cap:** the tree is capped at 100 levels — root folders sit at depth 0, legal folders occupy
+  depths 0…99, and any create or move that would put a folder below depth 99 answers `VALIDATION` naming the cap
+  (checked inside the per-user advisory lock below). A *create* needs only the destination parent's depth — the same
+  upward ancestor walk as the cycle guard. A *move* must also measure what it carries: the check is
+  **`depth(newParent) + 1 + height(moved subtree) ≤ 99`**, the height coming from a **downward** recursive walk from
+  the moved folder, because the upward walk alone would pass a whole deep subtree re-parented under a shallow root
+  and drop its tail below the CTE's guard. That cap is what makes the A.4 CTE's `depth < 100` guard a
+  runaway belt rather than a silent truncation: no folder the API ever accepted can sit where the CTE stops walking,
+  so `GET /api/tree` can never drop a legal subtree with its notes.
+  **Every folder mutation (create / rename / move / delete) opens its transaction with
   `SELECT pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))`** — one lock per user, held to commit —
   so the ancestor-walk cycle check runs against a tree no concurrent move is changing. Row locks on the two affected
   folders are *not* sufficient: two moves can lock disjoint pairs (`X` under `Y` while `Z` under `W`, where `Y ⊂ Z` and
@@ -1212,8 +1232,13 @@ decrypt it)
   never surfaces as an FK-violation `500` nor as `403`.
 - **Acceptance:** integration suite covers each behavior above plus: 3-level nesting, rename into a sibling
   occupied name, move folder A under its own child B rejected, cascade delete removes nested notes (and content
-  rows), **create at root (`folderId: null`) and move a note back to root both work**, tree depth 50 renders
-  without recursion errors (CTE depth guard at 100). It also covers **the cross-user body-id case the FKs cannot
+  rows), **create at root (`folderId: null`) and move a note back to root both work**, a 99-deep chain (the cap's
+  last legal level) renders **complete** through `GET /api/tree` — every folder and note present, nothing truncated at
+  the CTE's `depth < 100` guard — and **the cap is an error, not a silent drop**: `POST /api/folders` under the deepest
+  folder answers `VALIDATION` naming the limit, and so does the case a destination-depth check alone cannot see —
+  root folder `F` whose subtree reaches depth 99 moved under a **different root** folder `R` (the upward walk finds `R`
+  at depth 0, yet `F`'s tail would land at depth 100): the subtree-height check rejects it and the tree is
+  byte-identical afterwards. It also covers **the cross-user body-id case the FKs cannot
   catch**: user A and user B each create a folder, then B sends `POST /api/notes {folderId: A's}`,
   `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
   `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
@@ -1344,8 +1369,10 @@ decrypt it)
 **Branch:** `feat/pr-15-new-note` · **Size:** S · **Depends on:** PR-12, PR-09, PR-13 — the acceptance ends with the
 new note open in the editor, so `/app/note/$noteId` must already exist
 
-- **Create:** `components/notes/NewNoteDialog.tsx`, `lib/name.ts`, wire `Ctrl/Cmd+N` + "New note" buttons in
-  `TopBar`/`StatusBar`/tree context menu.
+- **Create:** `components/notes/NewNoteDialog.tsx`, `lib/name.ts`, wire the "New note" buttons in
+  `TopBar`/`StatusBar`/tree context menu — **no `Ctrl/Cmd+N` binding**: that chord is browser-reserved (Chromium opens
+  a window before the page sees it) and cannot be intercepted (§11.5), so keyboard users reach the dialog through the
+  same focusable buttons.
 - **Acceptance:** input pre-filled with `new-file-<Date.now()>.md`, caret placed before `.md`, `.md` rendered as a
   non-editable suffix and stripped from the submitted name; live invalid-name message; collision against the tree
   cache disables Create with "name already used in this folder"; creating in the selected folder; after create,
@@ -1372,9 +1399,13 @@ new note open in the editor, so `/app/note/$noteId` must already exist
 **Branch:** `feat/pr-17-search-ui` · **Size:** S · **Depends on:** PR-11, PR-12, PR-13 — a search result must open the
 note, and the note route belongs to PR-13
 
-- **Create:** `routes/app/search.tsx`, search box in `TopBar` (`Ctrl/Cmd+K` focuses the page link in MVP),
+- **Create:** `routes/app/search.tsx`, search box in `TopBar` (`Ctrl/Cmd+K` focuses the page link in MVP — the global
+  handler fires only when the CodeMirror editor is **not** focused; inside the editor the chord belongs to CodeMirror's
+  link-insert and must not move focus out of it, §11.3/§11.5),
   results list with breadcrumb path + highlighted snippet, keyboard selection, empty/no-result states.
-- **Acceptance:** debounce 250 ms, `?q=` in URL (shareable), clicking a result opens the note, snippets escape HTML.
+- **Acceptance:** debounce 250 ms, `?q=` in URL (shareable), clicking a result opens the note, snippets escape HTML;
+  the chord precedence is asserted: with the editor focused, `Ctrl/Cmd+K` inserts a link and does **not** focus the
+  search link, and with focus anywhere else it focuses the search link without touching any buffer.
 
 #### PR-18 — Production Docker image + compose + env safety + deploy docs
 **Branch:** `feat/pr-18-docker-prod` · **Size:** M · **Depends on:** PR-01…PR-17 (needs the whole app — search UI
@@ -1466,7 +1497,10 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   inherits an unset `NODE_ENV` dies on the §10 boot guard before any spec runs,
   `NOTE_ENCRYPTION_KEY` a non-secret test constant supplied as **job env in CI** — exactly as §17 says — and, for local
   runs only, via a gitignored `.env.test` carrying that same throwaway value),
-  `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, CI `e2e` job, and **`e2e/db.ts`** — a
+  `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, the **root `test:e2e` script** — the one §17's
+  e2e row and the CI `e2e` job invoke; PR-01's root script list deliberately left it out because, like
+  `coverage:integration` in PR-04, a script is registered by the PR that creates the config and specs it runs —,
+  the CI `e2e` job, and **`e2e/db.ts`** — a
   test-only Postgres reader for scenario 7, written against **`postgres` (postgres.js), the driver §4 already chose and
   PR-04 put in `apps/server`'s dependencies** — not a second `pg` client. Because pnpm does not expose one workspace's
   dependencies to another, PR-19 declares `postgres` as a **devDependency of `apps/web` at the version PR-04 pinned**, so
@@ -1682,6 +1716,9 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
 #    values are REQUIRED in this file: `notetaker` in §16 is only Compose `${VAR:-notetaker}` interpolation, so an
 #    operator who omits them gets a working container but an EMPTY `$POSTGRES_USER`/`$POSTGRES_DB` in the shell, and
 #    every command in the runbook below silently degrades to `pg_dump -U "" ""` and `createdb … "_restore"`.
+#    POSTGRES_PASSWORD must be URL-safe — generate it with `openssl rand -hex 32`. The app's DSN is composed from
+#    these values **raw** (the `app` service's `environment:` block below; `databaseUrl()` on the host — §16), and
+#    nothing percent-encodes on the way, so `@`, `:`, `/`, `+`, `%`, `?` or `#` in a password silently corrupt the URL.
 #    DATABASE_URL needs no entry — the app service's environment: block derives it from these same values and takes
 #    precedence over env_file:. On the host the same derivation happens in env.ts's databaseUrl() when the variable
 #    is unset (§16); writing DATABASE_URL into this file freezes it against later POSTGRES_* edits.
@@ -1709,7 +1746,10 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 > service `environment:` block sets `DATABASE_URL` to
 > `postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB`, so the DSN is derived from the same `POSTGRES_*`
 > values the `db` container initializes with — host is the service name `db` (never `localhost`, which only exists on a
-> developer machine). `NODE_ENV=production` is set in the same block, and so is
+> developer machine). The interpolation is **raw** — nothing URL-encodes the three values as they are composed — which is
+> why step 2 requires a URL-safe (hex) `POSTGRES_PASSWORD`: Compose cannot percent-encode inside a URL, and once the
+> string reaches the container the app cannot repair a password that ate the DSN's delimiters.
+> `NODE_ENV=production` is set in the same block, and so is
 > `NOTE_ENCRYPTION_KEY: ${NOTE_ENCRYPTION_KEY:?set NOTE_ENCRYPTION_KEY in the repo-root .env}` — required, no default,
 > which is what turns §15 step 2b's `docker compose config` into a real preflight on a host with no Node: Compose
 > refuses to resolve the file instead of handing the container an empty key. (The mounted-key-file variant below is
@@ -1803,7 +1843,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `PORT` | `3000` | — | port the container listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid — use `HOST_PORT` to publish elsewhere |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping (`"${HOST_PORT:-3000}:3000"`) — the operator-facing port knob |
 | `POSTGRES_USER` | `notetaker` | ✔ **in `.env` whenever compose is used** | role + owner created by the `db` service of `docker/compose.yml` (prod compose publishes no port). The §15 runbook's shell commands read this variable, so it must be written into `.env` — Compose's `${POSTGRES_USER:-notetaker}` fallback covers Compose only (§15) |
-| `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; an explicit `DATABASE_URL` must embed the same value, and with it unset `databaseUrl()` embeds it for you (§16) |
+| `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; an explicit `DATABASE_URL` must embed the same value, and with it unset `databaseUrl()` embeds it for you (§16). Both compositions embed the value **raw**, so it must be URL-safe — `[A-Za-z0-9]+` in practice, generated as hex (`openssl rand -hex 32`) per the §15 quick start; `databaseUrl()` rejects a value containing `@ : / + % ? #` with a readable error naming the variable rather than emitting a broken DSN |
 | `POSTGRES_DB` | `notetaker` | ✔ **in `.env` whenever compose is used** | database created by the `db` image's first init; also interpolated into the app's `DATABASE_URL` by `compose.yml` and used as the base for the §15 restore drill's `<db>_restore` — so it must be written in `.env` like `POSTGRES_USER`, not left to Compose's default |
 | `POSTGRES_PORT` | `5432` | — | host port published for the **dev** compose `db` only (`docker/compose.dev.yml`); the prod `db` publishes nothing |
 | `DATABASE_URL` | **unset ⇒ derived** as `postgres://<POSTGRES_USER>:<POSTGRES_PASSWORD>@localhost:<POSTGRES_PORT>/<POSTGRES_DB>` (`notetaker`/`notetaker`/`5432`/`notetaker` in dev — see the DSN-resolution bullet below); **set ⇒ used verbatim** | ✔ **required in `production`**, optional elsewhere | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2). `.env.example` deliberately ships **no** `DATABASE_URL` line: leaving it unset is what makes one `POSTGRES_PORT`/`POSTGRES_PASSWORD` edit move both the dev container and every host process (PR-04's acceptance pins that), whereas adding the line freezes the DSN, because `process.loadEnvFile` expands nothing. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB |
@@ -1871,7 +1911,12 @@ the plan states the mechanism instead of leaving it implicit:
   2. **Unset and `NODE_ENV` is `development`/`test`** → derive it:
      `postgres://${POSTGRES_USER ?? 'notetaker'}:${POSTGRES_PASSWORD ?? 'notetaker'}@localhost:${POSTGRES_PORT ?? 5432}/${POSTGRES_DB ?? 'notetaker'}`
      (the host is literally `localhost`, because this branch only runs outside containers; inside the stack Compose
-     supplies its own DSN with host `db`, §15). This is what makes
+     supplies its own DSN with host `db`, §15). The composition embeds the three values **raw** — no layer percent-encodes
+     them afterwards — so `databaseUrl()` first validates that `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` are
+     URL-safe (`[A-Za-z0-9]+` in practice; a value containing `@ : / + % ? #` fails with a readable error naming the
+     variable instead of producing a mangled DSN), `check-env.ts` (PR-18) applies the same check to the trio in the file,
+     and the §15 quick start's hex-password rule is what keeps every composition path (Compose, host, restore drill)
+     consistent. This is what makes
      a bare clone usable before `.env` exists **and** what makes PR-04's acceptance (§12) meaningful — flipping
      `POSTGRES_PORT` moves both the dev container's published port and every host process, because the DSN is derived
      from the same variable. `drizzle.config.ts`, the integration Vitest setup and `scripts/seed-demo.ts` call this same
@@ -2081,7 +2126,9 @@ export function seal(plain: string, noteId: string, keyring: Keyring) {
 // open() splits the trailing 16 bytes as the auth tag; any GCM failure throws → API returns INTERNAL, never blank content
 ```
 
-**A.4 Tree in one query (`tree.service.ts`)** — recursive CTE with `user_id` bound once, `depth < 100` guard,
+**A.4 Tree in one query (`tree.service.ts`)** — recursive CTE with `user_id` bound once, `depth < 100` runaway
+guard (the same 100-level cap PR-09 enforces at create/move, so the walk can never stop short of a folder the API
+accepted — it protects against a corrupted `parent_id` cycle, not against legal depth),
 `array_agg` path for breadcrumbs; assembled into `{folders: FolderNode[], notes: NoteNode[]}` and rebuilt into a
 nested structure client-side by `features/tree/tree.selectors.ts`.
 

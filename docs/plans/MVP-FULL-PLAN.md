@@ -294,7 +294,7 @@ note-taker/
     └── web/                                   Vite + React SPA
         ├── package.json  tsconfig.json  vite.config.ts  index.html  vitest.config.ts   PR-01
         ├── playwright.config.ts               PR-19
-        ├── e2e/                               PR-19 auth.spec.ts, notes.spec.ts, autosave.spec.ts
+        ├── e2e/                               PR-19 auth.spec.ts, notes.spec.ts, autosave.spec.ts, folders.spec.ts
         └── src/
             ├── main.tsx                       PR-01 (Router + QueryClient + providers)
             ├── styles/globals.css             PR-01 (Tailwind v4 @theme tokens)
@@ -878,8 +878,12 @@ merge with the placeholder still in place — see "Jobs added later" below)
   into a 409). `.env.example`
   additions. The ADR-0002 write-up itself belongs to PR-20 (§7 maps every file to one PR); this PR only leaves a
   `// ADR-0002` comment in `crypto/envelope.ts` pointing at where it will land.
-- **Acceptance:** round-trip test; tamper test (flip a ciphertext byte ⇒ `decrypt` throws ⇒ API surfaces
-  `INTERNAL` + logs note id, never blank content); wrong-key test; **key-version rules**: the current key's version comes
+- **Acceptance:** every assertion here is made at the layer this PR owns — `crypto/*`, `notes.repo.ts` and the compiled
+  script — because **no route exists yet** and the routes that would exercise this code (PR-09's `POST /api/notes` /
+  `GET /api/notes/:id`, PR-10's `PUT /api/notes/:id/content`) depend on this PR, so anything HTTP-level here would be
+  unmeetable at merge time. Round-trip test; tamper test (flip a ciphertext byte ⇒ `decrypt()` throws — the route-level
+  mapping of that failure, `INTERNAL` + logged note id + never blank content, is asserted in **PR-09**); wrong-key test;
+  **key-version rules**: the current key's version comes
   from `NOTE_ENCRYPTION_KEY_VERSION` (default `1`) and is written into every new row; the **script** re-encrypts rows and
   stamps them with the current version; the version/key edits in `.env` and the `up -d` restart are **operator steps**
   (the script cannot change its own container's environment — §15 numbers them), so acceptance drives the script with an
@@ -888,16 +892,20 @@ merge with the placeholder still in place — see "Jobs added later" below)
   version 1 still decrypt while that entry stays in `_PREVIOUS`; removing a still-referenced `_PREVIOUS` entry makes
   exactly those rows unreadable (the lossy case the explicit version prevents);
   server refuses to boot in production when neither `NOTE_ENCRYPTION_KEY` nor a readable `NOTE_ENCRYPTION_KEY_FILE`
-  yields 32 bytes; creating a note seals the **empty string** into a valid envelope that decrypts back to the empty
-  string (the schema never holds a NULL/empty cipher or iv); **dev-key path**: with `NODE_ENV=development` and no key
+  yields 32 bytes; `sealNoteContent('')`/`openNoteContent()` round-trip the **empty string** into a valid envelope
+  (the schema never holds a NULL/empty cipher or iv — `sealNoteContent` always emits a 12-byte IV + 16-byte tag);
+  **dev-key path**: with `NODE_ENV=development` and no key
   configured, `.dev/note-key` is created with mode `0600`, the logged fingerprint is identical on the next boot (so rows
   survive a restart), and with `NODE_ENV=production` the same setup still exits non-zero instead of writing `.dev/`; a
   note written with a generated key is unreadable after the key file is deleted, which is the documented dev caveat.
-- **Tests:** ≥ 12 unit assertions (including AAD mismatch across two note ids ⇒ decrypt fails) **plus the
-  rotation-concurrency integration test**: two clients against a real DB, `rotate-note-key.ts` running while a
-  `PUT /api/notes/:id/content` lands mid-run. Assert the note's final content is the *client's* write (not the
-  script's stale buffer), sealed at the current `key_version`, `notes.version` incremented exactly once, and
-  `--verify` exits 0 afterwards. Without the row lock / conditional write this test fails, which is the point.
+- **Tests:** ≥ 12 unit assertions (including AAD mismatch across two note ids ⇒ `decrypt()` fails) **plus the
+  rotation-concurrency integration test**, driven through the layer this PR actually has: two writers against a real DB,
+  `rotate-note-key.ts` running while a second writer calls the **repository's conditional update** (the A.2 shape —
+  `UPDATE notes SET … WHERE id=$1 AND version=$2`, the very statement PR-10's route will wrap) on the same row. Assert
+  the note's final content is the *writer's* (not the script's stale buffer), sealed at the current `key_version`,
+  `notes.version` incremented exactly once, and `--verify` exits 0 afterwards. Without the row lock / conditional write
+  this test fails, which is the point. The same race is re-tested at the HTTP level in **PR-10** (where
+  `PUT /api/notes/:id/content` exists) — that is a second look at the same guarantee, not its only proof.
 - **Out of scope:** per-user keys, KMS integration.
 
 #### PR-07 — Auth core (users, sessions, cookies, CSRF, rate limit, guards)
@@ -985,6 +993,11 @@ decrypt it)
   `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
   `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
   subtree is byte-identical afterwards (§8; no FK-violation `500`, no existence oracle).
+  **The route-level crypto assertions live here, not in PR-06** — this is the first PR whose routes make them
+  measurable: `POST /api/notes` with no content stores a real envelope and `GET /api/notes/:id` answers `content: ''`
+  (PR-06's empty-string seal, proven over HTTP); and a row whose ciphertext fails authentication — forced by rewriting the
+  stored blob directly — makes `GET /api/notes/:id` answer `INTERNAL` with the note id logged and **never**
+  blank-or-garbage content (the mapping `plugins/error-handler.ts` gained in PR-05).
 - **Tests:** ≥ 25 assertions; `services` coverage ≥ 85%.
 - **Out of scope:** content versioning endpoint (PR-10), search (PR-11), UI (PR-12).
 
@@ -998,6 +1011,9 @@ decrypt it)
 - **Acceptance:** two clients on the same version ⇒ one 200, one `VERSION_CONFLICT` carrying server `content` +
   `version`; empty-string content allowed (a legitimately emptied note); write with `If-Match` matching a stale
   ETag ⇒ `VERSION_CONFLICT`; `PUT` against a missing or another user's note ⇒ `404`, never `409` (the follow-up scoped read in A.2); no partial writes when the process is killed mid-request (single statement).
+  **Re-test of PR-06's rotation-concurrency guarantee, one layer up:** run `rotate-note-key.ts` while a real
+  `PUT /api/notes/:id/content` lands mid-rotation — the note ends with the *client's* content at the current
+  `key_version`, `version` bumped exactly once, and the rotation's `--verify` still exits 0.
 - **Out of scope:** client autosave engine (PR-14).
 
 
@@ -1140,8 +1156,10 @@ prepared earlier and rebased)
   `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production.
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
-  the backup + restore drill from §15 (`pg_dump … | gzip`, then `gunzip -c backup.sql.gz | docker compose … exec -T db
-  psql …` into a scratch DB, start the app against it with the same `NOTE_ENCRYPTION_KEY`, and read a note back); the
+  the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
+  notetaker notetaker_restore` — the scratch DB must exist before the pipe can succeed; `gunzip -c backup.sql.gz |
+  docker compose … exec -T db psql -U notetaker -d notetaker_restore`; then the app started against it with a one-off
+  `DATABASE_URL` override and the same `NOTE_ENCRYPTION_KEY`, and a note read back); the
   key-rotation drill from §15 — edit `.env` (new key + bumped
   `NOTE_ENCRYPTION_KEY_VERSION` + old key appended to `_PREVIOUS`), `up -d`, then
   `docker compose … exec app node apps/server/dist/scripts/rotate-note-key.js --dry-run` → real run → `--verify` exits 0,
@@ -1156,8 +1174,9 @@ prepared earlier and rebased)
 **Branch:** `test/pr-19-e2e` · **Size:** M · **Depends on:** PR-08…PR-18
 
 - **Create:** `apps/web/playwright.config.ts` (webServer: build + start API against a throwaway Postgres DB,
-  `NOTE_ENCRYPTION_KEY` from a test-only env file that is gitignored; `.env.test` values are non-secret test
-  constants), `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, CI `e2e` job.
+  `NOTE_ENCRYPTION_KEY` a non-secret test constant supplied as **job env in CI** — exactly as §17 says — and, for local
+  runs only, via a gitignored `.env.test` carrying that same throwaway value),
+  `e2e/{auth.spec.ts,notes.spec.ts,autosave.spec.ts,folders.spec.ts}`, CI `e2e` job.
 - **Scenarios (the MVP acceptance proof):**
   1. first run → `/setup` → owner created → lands on `/app`; sign out → `/login` → sign in.
   2. create folder → create note (assert prefilled `new-file-<ms>.md` and immutable `.md`) → type a heading + a
@@ -1236,6 +1255,10 @@ PR-20 (docs)    ← PR-19
   additionally need **PR-13** (their acceptance ends inside the note editor); PR-14 needs the settings API from
   **PR-09**; PR-16 needs PR-09 + PR-14; **PR-09 needs PR-06** (its `POST /api/notes` seals content and
   `GET /api/notes/:id` decrypts it — the ASCII graph only draws 06 feeding PR-10, so the §12 list is the authority).
+- **The dependency graph must stay acyclic through acceptance, not just through file lists.** A PR's acceptance/tests may
+  only exercise code that exists when it merges — if a criterion needs a route from a later PR, the criterion is moved to
+  that PR (or re-expressed against the layer this PR owns). This is why PR-06 asserts crypto + repository behavior while
+  PR-09/PR-10 carry the HTTP-level versions.
 
 **Suggested milestones (review gates):**
 
@@ -1348,12 +1371,22 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 - Backups: `docker compose --env-file .env -f docker/compose.yml exec -T db pg_dump -U notetaker notetaker | gzip > backup.sql.gz` (`-T` is mandatory: `docker compose exec` allocates a TTY by default, which CRLF-translates the dump and corrupts it)
   **plus the encryption key** (`.env`, or the mounted key file, or `.dev/note-key` in dev). The restore and the
   **key-rotation procedure** are documented in `docs/DEPLOY.md`; the rotation runbook is spelled out below.
-- **Restore drill (PR-18 acceptance, and the procedure `docs/DEPLOY.md` must contain):**
-  `gunzip -c backup.sql.gz | docker compose --env-file .env -f docker/compose.yml exec -T db psql -U notetaker -d notetaker_restore`
-  into a scratch database (a second `db` service or a renamed `POSTGRES_DB` in a throwaway compose file — never over the
-  live one), then start the app against that scratch DB with the **same** `NOTE_ENCRYPTION_KEY` and log in and read a
-  note back. The drill must consume exactly the artifact the backup step produces, `gzip` included — an ungzipped or
-  TTY-corrupted dump failing here is the point of the drill.
+- **Restore drill (PR-18 acceptance, and the procedure `docs/DEPLOY.md` must contain).** The scratch database has to
+  **exist before anything can be piped into it** — `psql -d notetaker_restore` alone dies with
+  `database "notetaker_restore" does not exist`:
+  1. `docker compose --env-file .env -f docker/compose.yml exec -T db createdb -U notetaker notetaker_restore`
+     — same `db` container, never over the live `notetaker` DB. Do **not** try the "rename `POSTGRES_DB`" route: the
+     postgres image reads `POSTGRES_DB` only while initializing an **empty** data directory, so it does nothing to an
+     existing `pgdata` volume;
+  2. `gunzip -c backup.sql.gz | docker compose --env-file .env -f docker/compose.yml exec -T db psql -U notetaker -d notetaker_restore -v ON_ERROR_STOP=1`;
+  3. point the **app** at the scratch DB explicitly — `compose.yml` derives `DATABASE_URL` from `$POSTGRES_DB`, so the
+     drill must override it:
+     `docker compose --env-file .env -f docker/compose.yml run --rm -T -e DATABASE_URL=postgres://notetaker:$POSTGRES_PASSWORD@db:5432/notetaker_restore app`
+     (started with the **same** `NOTE_ENCRYPTION_KEY`, or every note decrypts to garbage and the drill proves nothing);
+  4. log in on that throwaway instance and read a note back, then `exec -T db dropdb -U notetaker notetaker_restore`.
+  The drill must consume exactly the artifact the backup step produces, `gzip` included — an ungzipped or TTY-corrupted
+  dump failing at step 2 is the point of the drill.
+
 
 - **Key rotation (the operator procedure `docs/DEPLOY.md` must contain, PR-18; the script itself is PR-06).** The script
   is compiled into the image, so it runs where the DB and the keyring already are — no pnpm, no `tsx`, no second DB
@@ -1401,7 +1434,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |
 | `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` of **older** keys, kept decrypt-only for as long as any row carries that `key_version` |
-| `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; `scripts/rotate-note-key.ts` bumps it and rewrites every row's `key_version` (§10, PR-06) |
+| `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; the operator bumps it by hand in `.env` (§15 step 2) and `apps/server/src/scripts/rotate-note-key.ts` rewrites every row's `key_version` to that value (§10, PR-06) |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
 | `LOG_LEVEL` | `info` | — | pino level |
@@ -1481,7 +1514,7 @@ The MVP is done when **all** of these are true on `main`:
 
 | # | Risk | Impact | Mitigation (owner PR) |
 | --- | --- | --- | --- |
-| R1 | **Losing `NOTE_ENCRYPTION_KEY` = unrecoverable notes** | Critical, user data | Key backup + restore drill in `docs/DEPLOY.md`; fingerprint logging; `check-env.ts` boot guard (PR-06, PR-18) |
+| R1 | **Losing `NOTE_ENCRYPTION_KEY` = unrecoverable notes** | Critical, user data | Key backup + restore drill in `docs/DEPLOY.md`; fingerprint logging; the compiled `env.ts` boot guard, which is the one that actually runs at boot, plus `check-env.ts` as a dev/CI preflight (PR-06, PR-18) |
 | R2 | Autosave silently overwrites in a second tab | Lost writing | `version` optimistic concurrency + conflict UI (PR-10, PR-14) — never last-write-wins |
 | R3 | Browser crash between keystrokes and the debounce window | Small text loss | Draft mirror in `localStorage`, restore prompt, flush on `pagehide` (PR-14) |
 | R4 | Cascade folder delete nukes many notes accidentally | Data loss | API requires `cascade=true`; UI requires typing the folder name; hard delete logged (PR-09, PR-12) |

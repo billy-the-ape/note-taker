@@ -377,7 +377,7 @@ CREATE INDEX sessions_user_idx ON sessions(user_id);
 CREATE TABLE folders (
   id         uuid PRIMARY KEY,
   user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  parent_id  uuid REFERENCES folders(id) ON DELETE CASCADE,   -- NULL = root; the cycle check (PR-09) runs inside a transaction that locks the moved folder and its new parent - two sibling-unique indexes cannot see a cycle, and an unlocked check loses to a concurrent move
+  parent_id  uuid REFERENCES folders(id) ON DELETE CASCADE,   -- NULL = root. The cycle check (PR-09) runs in a transaction that FIRST takes pg_advisory_xact_lock(hashtext('folder_move), hashtext(user_id::text)) — one lock per user serializes folder create/move/delete. Locking only the two affected rows is not enough: two moves can lock disjoint pairs (X→Y and Z→W), each pass its own ancestor walk, and commit a cycle
   name       text NOT NULL CHECK (name <> ''),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -427,8 +427,8 @@ CREATE INDEX auth_attempts_key_at_idx ON auth_attempts(user_key, at DESC);
 | --- | --- |
 | Every folder/note belongs to exactly one user | `user_id` NOT NULL + `WHERE user_id = auth.userId` on **every** repository query; cross-user access returns `404`, never `403` (no enumeration). **This applies to ids arriving in bodies too** (`POST /api/notes {folderId}`, `POST /api/folders {parentId}`, `PATCH … {parentId\|folderId}`): the FKs (`notes.folder_id → folders.id`, `folders.parent_id → folders.id`) do **not** carry `user_id`, so the service must load the target folder scoped to `auth.userId` and answer `404 NOT_FOUND` before inserting/moving — otherwise user A could attach rows into user B's tree, probe folder ids through FK violations, and lose rows in B's cascade delete. (Backlog alternative: composite `(user_id, id)` unique + FKs — see §12 PR-09 create list.) |
 | Sibling names unique (case-sensitive, trimmed, no `/`, no control chars, ≤ 120 chars) | DB unique index + Zod refinements in `contracts` |
-| Note name never contains the `.md` extension in the DB | `stripMd()` in `contracts/names.ts` (display adds it back via `withMd()`), applied in `note.service.ts` |
-| A folder cannot be moved inside itself | `folder.service.ts` CTE ancestor walk → `CONFLICT` |
+| Note name never contains the `.md` extension in the DB | `stripMd()` in `contracts/names.ts` (display adds it back via `withMd()`), applied in `note.service.ts` — and enforced, not assumed: `isValidNoteName` **rejects any stripped name that still ends in `.md`** (case-insensitive), so one strip is provably enough. Without that rule `foo.md.md` stores as `foo.md`, renders identically to the stored note `foo`, and a rename prefill silently loses characters (A.1; PR-05 contract tests) |
+| A folder cannot be moved inside itself | `folder.service.ts` CTE ancestor walk → `CONFLICT`, inside the per-user `pg_advisory_xact_lock` transaction (§8 `folders.parent_id` comment, PR-09) — row locks alone leave a four-node cycle reachable |
 | `note.version` monotonic | conditional `UPDATE … WHERE id = $1 AND version = $2 RETURNING` → 0 rows ⇒ `409` |
 | Deleting a folder removes descendants | `ON DELETE CASCADE`, gated by explicit `?cascade=true` in the API |
 | Notes **and** folders may live at the root of the tree | `notes.folder_id` and `folders.parent_id` are both nullable, `NULL` = root; the `COALESCE`-based unique indexes above keep sibling names unique for root-level rows too |
@@ -457,7 +457,10 @@ is reserved for malformed payloads (bad characters, length, missing fields).
 
 `code ∈ VALIDATION | UNAUTHORIZED | FORBIDDEN | NOT_FOUND | CONFLICT | RATE_LIMITED | VERSION_CONFLICT |
 PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` from typed domain errors in
-`domain/errors.ts`. `requestId` is echoed in logs for support.
+`domain/errors.ts`. Postgres concurrency errors — `40001` (serialization failure) and `40P01` (deadlock detected) — map
+to `CONFLICT` (409) as well: they are retryable by the client and must never surface as an unexplained `INTERNAL`. PR-05
+wires that mapping; PR-09's folder-move design takes exactly one advisory lock per user precisely so `40P01` is not
+reachable there (§8, PR-09). `requestId` is echoed in logs for support.
 
 ### 9.2 Endpoints
 
@@ -720,8 +723,11 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
 
 - **Goal:** a cloneable repo where `pnpm i && pnpm dev` serves a page and `pnpm build` produces a deployable
   artifact; all quality gates exist from day one so later PRs can only *add* tests, never bolt on tooling.
-- **Create:** `package.json` (root, `packageManager`, workspace scripts: `dev build lint format typecheck test
-  test:integration coverage` — `coverage:integration` is registered later, by PR-04, together with the integration config
+- **Create:** `package.json` (root, `packageManager`, workspace scripts: `dev build build:packages lint format typecheck test
+  test:integration coverage` — `build:packages` (`pnpm -r --filter './packages/**' build`) is defined here even though
+  `packages/` only appears in PR-05, so PR-03's CI steps can call it from day one; while nothing matches the filter it is a
+  no-op, and §14 explains why every typecheck/test job needs it. `coverage:integration` is registered later, by PR-04,
+  together with the integration config
   it needs (§14)) — **and the dev scripts must carry `NODE_ENV` themselves**: `dev` runs `dev:server` +
   `dev:web`, and `dev:server` is `NODE_ENV=development tsx watch src/index.ts` (POSIX; the Windows-safe variant
   `cross-env NODE_ENV=development …` if the owner develops on Windows — §21). `.env.example` ships
@@ -785,7 +791,8 @@ merge with the placeholder still in place — see "Jobs added later" below)
 - **Modify:** `.github/workflows/CI.yml` — **delete the `placeholder` job but keep `name: CI` and the same
   triggers**, because `claude-review.yml` runs `on: workflow_run: workflows: ["CI"]`. Do not rename the workflow.
 - **Jobs shipped by this PR:** `quality` (checkout → `pnpm/action-setup` v12 → `actions/setup-node` cache `pnpm` →
-  `pnpm install --frozen-lockfile` → `pnpm lint && pnpm typecheck`), `unit` (`pnpm coverage` — the **unit** configs only,
+  `pnpm install --frozen-lockfile` → `pnpm build:packages` → `pnpm lint && pnpm typecheck`), `unit` (`pnpm build:packages` →
+  `pnpm coverage` — the **unit** configs only,
   no Postgres service, so it can only enforce the pure-code rows of the §14 table; it uploads `coverage-unit/`),
   `build` (`pnpm build` only — **no `docker build` yet**, because
   `docker/Dockerfile` does not exist until PR-18).
@@ -842,19 +849,31 @@ merge with the placeholder still in place — see "Jobs added later" below)
   examples; `apps/web/src/lib/api.ts` typed fetch wrapper (`json()`, `ApiError`, CSRF header injection, 401
   handling hook) and `queryClient.ts`. It also owns the server-side error plumbing the §9.1 envelope needs before any
   route exists: `apps/server/src/domain/errors.ts` (typed domain errors: `NotFoundError`, `ConflictError`,
-  `VersionConflictError`, …) and `apps/server/src/plugins/error-handler.ts` (Zod / Drizzle / domain error → envelope,
+  `VersionConflictError`, …) and `apps/server/src/plugins/error-handler.ts` (Zod / Drizzle / domain error → envelope —
+  including Postgres `40001`/`40P01` → `CONFLICT`, §9.1 —
   registered inside `buildApp()`). Later PRs only *add mapping cases* to those two files — they never re-create them.
 - **Key content:** `names.ts` =
-  `NOTE_NAME_MAX=120`, `NOTE_NAME_RE` (no `/ \ : * ? " < > |`, no control chars, no leading/trailing space, no `.`/`..`),
+  `NOTE_NAME_MAX=120`, `NOTE_NAME_RE` (no `/ \ : * ? " < > |`, no control chars, no leading/trailing space, no `.`/`..`,
+  **and no stripped name that still ends in `.md`** — A.1: `stripMd` removes exactly one suffix, so `foo.md.md` must be
+  rejected rather than stored as `foo.md`),
   `newFileName(msEpoch) => \`new-file-${msEpoch}.md\``, `stripMd(name)` (drops a trailing `.md`, case-insensitive),
-  `withMd(name)` (display-only re-append), `uniquify(name, taken)`
-  (`…-2.md`, `-3.md`), plus `createNoteSchema.superRefine` enforcing them; folder name rules (no extension handling).
+  `withMd(name)` (display-only re-append), `uniquify(name, taken)` (operates on the stored, extension-free base:
+  `plan` → `plan-2` → `plan-3`), plus `createNoteSchema.superRefine` enforcing them; folder name rules (no extension
+  handling).
 - **Acceptance:** `pnpm build` produces `packages/contracts/dist/index.js` + `index.d.ts`, and
   `node --input-type=module -e "import('@note-taker/contracts').then(m => console.log(typeof m.createNoteSchema))"` run
   from `apps/server` prints `object` — proof the compiled server can resolve the package at runtime with nothing from
   `src/` involved;
-  `pnpm -w typecheck` resolves contracts from both apps; contract unit tests cover name rules
-  (unicode, 121 chars, path chars, existing sibling, **and the stripped-name edge cases from A.1: `"..md"` and `"foo .md"` are rejected because every rule runs on `stripMd(name)`**), error envelope typing, `uniquify` sequences.
+  `pnpm -w typecheck` resolves contracts from both apps **only after `pnpm build:packages` has run** — this PR turns that
+  PR-03 step from a no-op into a requirement, and the acceptance includes the negative control: with `packages/contracts/dist`
+  deleted, `pnpm -w typecheck` fails to resolve `@note-taker/contracts` (proof that `exports`→`dist` is what CI is relying
+  on, §14); contract unit tests cover name rules
+  (unicode, 121 chars, path chars, existing sibling, **and the stripped-name edge cases from A.1: `"..md"` and `"foo .md"`
+  are rejected because every rule runs on `stripMd(name)`, while `"foo.md.md"` and `"foo.md.MD"` are rejected because the
+  stripped result *still* ends in `.md`** — the case that would otherwise store `foo.md` and render it identically to the
+  stored note `foo`), the round-trip property (`isValidNoteName(n) ⇒ stripMd(n) === n`, and two distinct stored names never
+  render to the same `withMd()` display string), error envelope typing, `uniquify` sequences (`plan` → `plan-2`, never
+  `plan.md-2`).
 - **Coverage:** ≥ 90% lines and ≥ 85% branches in `packages/contracts` (the `packages/contracts` row of the §14
   threshold table: 90/90/85/90 here, ratcheting to 95 across the board after PR-19; pure module, no excuse, and it is a
   `unit`-job scope because contracts needs no DB).
@@ -1007,7 +1026,14 @@ decrypt it)
   that only lands in PR-16 would be circular. PR-16 keeps the settings **UI** (page, theme, change-password form).
 - **Behavior:** `GET /api/tree` one recursive CTE (ordered folders-then-notes, `name` collation `C`);
   create/rename/move with sibling-uniqueness ⇒ `CONFLICT` (body carries the conflicting `id`); move-to-self/descendant
-  ⇒ `CONFLICT`; delete folder requires `cascade=true` when non-empty; `POST /api/notes` with no `name` generates
+  ⇒ `CONFLICT`. **Every folder mutation (create / rename / move / delete) opens its transaction with
+  `SELECT pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))`** — one lock per user, held to commit —
+  so the ancestor-walk cycle check runs against a tree no concurrent move is changing. Row locks on the two affected
+  folders are *not* sufficient: two moves can lock disjoint pairs (`X` under `Y` while `Z` under `W`, where `Y ⊂ Z` and
+  `W ⊂ X`), each ancestor walk passes against committed state, and a four-node cycle commits. And because a move takes
+  exactly one advisory lock, the opposite-order acquisition that makes Postgres abort one side of an `A↔B` pair with
+  `40P01` cannot occur; a `40001`/`40P01` arriving from any other path maps to a retryable `CONFLICT` (§9.1), never
+  `INTERNAL`. Delete folder requires `cascade=true` when non-empty; `POST /api/notes` with no `name` generates
   `new-file-<msepoch>` then `uniquify`; cross-user id in any path, query **or body** ⇒ `404` — a `folderId`/`parentId`
   pointing at another user's folder is caught by the service's scoped lookup (the FKs do not carry `user_id`, §8), and
   never surfaces as an FK-violation `500` nor as `403`.
@@ -1019,10 +1045,15 @@ decrypt it)
   `POST /api/folders {parentId: A's}`, `PATCH /api/folders/:id {parentId: A's}` and
   `PATCH /api/notes/:id {folderId: A's}` — every call answers `404 NOT_FOUND`, nothing is created or moved, and A's
   subtree is byte-identical afterwards (§8; no FK-violation `500`, no existence oracle).
-  **Move-cycle race:** with folders `A → B` (B inside A), fire `PATCH /api/folders/A {parentId: B}` and
-  `PATCH /api/folders/B {parentId: A}` through `Promise.all`. Exactly one commit may land; afterwards the `GET /api/tree`
-  walk terminates, both folders are still reachable, and no row has the other as both ancestor and descendant — the test
-  that fails if the cycle check is a plain read-then-write instead of a locked transaction (behavior bullet above).
+  **Move-cycle race — two cases, not one.** (a) *Adjacent pair:* with folders `A → B` (B inside A), fire
+  `PATCH /api/folders/A {parentId: B}` and `PATCH /api/folders/B {parentId: A}` through `Promise.all`; exactly one commit
+  may land, and afterwards the `GET /api/tree` walk terminates, both folders are reachable, and no row has the other as
+  both ancestor and descendant. (b) *Disjoint locks — the case (a) does not catch:* four folders with `Y ⊂ Z` and
+  `W ⊂ X`, fired as `PATCH /api/folders/X {parentId: Y}` and `PATCH /api/folders/W {parentId: Z}` concurrently. They share
+  no row, so a design that locks only the moved folder plus its new parent lets both ancestor walks pass and commits the
+  cycle `X→Y→Z→W→X`; with the per-user advisory lock the second transaction waits, then its walk sees the committed state
+  and answers `CONFLICT`. Assert that neither interleaving leaves a cycle, and that the loser gets `CONFLICT` — never an
+  unmapped `40P01`/`INTERNAL`.
   **The route-level crypto assertions live here, not in PR-06** — this is the first PR whose routes make them
   measurable: `POST /api/notes` with no content stores a real envelope and `GET /api/notes/:id` answers `content: ''`
   (PR-06's empty-string seal, proven over HTTP); and a row whose ciphertext fails authentication — forced by rewriting the
@@ -1200,7 +1231,9 @@ prepared earlier and rebased)
   started against it with a one-off `DATABASE_URL` override plus an explicit `-p 127.0.0.1:3100:3000` and `run -d`
   (because `run` publishes none of the service's ports), the same `NOTE_ENCRYPTION_KEY`, and a note read back at
   `http://127.0.0.1:3100`) — every command run **after** `set -a; . ./.env; set +a`, because `--env-file` feeds Compose's
-  interpolation and never the shell; the
+  interpolation and never the shell, and run against a `.env` carrying **all three** `POSTGRES_USER`/`POSTGRES_DB`/
+  `POSTGRES_PASSWORD` values (§15 step 2): with any of them missing, each `-U "$POSTGRES_USER"` and `${POSTGRES_DB}_restore`
+  in the sequence expands to empty and the drill proves nothing; the
   key-rotation drill from §15 — edit `.env` (new key + bumped
   `NOTE_ENCRYPTION_KEY_VERSION` + old key appended to `_PREVIOUS`), `up -d`, then
   `docker compose … exec app node apps/server/dist/scripts/rotate-note-key.js --dry-run` → real run → `--verify` exits 0,
@@ -1329,11 +1362,12 @@ on:
 permissions: { contents: read }
 concurrency: { group: "ci-${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }
 jobs:
-  quality:      # pnpm lint && pnpm typecheck            (~40 s)  — PR-03
-  unit:         # pnpm coverage (unit configs, NO Postgres) + artifact (~60 s) — PR-03
+  quality:      # pnpm build:packages && pnpm lint && pnpm typecheck   (~60 s)  — PR-03; the build:packages
+                # step starts as a no-op and becomes load-bearing in PR-05 (§14 rule below)
+  unit:         # pnpm build:packages && pnpm coverage (unit configs, NO Postgres) + artifact (~75 s) — PR-03
   build:        # pnpm build                           (~2 min)   — PR-03; gains `docker build` in PR-18
-  integration:  # services: postgres:16 → pnpm test:integration (~2 min) — added by PR-04; this job also runs
-                # `pnpm coverage:integration` (see the coverage rule below) — coverage of everything needing a DB
+  integration:  # services: postgres:16 → pnpm build:packages && pnpm test:integration (~2 min) — added by PR-04;
+                # this job also runs `pnpm coverage:integration` (see the coverage rule below) — coverage of everything needing a DB
   e2e:          # build, start app, Playwright chromium (~4 min)  — added by PR-19
 ```
 
@@ -1341,6 +1375,14 @@ Rules:
 
 - Jobs arrive incrementally with the PR that owns the files they run (PR-03 ships `quality`/`unit`/`build`; PR-04 adds
   `integration`; PR-18 adds the `docker build` step; PR-19 adds `e2e`) — see PR-03/PR-04 in §12.
+- **`pnpm build:packages` (`pnpm -r --filter './packages/**' build`) runs in every job that typechecks or tests app
+  code.** `@note-taker/contracts` declares `exports`/`main`/`types` → `./dist` only (§7) — right for the compiled image's
+  runtime import, but a fresh CI checkout has no `dist/`, so `pnpm typecheck` and the Vitest runs in `quality`/`unit`/
+  `integration` cannot resolve the specifier from **PR-05 onward**. PR-03 adds the step while it is still a no-op; PR-05
+  makes it load-bearing and proves the failure mode is gone (typecheck passes on a clean clone after only
+  `pnpm install && pnpm build:packages`). Alternative rejected for the MVP: aliasing `@note-taker/contracts` to `src/` in
+  `tsconfig`/Vitest — it would hide whether the published `exports` map actually resolves, which is precisely what PR-05's
+  acceptance exists to prove.
 
 - `pnpm install --frozen-lockfile` only; lockfile committed; `cache: pnpm` in `actions/setup-node`.
 - Integration/e2e jobs get a throwaway DB: `POSTGRES_PASSWORD: test` service env, `DATABASE_URL` pointing at it —
@@ -1383,10 +1425,13 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
   'console.log(require("crypto").randomBytes(32).toString("base64"))')" > .env
 #    NODE_ENV needs no entry here: the production image bakes ENV NODE_ENV=production into stage 2 and compose
 #    repeats it in the app service's environment block (§16 explains who sets what).
-# 2. fill in POSTGRES_PASSWORD / HOST_PORT in .env (DATABASE_URL is derived by compose; see §16), then — always from the repo root,
-#    DATABASE_URL in .env only matters when running the API on the host, outside compose: the app service's
-#    environment: block sets it from the POSTGRES_* values and takes precedence over env_file:.
-#    and always with BOTH flags (see the note below):
+# 2. fill in POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD (+ optionally HOST_PORT) in .env. All three POSTGRES_*
+#    values are REQUIRED in this file: `notetaker` in §16 is only Compose `${VAR:-notetaker}` interpolation, so an
+#    operator who omits them gets a working container but an EMPTY `$POSTGRES_USER`/`$POSTGRES_DB` in the shell, and
+#    every command in the runbook below silently degrades to `pg_dump -U "" ""` and `createdb … "_restore"`.
+#    DATABASE_URL needs no entry — the app service's environment: block derives it from these same values and takes
+#    precedence over env_file: (a hand-written DATABASE_URL only matters when running the API on the host).
+#    Then — always from the repo root, and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
 # 3. open http://<host>:3000  → /setup → create the first owner
@@ -1416,7 +1461,11 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
   `--env-file .env` feeds Compose's *own* variable interpolation only — it never populates the shell, so a bare
   `$POSTGRES_PASSWORD` typed at the prompt expands to empty and the DSN silently becomes `postgres://notetaker:@db:5432/…`
   (auth failure). And **never hardcode `notetaker`** in these commands: `POSTGRES_USER`/`POSTGRES_DB` are configurable
-  (§16), so use `"$POSTGRES_USER"` / `"$POSTGRES_DB"`.
+  (§16), so use `"$POSTGRES_USER"` / `"$POSTGRES_DB"`. That only works because the quick start above makes all three
+  `POSTGRES_*` values explicit in `.env` — Compose's `${VAR:-notetaker}` default exists **only** inside Compose's
+  interpolation and is invisible to a sourced shell, so an omitted variable would expand to `""` here rather than to
+  `notetaker`. If you want a second belt, run `: "${POSTGRES_USER:?}" "${POSTGRES_DB:?}" "${POSTGRES_PASSWORD:?}"`
+  after sourcing: it fails loudly instead of letting `pg_dump -U "" ""` look like a success.
 - Backups: `docker compose --env-file .env -f docker/compose.yml exec -T db pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" | gzip > "backup-$(date +%F).sql.gz"` (`-T` is mandatory: `docker compose exec` allocates a TTY by default, which CRLF-translates the dump and corrupts it)
   **plus the encryption key** (`.env`, or the mounted key file, or `.dev/note-key` in dev). The restore and the
   **key-rotation procedure** are documented in `docs/DEPLOY.md`; the rotation runbook is spelled out below.
@@ -1452,7 +1501,11 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
   1. back up first (previous bullet) — a rotation without a fresh backup is unsupported;
   2. edit the repo-root `.env` **by hand** (the script cannot change a running container's environment): append the old
      key to `NOTE_ENCRYPTION_KEY_PREVIOUS` as `{"<old version>": "<old base64>"}`, set the new `NOTE_ENCRYPTION_KEY`,
-     bump `NOTE_ENCRYPTION_KEY_VERSION` to `<old>+1`;
+     bump `NOTE_ENCRYPTION_KEY_VERSION` to `<old>+1`. **Write that value single-quoted** —
+     `NOTE_ENCRYPTION_KEY_PREVIOUS='{"1": "sGx/…="}'`: Compose strips one layer of surrounding quotes when it loads the
+     file through `env_file:`, while the shell convention above *sources* the same file, where a bare `{…}` containing a
+     space is a syntax error that breaks `set -a; . ./.env; set +a` for every later command in this runbook. The JSON must
+     therefore contain no single quotes of its own;
   3. `docker compose --env-file .env -f docker/compose.yml up -d` so the app process picks the new keyring up (old rows
      still decrypt through `_PREVIOUS` from this moment on);
   4. `docker compose --env-file .env -f docker/compose.yml exec app node apps/server/dist/scripts/rotate-note-key.js --dry-run`
@@ -1479,9 +1532,9 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `HOST` | `0.0.0.0` | — | bind address |
 | `PORT` | `3000` | — | port the container listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid — use `HOST_PORT` to publish elsewhere |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping (`"${HOST_PORT:-3000}:3000"`) — the operator-facing port knob |
-| `POSTGRES_USER` | `notetaker` | dev compose | role + owner created by the `db` service of `docker/compose.yml` (prod compose keeps it internal) |
+| `POSTGRES_USER` | `notetaker` | ✔ **in `.env` whenever compose is used** | role + owner created by the `db` service of `docker/compose.yml` (prod compose publishes no port). The §15 runbook's shell commands read this variable, so it must be written into `.env` — Compose's `${POSTGRES_USER:-notetaker}` fallback covers Compose only (§15) |
 | `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; `DATABASE_URL` must embed the same value |
-| `POSTGRES_DB` | `notetaker` | dev compose | database created by the `db` image's first init |
+| `POSTGRES_DB` | `notetaker` | ✔ **in `.env` whenever compose is used** | database created by the `db` image's first init; also interpolated into the app's `DATABASE_URL` by `compose.yml` and used as the base for the §15 restore drill's `<db>_restore` — so it must be written in `.env` like `POSTGRES_USER`, not left to Compose's default |
 | `POSTGRES_PORT` | `5432` | — | host port published for the **dev** compose `db` only (`docker/compose.dev.yml`); the prod `db` publishes nothing |
 | `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ **only when the API runs outside compose** | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2); the `localhost` default is the value for running the API on the host against the dev compose DB. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB |
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
@@ -1491,7 +1544,8 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `ALLOW_REGISTRATION` | `false` | — | when true, `POST /api/auth/register` (PR-07) opens self-service sign-up; when false, accounts come only from `POST /api/users` (owner only) |
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |
-| `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` of **older** keys, kept decrypt-only for as long as any row carries that `key_version` |
+| `NOTE_ENCRYPTION_KEY_PREVIOUS` | — | only during rotation | JSON map `{"1": "<base64>"}` of **older** keys, kept decrypt-only for as long as any row carries that `key_version`. Written **single-quoted** in `.env` (`='{"1": "…"}'`): Compose strips the surrounding quotes for the container, while the runbook's `set -a; . ./.env; set +a` sources the same file, where unquoted JSON is a shell syntax error (§15, rotation step 2) |
+
 | `NOTE_ENCRYPTION_KEY_VERSION` | `1` | ✔ set alongside the key | the integer tag stamped into `notes.key_version` for the **current** key. Explicit, never derived from `_PREVIOUS`; the operator bumps it by hand in `.env` (§15 step 2) and `apps/server/src/scripts/rotate-note-key.ts` rewrites every row's `key_version` to that value (§10, PR-06) |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | — | failures per 15 min per user+IP |
 | `MAX_NOTE_BYTES` | `1048576` | — | request body / note size cap |
@@ -1627,15 +1681,24 @@ nowhere else:
 ```ts
 export const MD_EXT = '.md';
 export const newFileName = (msEpoch: number = Date.now()) => `new-file-${msEpoch}${MD_EXT}`;
-// "Draft.md" -> "Draft" (names are stored extension-free)
+// "Draft.md" -> "Draft" (names are stored extension-free). Exactly ONE suffix is removed — which is only safe
+// because isValidNoteName() below rejects a stripped name that still ends in .md.
 export const stripMd = (name: string) => name.toLowerCase().endsWith(MD_EXT) ? name.slice(0, -MD_EXT.length) : name;
 export const withMd = (name: string) => stripMd(name) + MD_EXT; // display only
+const endsInMd = (s: string) => s.toLowerCase().endsWith(MD_EXT);
 export const isValidNoteName = (raw: string): boolean => {
-  const base = stripMd(raw);            // every rule runs on the STRIPPED name ("..md" → "." must fail, "foo .md" → "foo " must fail)
+  const base = stripMd(raw);   // every rule runs on the STRIPPED name ("..md" → "." must fail, "foo .md" → "foo " must fail)
   return base.length > 0 && base.length <= 120 &&
-    !/[\\/:*?"<>|\u0000-\u001f]/.test(base) && base === base.trim() && base !== '.' && base !== '..';
+    !/[\\/:*?"<>|\u0000-\u001f]/.test(base) && base === base.trim() && base !== '.' && base !== '..' &&
+    // …and the stripped result may not STILL end in .md. "foo.md.md" would otherwise be stored as "foo.md":
+    // that breaks the §8 "no .md in the DB" invariant, makes the stored rows `foo` and `foo.md` render
+    // identically (withMd turns both into "foo.md"), and loses characters when a rename prefill strips again.
+    // Rejecting is deliberate: silently stripping twice would make "foo.md.md" collide with "foo" instead.
+    !endsInMd(base);
 };
-export const uniquify = (name: string, taken: Set<string>): string => { /* base-2.md, base-3.md … */ };
+// Works on the extension-free base, because that is what is stored: "plan" → "plan-2" → "plan-3".
+// withMd() renders the ".md"; uniquify must never emit a name that still carries the extension.
+export const uniquify = (name: string, taken: Set<string>): string => { /* base, base-2, base-3 … */ };
 ```
 
 **A.2 Atomic versioned content write (`notes.repo.ts`)** — one statement, so two tabs cannot both win:

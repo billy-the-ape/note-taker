@@ -252,7 +252,8 @@ note-taker/
     │   └── src/
     │       ├── index.ts                       PR-01 (bootstrap: env → buildApp → migrate → listen → shutdown)
     │       ├── app.ts                         PR-01 factory `buildApp(deps)` — DI so tests never bind a port
-    │       ├── env.ts                         PR-01 zod-parsed process.env, prod invariants, `loadDevEnvFile()` (§16)
+    │       ├── env.ts                         PR-01 zod-parsed process.env, prod invariants, `loadDevEnvFile()`
+    │       │                                  and `databaseUrl()` (§16)
     │       ├── logger.ts                      PR-01 pino
     │       ├── db/schema.ts                   PR-04 drizzle table definitions (single source of truth)
     │       ├── db/client.ts                   PR-04 postgres.js pool + drizzle instance
@@ -579,6 +580,7 @@ home/LAN/VM network, possibly behind a reverse proxy.
 - The compiled `env.ts` bootstrap (`index.ts`, PR-01 + PR-06) fails in **every** environment when `NODE_ENV` is unset
   or not one of `development | test | production` — there is **no default**, so a container that forgot to set it cannot
   silently boot in the least-restrictive mode. In `production` it additionally refuses to start when:
+  `DATABASE_URL` unset (the `POSTGRES_*` derivation is a `development`/`test` convenience only, §16),
   `NOTE_ENCRYPTION_KEY` missing/≠32 bytes **and** `NOTE_ENCRYPTION_KEY_FILE` unset/unreadable,
   `SESSION_TTL_DAYS` > 365, `SECURE_COOKIES=false` while `TRUST_PROXY=true`, or
   `ALLOW_REGISTRATION=true` while `SECURE_COOKIES=false` (public sign-up over plain HTTP). The first account is
@@ -743,7 +745,9 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `NODE_ENV=development`, and the README quick start says `cp .env.example .env` — but PR-01 must boot **without** any
   `.env`, because the Makefile that copies it only arrives in PR-02 and `env.ts` (created here) rejects an unset
   `NODE_ENV` in every environment (§10, §16). **Loading `.env` for host processes is a PR-01 artifact too:** `env.ts`
-  exports `loadDevEnvFile()`, which `index.ts` calls before parsing, and PR-04/PR-09 reuse it from
+  exports `loadDevEnvFile()` **and** `databaseUrl()` — the single DSN resolver (§16: a set `DATABASE_URL` is used
+  verbatim; otherwise it is composed from `POSTGRES_*` in `development`/`test`; production has no default), which
+  `index.ts`, `db/client.ts` and `db/migrate.ts` all go through, and PR-04/PR-09 reuse both from
   `drizzle.config.ts`, the integration Vitest setup and `scripts/seed-demo.ts` (§16's "How the repo-root `.env` reaches
   a process"). Compose's `--env-file` feeds Compose's interpolation only, so without that function `pnpm dev` here,
   `pnpm db:migrate`/`drizzle-kit` and `pnpm test:integration` in PR-04, and `db:seed` in PR-09 would each silently
@@ -777,7 +781,7 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `pnpm lint`, `pnpm typecheck`,
   `pnpm test`, `pnpm build` all exit 0; `vite` proxies `/api` to `:3000`; server built with `tsc` (no bundler) to `apps/server/dist`,
   web built to `apps/web/dist`; `env.ts` rejects unknown/missing required vars and is unit-tested; **no `db:*` script is registered yet** (`pnpm db:migrate` fails as an unknown script until PR-04 adds it, and nothing in CI calls it before then).
-- **Tests:** `env.test.ts` (prod invariants, plus the `.env` loader via `DOTENV_PATH` pointing at a temp fixture: file values appear when the process env lacks them, a value already in the process env wins, a missing file is a silent no-op, a malformed file throws, and with `NODE_ENV=production` the file is never opened at all — §16), `app.test.ts` (`app.inject('/api/health')` = 200).
+- **Tests:** `env.test.ts` — prod invariants; the `.env` loader via `DOTENV_PATH` pointing at a temp fixture (file values appear when the process env lacks them, a value already in the process env wins, a missing file is a silent no-op, a malformed file throws, and with `NODE_ENV=production` the file is never opened at all); and `databaseUrl()` as a pure function with no DB involved (a set `DATABASE_URL` comes back verbatim; with it unset the DSN is composed from `POSTGRES_*`, so changing `POSTGRES_PORT` changes the string every host tool will use; with `NODE_ENV=production` and no `DATABASE_URL` it fails as a missing required var) — all §16. Plus `app.test.ts` (`app.inject('/api/health')` = 200).
 - **Out of scope:** any DB code, any real UI.
 
 #### PR-02 — Local dev infrastructure (Postgres in Docker, Make)
@@ -793,8 +797,10 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   `test -f .env || cp .env.example .env`, and every target that passes `--env-file .env` (`db-up`, `db-down`, `db-reset`,
   `dev`) depends on it — Compose hard-errors when the `--env-file` path is missing, so a cold clone would otherwise fail
   before Docker is even contacted. PR-02 also **extends `.env.example`** (PR-01 ships it with `NODE_ENV` only) with the
-  dev-only `POSTGRES_*`, `DATABASE_URL` and `HOST_PORT` defaults the dev compose file interpolates, so the copy produces a
-  working file rather than a stub.
+  dev-only `POSTGRES_*` and `HOST_PORT` defaults the dev compose file interpolates, so the copy produces a working
+  file rather than a stub — and deliberately **no** `DATABASE_URL` line, so host commands derive the DSN from the
+  same `POSTGRES_*` values and one edit moves the dev container and the host tools together (§16's DSN bullet,
+  asserted in PR-04).
 - **Acceptance:** from a cold clone (`pnpm i` only — **no `.env`, no schema**): `make db-up` creates `.env` from
   `.env.example` and leaves a healthy Postgres (`pg_isready -h localhost -p 5432` exits 0), `make db-reset` recreates it,
   and `make dev` serves the hello-world
@@ -845,19 +851,24 @@ merge with the placeholder still in place — see "Jobs added later" below)
   sees plaintext, because the schema has no plaintext representation; PR-04's tests insert fixed test blobs, and PR-06
   plugs the real `crypto/envelope.ts` in behind the same interface). Also creates **`apps/server/vitest.integration.config.ts`**
   with `include: ['src/**/*.int.test.ts']` — the only config that reads `DATABASE_URL` — and one of the two host entry points that must call PR-01's
-  `loadDevEnvFile()` itself (its Vitest setup file, plus the top of `drizzle.config.ts`: neither Vitest nor drizzle-kit
-  imports `env.ts` on its own, so without those calls `pnpm test:integration` and `pnpm db:migrate` would keep using the
-  in-code dev default after anyone edited `.env` — §16) — and every DB-backed file it adds
+  `loadDevEnvFile()` + `databaseUrl()` themselves (its Vitest setup file, plus the top of `drizzle.config.ts`: neither
+  Vitest nor drizzle-kit imports `env.ts` on its own, so without those calls `pnpm test:integration` and
+  `pnpm db:migrate` would ignore an edited `.env` and build the DSN from whatever the shell happened to export —
+  §16) — and every DB-backed file it adds
   (`db/repositories/*.int.test.ts`) carries that suffix, which is what keeps `pnpm test` and the Postgres-free `unit` job
   green from here on (§14's split rule, pre-configured in PR-01).
   Also **modify `.github/workflows/CI.yml`** to add the `integration` job (`services: postgres:16` + `DATABASE_URL` →
   `pnpm test:integration`, and the new `pnpm coverage:integration` step that produces the DB-dependent coverage numbers —
   §14) — this is the PR that makes that job meaningful (see PR-03).
 - **Acceptance:** `pnpm db:generate && pnpm db:migrate` idempotent on a fresh and existing DB — and run with **nothing
-  exported in the shell** but the repo-root `.env` a cold clone has: flipping `POSTGRES_PORT` there (and recreating the
-  dev `db`) makes `pnpm db:migrate` follow it, proving PR-01's `loadDevEnvFile()` really runs inside the drizzle-kit path,
-  while an explicitly exported `DATABASE_URL=…` overrides the file (the precedence §16 states, and how the CI `integration`
-  job's value wins); integration tests
+  exported in the shell** but the repo-root `.env` a cold clone has (`cp .env.example .env`, which ships `POSTGRES_*`
+  and `HOST_PORT` but **no** `DATABASE_URL`, §16). Two assertions, because a DSN and its parts are different levers:
+  (a) flip `POSTGRES_PORT` there (and recreate the dev `db`) and `pnpm db:migrate` follows it — true only because
+  `env.ts`'s `databaseUrl()` derives the DSN from `POSTGRES_*` when `DATABASE_URL` is unset, which is what makes
+  `loadDevEnvFile()` visible inside the drizzle-kit path at all;
+  (b) put a literal `DATABASE_URL=…:5433/notetaker_test` in the same `.env` and the same command targets *that* string
+  verbatim (`process.loadEnvFile` does no `${VAR}` expansion, §16), which is also how the CI `integration` job's exported
+  `DATABASE_URL` wins; integration tests
   prove: sibling uniqueness (folder & note), **root-level rows work** (`folders.parent_id IS NULL` and
   `notes.folder_id IS NULL` insert, and two root notes with the same name collide while a root note and a note inside
   a folder do not), cascade delete of nested folders, `notes.version` conditional update
@@ -1506,7 +1517,8 @@ Rules:
 
 **Dev** (PR-02): `make db-up` → Postgres 16 on `localhost:5432` in Docker; the app runs on the host with
 `pnpm dev` (`tsx watch` API on `:3000`, Vite on `:5173` proxying `/api`). No key setup is needed in dev:
-`.env.example` ships `NODE_ENV=development` plus the dev `POSTGRES_*`/`DATABASE_URL`/`HOST_PORT` defaults, and every compose-facing
+`.env.example` ships `NODE_ENV=development` plus the dev `POSTGRES_*`/`HOST_PORT` defaults and **no** `DATABASE_URL`
+line (the DSN is derived from `POSTGRES_*` by `env.ts`, §16), and every compose-facing
 make target depends on a `bootstrap-env` step (`test -f .env || cp .env.example .env`) before it can pass `--env-file .env`.
 The `NODE_ENV` line in that file is what Compose interpolation and `scripts/check-env.ts` see; the **process** gets
 `NODE_ENV` from the dev script (`dev:server`, PR-01) or the container's `environment:` block, never from the file (§16),
@@ -1528,7 +1540,8 @@ printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
 #    operator who omits them gets a working container but an EMPTY `$POSTGRES_USER`/`$POSTGRES_DB` in the shell, and
 #    every command in the runbook below silently degrades to `pg_dump -U "" ""` and `createdb … "_restore"`.
 #    DATABASE_URL needs no entry — the app service's environment: block derives it from these same values and takes
-#    precedence over env_file: (a hand-written DATABASE_URL only matters when running the API on the host).
+#    precedence over env_file:. On the host the same derivation happens in env.ts's databaseUrl() when the variable
+#    is unset (§16); writing DATABASE_URL into this file freezes it against later POSTGRES_* edits.
 #    Then — always from the repo root, and always with BOTH flags (see the note below):
 docker compose --env-file .env -f docker/compose.yml up -d     # publishes ONLY ${HOST_PORT:-3000}
 docker compose --env-file .env -f docker/compose.yml ps        # app reported healthy
@@ -1632,10 +1645,10 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `PORT` | `3000` | — | port the container listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid — use `HOST_PORT` to publish elsewhere |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping (`"${HOST_PORT:-3000}:3000"`) — the operator-facing port knob |
 | `POSTGRES_USER` | `notetaker` | ✔ **in `.env` whenever compose is used** | role + owner created by the `db` service of `docker/compose.yml` (prod compose publishes no port). The §15 runbook's shell commands read this variable, so it must be written into `.env` — Compose's `${POSTGRES_USER:-notetaker}` fallback covers Compose only (§15) |
-| `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; `DATABASE_URL` must embed the same value |
+| `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the **only** secret the `db` container needs; an explicit `DATABASE_URL` must embed the same value, and with it unset `databaseUrl()` embeds it for you (§16) |
 | `POSTGRES_DB` | `notetaker` | ✔ **in `.env` whenever compose is used** | database created by the `db` image's first init; also interpolated into the app's `DATABASE_URL` by `compose.yml` and used as the base for the §15 restore drill's `<db>_restore` — so it must be written in `.env` like `POSTGRES_USER`, not left to Compose's default |
 | `POSTGRES_PORT` | `5432` | — | host port published for the **dev** compose `db` only (`docker/compose.dev.yml`); the prod `db` publishes nothing |
-| `DATABASE_URL` | `postgres://notetaker:notetaker@localhost:5432/notetaker` | ✔ **only when the API runs outside compose** | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2); the `localhost` default is the value for running the API on the host against the dev compose DB. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB. On the host this value arrives from the repo-root `.env` through PR-01's `loadDevEnvFile()`, which also carries it as an in-code default in `development`/`test` **only** — never in production (§16) |
+| `DATABASE_URL` | **unset ⇒ derived** as `postgres://<POSTGRES_USER>:<POSTGRES_PASSWORD>@localhost:<POSTGRES_PORT>/<POSTGRES_DB>` (`notetaker`/`notetaker`/`5432`/`notetaker` in dev — see the DSN-resolution bullet below); **set ⇒ used verbatim** | ✔ **required in `production`**, optional elsewhere | Postgres DSN. In the container stack you do **not** set this: `docker/compose.yml` derives it from the `POSTGRES_*` values in the `app` service `environment:` block (which takes precedence over `env_file:`), with the host part as the service name `db` — never `localhost`, which only exists on a developer machine. A hand-written `DATABASE_URL` in the repo-root `.env` is overridden by that block and has no effect inside the stack (§15 step 2). `.env.example` deliberately ships **no** `DATABASE_URL` line: leaving it unset is what makes one `POSTGRES_PORT`/`POSTGRES_PASSWORD` edit move both the dev container and every host process (PR-04's acceptance pins that), whereas adding the line freezes the DSN, because `process.loadEnvFile` expands nothing. The one place a runbook must set it explicitly is the §15 restore drill, which uses `run -e DATABASE_URL=…` to point the app at the scratch DB |
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
 | `SESSION_TTL_DAYS` | `30` | — | session cookie + DB expiry |
 | `SECURE_COOKIES` | `false` (dev) | ✔ `true` behind TLS | `Secure` cookie flag |
@@ -1679,15 +1692,31 @@ the plan states the mechanism instead of leaving it implicit:
 - **Precedence: the environment beats the file.** `process.loadEnvFile` does not overwrite already-set keys (verified
   on Node 22.22), so CI's explicit `DATABASE_URL`, the container environment Compose injects, and a one-off
   `DATABASE_URL=… pnpm db:migrate` always win over `.env`. The file only fills gaps.
-- **`DATABASE_URL` does have an in-code default — in `development`/`test` only**, exactly the value in the table above
-  (`…@localhost:5432/notetaker`), which is what makes a bare clone usable before PR-02 copies `.env.example` and keeps
-  PR-04's local `test:integration` working against `make db-up`'s published dev `db`. In `production` there is **no
-  default**: `env.ts` fails the boot unless `DATABASE_URL` is set, and in the Compose stack the value comes from the
-  `app` service's `environment:` block, whose host is the service name `db` (§15). A production process pointed at
-  `localhost` is therefore always an explicit choice, never an accident.
-- The consequence PR-02/PR-04 acceptance asserts: editing `POSTGRES_PORT` or `POSTGRES_PASSWORD` in the repo-root `.env`
-  changes **both** what the dev `db` container publishes and what the host API, `pnpm db:migrate` and the integration
-  tests connect to, because both sides read the same file.
+- **The DSN is resolved by one exported function, `env.ts`'s `databaseUrl()`, not read ad hoc.** Resolution order:
+  1. **`DATABASE_URL` is set** (process env or `.env`) → use that string **verbatim**. `process.loadEnvFile` performs no
+     `${VAR}` expansion (verified on Node 22.22), so a hand-written DSN is a literal: it does **not** track a later
+     `POSTGRES_PORT`/`POSTGRES_PASSWORD` edit, and the two must be changed together if the operator edits one.
+  2. **Unset and `NODE_ENV` is `development`/`test`** → derive it:
+     `postgres://${POSTGRES_USER ?? 'notetaker'}:${POSTGRES_PASSWORD ?? 'notetaker'}@localhost:${POSTGRES_PORT ?? 5432}/${POSTGRES_DB ?? 'notetaker'}`
+     (the host is literally `localhost`, because this branch only runs outside containers; inside the stack Compose
+     supplies its own DSN with host `db`, §15). This is what makes
+     a bare clone usable before `.env` exists **and** what makes PR-04's acceptance (§12) meaningful — flipping
+     `POSTGRES_PORT` moves both the dev container's published port and every host process, because the DSN is derived
+     from the same variable. `drizzle.config.ts`, the integration Vitest setup and `scripts/seed-demo.ts` call this same
+     function after `loadDevEnvFile()`; none of them builds its own DSN.
+  3. **Unset and `NODE_ENV=production`** → no derivation and no default: the boot fails naming `DATABASE_URL`
+     (`check-env.ts`, PR-18, says the same thing earlier). In the Compose stack the value is never missing, because the
+     `app` service's `environment:` block sets it from the same `POSTGRES_*` values with host `db` (§15). A production
+     process pointed at `localhost` is therefore always an explicit choice, never an accident.
+  In `development`/`test`, when an explicit `DATABASE_URL` disagrees with the `POSTGRES_*` values in the same file
+  (different port or db), `env.ts` logs one warning naming both, so the literal-vs-derived trap is visible instead of
+  silently connecting to the wrong database.
+- The consequence PR-02/PR-04 acceptance asserts: with **no** `DATABASE_URL` in the file, editing `POSTGRES_PORT` or
+  `POSTGRES_PASSWORD` in the repo-root `.env` changes **both** what the dev `db` container publishes and what the host
+  API, `pnpm db:migrate` and the integration tests connect to, because both sides read the same variables through
+  `loadDevEnvFile()` + `databaseUrl()`. With a literal `DATABASE_URL` present, only the container follows the `POSTGRES_*`
+  edit, and the DSN line has to be edited in the same breath — which is why `.env.example` ships `POSTGRES_*` and
+  `HOST_PORT` but **no** `DATABASE_URL` line (§15, PR-02).
 
 ---
 

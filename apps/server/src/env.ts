@@ -33,7 +33,7 @@ export type NodeEnv = (typeof NODE_ENV_VALUES)[number];
 export const LOG_LEVEL_VALUES = ['fatal', 'error', 'warn', 'info', 'debug', 'trace'] as const;
 export type LogLevel = (typeof LOG_LEVEL_VALUES)[number];
 
-/** Anything shaped like `process.env`; an empty or whitespace-only value counts as unset. */
+/** Anything shaped like `process.env`. */
 export type EnvSource = Readonly<Record<string, string | undefined>>;
 
 /** Every problem found in one boot, already human-readable. Thrown instead of booting half-configured. */
@@ -367,7 +367,7 @@ export function databaseUrl(source: EnvSource = process.env, options: DatabaseUr
 
   if (mode === undefined) {
     throw new EnvError([
-      `NODE_ENV is required before a Postgres DSN can be resolved: DATABASE_URL is unset and ` +
+      'NODE_ENV is required before a Postgres DSN can be resolved: DATABASE_URL is unset and ' +
         `derivation from POSTGRES_* is only allowed in ${NODE_ENV_VALUES.filter((value) => value !== 'production').join('/')}`,
     ]);
   }

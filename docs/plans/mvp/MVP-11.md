@@ -9,7 +9,7 @@ Self-contained work order — everything you need is below; do not load `MVP-FUL
 
 | Direction | Estimate | What it covers |
 | --- | --- | --- |
-| **Input** | **~18k tokens** | this brief (1.3k as written) + PR-09's services/repositories + PR-06's `openNoteContent()` + `contracts/search.schemas.ts` + drizzle `ILIKE`/`sql` templating docs + timing output from the 1 000-note fixture |
+| **Input** | **~18k tokens** | this brief (1.7k as written) + PR-09's services/repositories + PR-06's `openNoteContent()` + `contracts/search.schemas.ts` + drizzle `ILIKE`/`sql` templating docs + timing output from the 1 000-note fixture |
 | **Output** | **~6k tokens** | `services/search.service.ts`, `routes/search.routes.ts`, one `.int.test.ts` (plus a 1 000-note fixture helper), `docs/API.md` addition |
 | **Session total** | **~24k tokens** | ≈ one `M` engineer-day (the p95 assertion is the only fiddly part) |
 
@@ -40,14 +40,20 @@ Conventional-commit title; PR body starts `Task: PR-11`; CI green; never lower a
 
 ## 4. Required behavior
 
-- **Name / folder-path match in SQL:** `ILIKE` on `lower(name)` **with `%` and `_` escaped** so they are literal.
-- **Body match in-process:** load up to **500** most recently updated notes for the user, decrypt, case-insensitive
-  substring/word match.
+- **Name / folder-path match in SQL:** `ILIKE` on `lower(name)` **with `%` and `_` escaped** so they are literal. This
+  branch guarantees coverage of the whole corpus, but it is **accent-sensitive** (see the Unicode rule below).
+- **Name / path / body match in-process:** load up to **500** most recently updated notes for the user, decrypt, and match
+  the name, the folder path and the body case-insensitively (substring/word). This pass is what makes results
+  accent-aware, and it is also where a name hit is distinguished from a body hit for scoring.
 - **Ordering / score:** `name hit > body hit > recency`.
 - **Return ≤ 25 results**, each with an **~120-char snippet** generated from **plaintext**, truncated on a
   **code-point boundary** (never split an emoji or surrogate pair).
 - **Unicode:** accent folding for search keys — NFD normalize then strip combining marks — applied to both the query and
-  the candidate text.
+  the candidate text **inside the in-process pass only**. It cannot run in the SQL branch: `unaccent` is not installed
+  (PR-04's migration enables `pgcrypto` alone) and folding is not expressible as an `ILIKE` pattern. Net behavior to state
+  in `docs/API.md`: `cafe` finds a note named `café` whenever that note is inside the 500-candidate window, and only the
+  exact `café` matches outside it. Making name search uniformly accent-insensitive needs a folded generated column or
+  `unaccent` — backlog PR-29, not this PR.
 - Everything is scoped to `auth.userId` **inside the repository**, so cross-user results are structurally impossible.
 - Empty `q` ⇒ `VALIDATION` (400) via `searchQuerySchema`.
 - Cap `limit` (default 25) and never let a caller force more than the 500-candidate scan implies.
@@ -60,7 +66,11 @@ Conventional-commit title; PR body starts `Task: PR-11`; CI green; never lower a
 
 ## 6. Acceptance criteria (integration)
 
-- [ ] Unicode + accent folding (NFD-strip) on both sides: searching `cafe` finds `café`, and vice versa.
+- [ ] Unicode + accent folding (NFD-strip) asserted **on the in-process path, both directions**: an in-window note named
+      `café` is found by `cafe`, and an in-window note whose body says `café` is found by `cafe`.
+- [ ] The documented asymmetry is pinned by its own test: for a note **outside** the 500-candidate window, `cafe` finds
+      nothing by name while the exact `café` still matches — proof that the SQL branch is accent-sensitive (the gap
+      backlog PR-29 closes), so nobody later "fixes" it by silently adding `unaccent`.
 - [ ] `%` and `_` in the query are treated **literally** (searching `100%` does not match everything).
 - [ ] Empty `q` ⇒ `VALIDATION`; whitespace-only `q` behaves the same way.
 - [ ] Cross-user isolation: nothing from another user appears, and the snippet never leaks another user's text.
@@ -75,7 +85,8 @@ Conventional-commit title; PR body starts `Task: PR-11`; CI green; never lower a
 ## 7. Out of scope
 
 `pg_trgm` / `tsvector` (documented as the scale-out path in ADR-0002, backlog PR-29 — only needed past ~5 000 notes), an
-encrypted search index, search UI (PR-17), pagination beyond `limit`.
+encrypted search index, `unaccent` or a folded generated column for accent-insensitive **SQL** name search (same backlog
+item; the in-process pass already covers the common case), search UI (PR-17), pagination beyond `limit`.
 
 ## 8. PR body template
 
@@ -83,10 +94,12 @@ encrypted search index, search UI (PR-17), pagination beyond `limit`.
 Task: PR-11
 
 ## What
-GET /api/search: SQL name/path match (escaped ILIKE) + in-process body match over ≤500 recent notes,
-score name>body>recency, ≤25 results, ~120-char code-point-safe snippets, NFD accent folding.
+GET /api/search: SQL name/path match (escaped ILIKE, accent-sensitive) + in-process name/path/body match over
+≤500 recent notes, score name>body>recency, ≤25 results, ~120-char code-point-safe snippets, NFD accent folding applied
+in-process (documented in docs/API.md together with the out-of-window asymmetry).
 
 ## Acceptance evidence
-- integration run: unicode folding, literal %/_ , empty q → VALIDATION, cross-user isolation, cap bounds, snippet safety
+- integration run: unicode folding (in-window, both directions), the pinned out-of-window asymmetry, literal %/_ ,
+  empty q → VALIDATION, cross-user isolation, cap bounds, snippet safety
 - measured p95 over the 1 000-note fixture: <n> ms (<300)
 ```

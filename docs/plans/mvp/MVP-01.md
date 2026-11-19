@@ -11,7 +11,7 @@ This file is a **self-contained work order**. Everything you need is here; you d
 | Direction | Estimate | What it covers |
 | --- | --- | --- |
 | **Input** | **~22k tokens** | this brief (4.3k as written) + existing repo files to read (`README.md`, `AGENTS.md`, `CLAUDE.md`, `.github/workflows/CI.yml`, `.github/workflows/claude-review.yml`) + toolchain references you will consult (pnpm workspaces, Fastify 5, Vite 7 + React 19, Biome, Vitest, TypeScript 5 `strict`) + re-reading your own output during verification |
-| **Output** | **~11k tokens** | ~30 new files: 12 root config/manifest files, 8 server files, 8 web files, 3 test files, plus a 10-line `AGENTS.md` edit |
+| **Output** | **~11k tokens** | ~30 new files: 11 root config/manifest files, 8 server files, 9 web files, 2 test files, plus a 10-line `AGENTS.md` edit |
 | **Session total** | **~33k tokens** | ≈ one `M`-sized engineer-day; budget ~45k with two verification loops |
 
 > Basis: 1 token ≈ 4 chars of source; ±30%. No DB, no Docker, no UI beyond a placeholder card — the file count is what
@@ -107,7 +107,7 @@ the root.
 - **No `db:*` scripts and no `test:e2e` here.** `db:generate`/`db:migrate` arrive with PR-04, `db:seed` with PR-09,
   `check:env` with PR-18, `test:e2e` with PR-19. `pnpm db:migrate` must fail as "unknown script" until PR-04.
 - **Every host script that reads env declares `NODE_ENV` inline on its own command line.** `apps/server`'s `dev` is
-  `NODE_ENV=development tsx watch src/index.ts` (POSIX form; the `cross-env` variant is a §21 open question, do not add
+  `NODE_ENV=development tsx watch src/index.ts` (POSIX form; the `cross-env` variant is a plan §21 open question, do not add
   the dependency now). The rule is a **contract the later PRs implement**: `db:generate`/`db:migrate` are
   `NODE_ENV=development drizzle-kit …` (PR-04), `db:seed` is `NODE_ENV=development tsx scripts/seed-demo.ts` (PR-09),
   `test:integration`/`coverage:integration` are `NODE_ENV=test vitest run --config …` (PR-04), `check:env` is

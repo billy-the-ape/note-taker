@@ -21,7 +21,7 @@ Self-contained work order — everything you need is below; do not load `MVP-FUL
 ## 1. Goal
 
 The write side of note content: `PUT /api/notes/:id/content` with optimistic concurrency (`baseVersion`), so two tabs
-never silently overwrite each other. The read side (`GET /api/notes/:id`, §9.2 #17) **already shipped in PR-09**; you own
+never silently overwrite each other. The read side (`GET /api/notes/:id`) **already shipped in PR-09**; you own
 only the write path, and you re-test the `ETag` round-trip against the read.
 
 ## 2. Repo state you can assume
@@ -45,7 +45,7 @@ same PR (`docs/API.md` for the new endpoint); any new column ⇒ migration here 
 ## 4. The write must be one atomic statement (Appendix A.2)
 
 ```ts
-// Drizzle schema properties are camelCase and map to the snake_case columns (§8); adjust to the names in db/schema.ts.
+// Drizzle schema properties are camelCase and map to the snake_case columns of PR-04's schema; adjust to db/schema.ts.
 const updated = await db
   .update(notes)
   .set({ contentCipher, contentIv, keyVersion, contentBytes, wordCount,
@@ -72,7 +72,8 @@ One statement, so two tabs cannot both win and a process killed mid-request leav
 
 - Request `{content, baseVersion}`; `If-Match` optional (`If-Match: W/"v<baseVersion>"` when present must agree).
 - Success response: `{…NoteNode, content, version: version+1}` with the new `ETag`.
-- `baseVersion` mismatch ⇒ `409 VERSION_CONFLICT` **whose body carries the current server `content` and `version`**.
+- `baseVersion` mismatch ⇒ `409 VERSION_CONFLICT` **whose body carries the current server `content` and `version`**
+  (in the envelope's `error.data`, pinned by PR-05).
   That payload is what lets PR-14's autosave engine tell a committed-but-unacknowledged write from a real collision: the
   client compares the returned content with the exact snapshot it put on the wire, and if they are equal it adopts the
   returned `version` and settles clean instead of showing a phantom conflict. **Pin both fields in an assertion.**

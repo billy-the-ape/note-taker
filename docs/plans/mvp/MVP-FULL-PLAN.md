@@ -475,7 +475,8 @@ Base path `/api`. Content type `application/json; charset=utf-8`. All bodies val
 
 ```jsonc
 { "error": { "code": "CONFLICT", "message": "name already exists in this folder",
-             "details": [{ "path": "name", "message": "must be unique among siblings" }], "requestId": "…" } }
+             "details": [{ "path": "name", "message": "must be unique among siblings" }],
+             "data": { "id": "0f6f0c1a-…" }, "requestId": "…" } }
 ```
 
 A sibling-name clash is always `CONFLICT` (409), never `VALIDATION` — see §9.2 notes and PR-09. `VALIDATION` (400)
@@ -487,6 +488,12 @@ PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` fr
 to `CONFLICT` (409) as well: they are retryable by the client and must never surface as an unexplained `INTERNAL`. PR-05
 wires that mapping; PR-09's folder-move design takes exactly one advisory lock per user precisely so `40P01` is not
 reachable there (§8, PR-09). `requestId` is echoed in logs for support.
+
+`data` is an **optional, code-specific payload object** — the only place structured extras travel, so `details` stays a
+list of field errors. `CONFLICT` from a duplicate create carries `data: { id }` (the existing row, the id referenced by
+the idempotency rule in §9.3), and `VERSION_CONFLICT` carries `data: { content, version }` (the current server plaintext
+plus version, which §11.4's autosave engine compares against the snapshot it sent). Every other code omits `data`.
+PR-05 pins the field names in the envelope schema and `docs/API.md`; PR-09, PR-10 and PR-14 read them.
 
 ### 9.2 Endpoints
 

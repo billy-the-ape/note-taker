@@ -2,7 +2,7 @@
 
 > **Task ID:** `PR-19` · **Branch:** `test/pr-19-e2e` · **Size:** M (1–2 days) · **Depends on:** PR-08…PR-18 (merged)
 > **Track:** F Ship · **Review gate:** M4 · **Unblocks:** PR-20
-> **This PR is the MVP acceptance proof** — `docs/plans/mvp/MVP-FULL-PLAN.md` §17's "MVP proof must be one scenario" is
+> **This PR is the MVP acceptance proof** — `docs/plans/mvp/MVP-FULL-PLAN.md` §17's "MVP proof" scenario is
 > executed by these specs.
 
 Self-contained work order — everything you need is below; do not load `MVP-FULL-PLAN.md`.

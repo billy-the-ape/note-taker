@@ -148,7 +148,7 @@ recovery.
 - [ ] Cookie flags asserted on the responses (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age`, `Secure` when
       `SECURE_COOKIES=true`).
 - [ ] Logout invalidates: a subsequent `GET /api/auth/session` ⇒ `user:null`.
-- [ ] Password change kills the **other** sessions (and rotates/keeps the acting one, per §9.2 #9).
+- [ ] Password change kills the **other** sessions (and rotates/keeps the acting one, per §4 #9).
 - [ ] The **11th** bad login within 15 min ⇒ `429` (with `Retry-After`); `auth_attempts` rows written for both success
       and failure.
 - [ ] Missing CSRF header on a mutation ⇒ `403`.

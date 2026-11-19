@@ -79,8 +79,8 @@ indistinguishable, from the client's seat, from a `PUT` that never reached the s
 the user cannot resolve except by clicking through their own text.
 
 **Therefore the engine keeps the exact payload it put on the wire** — the in-flight snapshot, *not* a reference to the
-live buffer (which a later keystroke would change). Rule: on `VERSION_CONFLICT`, compare the `content` in the error
-payload with that snapshot.
+live buffer (which a later keystroke would change). Rule: on `VERSION_CONFLICT`, compare the `content` the error carries
+(in `error.data`, pinned in PR-05 §6) with that snapshot.
 
 - **Equal** ⇒ the write landed, only the reply was lost ⇒ adopt the payload's `version` and continue with **no banner and
   no pause**: to `clean` if the live buffer still equals the snapshot, to `dirty` if the user typed meanwhile (the next

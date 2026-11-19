@@ -57,7 +57,7 @@ with a migration here (you should need none); docs updated in the same PR (`docs
 | 13 | `POST /api/folders` `{name, parentId\|null}` | `201 FolderNode` | 409 sibling clash (body carries the existing `id`); `VALIDATION` naming the cap if the folder would sit at depth 100 |
 | 14 | `PATCH /api/folders/:id` `{name?, parentId?}` | `200 FolderNode` | rename and/or move; cycle guard ⇒ `CONFLICT`; same depth cap |
 | 15 | `DELETE /api/folders/:id?cascade=true` | `204` | without `cascade=true` and non-empty ⇒ `CONFLICT` |
-| 16 | `POST /api/notes` `{name?, folderId\|null, content?}` | `201 NoteWithContent` | no `name` ⇒ generate `new-file-<msepoch>` then `uniquify`; `content` omitted ⇒ `seal('')`; duplicate name in folder ⇒ `CONFLICT` **with the existing id** |
+| 16 | `POST /api/notes` `{name?, folderId\|null, content?}` | `201 NoteWithContent` | no `name` ⇒ generate `new-file-<msepoch>` then `uniquify`; `content` omitted ⇒ `seal('')`; duplicate name in folder ⇒ `CONFLICT` **with the existing id in `error.data.id`** |
 | 17 | `GET /api/notes/:id` | `{…NoteNode, content, version}` + `ETag: W/"v<version>"` | **created here, not in PR-10**; decrypts |
 | 19 | `PATCH /api/notes/:id` `{name?, folderId\|null}` | `200 NoteNode` | rename/move (`folderId: null` = root); `notes.name` stays extension-free |
 | 20 | `DELETE /api/notes/:id` | `204` | hard delete |

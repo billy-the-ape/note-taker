@@ -10,8 +10,8 @@ Self-contained work order — everything you need is below; do not load `MVP-FUL
 
 | Direction | Estimate | What it covers |
 | --- | --- | --- |
-| **Input** | **~28k tokens** | this brief (4.2k as written: name-rule sketch, error envelope, full endpoint table) + PR-01's `apps/server/src/{app.ts,env.ts}` and Vitest configs + Zod v4 + fastify-type-provider-zod docs + reading your own `tsc` errors across the two apps |
-| **Output** | **~14k tokens** | `packages/contracts` (11 source files + 4 test files + `package.json`/`tsconfig`/`vitest.config`), `docs/API.md`, `apps/web/src/lib/{api.ts,queryClient.ts}` + their mocked-`fetch` tests, `apps/server/src/{domain/errors.ts,plugins/error-handler.ts}` |
+| **Input** | **~28k tokens** | this brief (4.4k as written: name-rule sketch, error envelope incl. the `data` payload field, full endpoint table) + PR-01's `apps/server/src/{app.ts,env.ts}` and Vitest configs + Zod v4 + fastify-type-provider-zod docs + reading your own `tsc` errors across the two apps |
+| **Output** | **~14k tokens** | `packages/contracts` (10 source files + 4 test files + `package.json`/`tsconfig`/`vitest.config`), `docs/API.md`, `apps/web/src/lib/{api.ts,queryClient.ts}` + their mocked-`fetch` tests, `apps/server/src/{domain/errors.ts,plugins/error-handler.ts}` |
 | **Session total** | **~42k tokens** | ≈ one `M` engineer-day; budget ~55k if the dist-resolution acceptance needs more than one loop |
 
 > 1 token ≈ 4 chars; ±30%. The dist-resolution acceptance (negative control) is what usually costs extra iterations.
@@ -93,7 +93,8 @@ client-retryable and must never surface as an unexplained `INTERNAL`.
 
 ```jsonc
 { "error": { "code": "CONFLICT", "message": "name already exists in this folder",
-             "details": [{ "path": "name", "message": "must be unique among siblings" }], "requestId": "…" } }
+             "details": [{ "path": "name", "message": "must be unique among siblings" }],
+             "data": { "id": "0f6f0c1a-…" }, "requestId": "…" } }
 ```
 
 `code ∈ VALIDATION | UNAUTHORIZED | FORBIDDEN | NOT_FOUND | CONFLICT | RATE_LIMITED | VERSION_CONFLICT |
@@ -101,6 +102,13 @@ PAYLOAD_TOO_LARGE | INTERNAL`.
 
 - A sibling-name clash is always `CONFLICT` (409), never `VALIDATION`. `VALIDATION` (400) is reserved for malformed
   payloads (bad characters, length, missing fields).
+- **`data` is the optional, code-specific payload object** — the only place structured extras travel, so `details`
+  stays a list of field errors. `CONFLICT` from a duplicate create carries `data: { id }` (the existing row, so a
+  double-clicked "Create" can adopt it instead of firing twice); `VERSION_CONFLICT` carries
+  `data: { content, version }` (the current server plaintext + version — the exact pair PR-14's autosave engine
+  compares against the snapshot it put on the wire). Every other code omits `data`.
+  Pin these field names in `api-envelope.ts` (a `data` key on the error schema) and in `docs/API.md`: PR-09, PR-10 and
+  PR-14 all read them.
 - `requestId` is echoed in logs for support.
 - Cross-user access is always `404` (never `403`) so ids cannot be probed.
 
@@ -177,7 +185,8 @@ clamped to 120.
 (re-)issued by `GET /api/auth/status` and by every `setup`/`login`/`register`/`logout` response. `lib/api.ts` echoes the
 cookie value in the `X-CSRF-Token` header on every mutation. On a `403` from a mutation it re-fetches
 `/api/auth/status` **once** and replays the mutation **once** before surfacing the error, so a long-open tab recovers
-instead of failing forever. `ApiError` carries `code`, `message`, `details`, `requestId`.
+instead of failing forever. `ApiError` carries `code`, `message`, `details`, `data`, `requestId` — `data` so PR-14's
+engine can read the conflict payload without re-fetching the note.
 
 ## 10. Coverage + CI
 

@@ -33,7 +33,7 @@ focused in the editor.
 - PR-09: `POST /api/notes {name?, folderId|null, content?}` → `201 NoteWithContent`; sibling clash ⇒ `409 CONFLICT`
   **with the existing id**; `name` omitted ⇒ the server generates `new-file-<msepoch>` and uniquifies; cross-user
   `folderId` ⇒ `404`.
-- `@note-taker/contracts` `names.ts`: `NOTE_NAME_MAX = 120`, `newFileName(msEpoch) => \`new-file-${msEpoch}.md\``,
+- `@note-taker/contracts` `names.ts`: `NOTE_NAME_MAX = 120`, ``newFileName(msEpoch) => `new-file-${msEpoch}.md` ``,
   `stripMd` (drops one trailing `.md`, case-insensitive), `withMd` (display only), `isValidNoteName` (rejects path chars
   `/ \ : * ? " < > |`, control chars, leading/trailing space, `.`/`..`, > 120 chars, **and any stripped name that still
   ends in `.md`**), `uniquify(name, taken)` operating on the extension-free base (`plan` → `plan-2` → `plan-3`).

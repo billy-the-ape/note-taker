@@ -1,3 +1,4 @@
+import { errorResponseSchema, healthResponseSchema } from '@note-taker/contracts';
 import { describe, expect, it } from 'vitest';
 
 import { buildApp } from './app.js';
@@ -26,6 +27,8 @@ describe('GET /api/health', () => {
       db: 'ok',
       version: expect.stringMatching(/^\d+\.\d+\.\d+/),
     });
+    // The contract, not just the shape PR-01 hand-wrote: this is the body the client's schema accepts.
+    expect(() => healthResponseSchema.parse(response.json())).not.toThrow();
 
     await app.close();
   });
@@ -51,14 +54,15 @@ describe('GET /api/healthz', () => {
   });
 });
 
-describe('error placeholders (PR-05 owns the envelope)', () => {
-  it('answers an unknown route with JSON, never the SPA or an HTML error page', async () => {
+describe('the §9.1 error envelope (PR-05 owns it; the route PRs only add mapping cases)', () => {
+  it('answers an unknown route with the envelope, never the SPA or an HTML error page', async () => {
     const app = await makeApp();
     const response = await app.inject('/api/nope');
 
     expect(response.statusCode).toBe(404);
     expect(response.headers['content-type']).toContain('application/json');
-    expect(response.json()).toMatchObject({ error: { code: 'not_found' } });
+    expect(errorResponseSchema.safeParse(response.json()).success).toBe(true);
+    expect(response.json()).toMatchObject({ error: { code: 'NOT_FOUND' } });
 
     await app.close();
   });
@@ -82,7 +86,8 @@ describe('error placeholders (PR-05 owns the envelope)', () => {
       payload: JSON.stringify({ body: 'x'.repeat(2048) }),
     });
     expect(response.statusCode).toBe(413);
-    expect(response.json()).toMatchObject({ error: { code: 'bad_request' } });
+    // §7: an over-cap body is `PAYLOAD_TOO_LARGE`, not the generic `VALIDATION` a bad field gets.
+    expect(response.json()).toMatchObject({ error: { code: 'PAYLOAD_TOO_LARGE' } });
 
     await app.close();
   });
@@ -96,7 +101,13 @@ describe('error placeholders (PR-05 owns the envelope)', () => {
 
     const response = await app.inject('/api/boom');
     expect(response.statusCode).toBe(500);
-    expect(response.json()).toEqual({ error: { code: 'internal_error', message: 'internal error' } });
+    // `requestId` joins the body, so match on the envelope rather than the whole object.
+    expect(response.json()).toMatchObject({ error: { code: 'INTERNAL', message: 'internal error' } });
+    expect(errorResponseSchema.safeParse(response.json()).success).toBe(true);
+    expect(typeof (response.json() as { error: { requestId?: unknown } }).error.requestId).toBe('string');
+    expect(response.headers['x-request-id']).toBe(
+      (response.json() as { error: { requestId: string } }).error.requestId,
+    );
     expect(response.body).not.toContain('kaboom');
     expect(response.body).not.toContain('password');
 

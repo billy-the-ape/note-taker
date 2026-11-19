@@ -7,6 +7,7 @@
  * and PR-18's `HEALTHCHECK` polls it from outside the container.
  */
 import { readFileSync } from 'node:fs';
+import { healthResponseSchema } from '@note-taker/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createDb, type DbHandle, probeDb } from '../db/client.js';
@@ -41,6 +42,9 @@ describe('GET /api/health (PR-04: db is wired)', () => {
           db: 'ok',
           version: expect.any(String),
         });
+        // PR-05's DTO: this body is the one the client parses, so a probe answer that is not one of the two
+        // designed states fails here rather than in someone's browser.
+        expect(() => healthResponseSchema.parse(response.json())).not.toThrow();
       },
       { checkDb: () => probeDb(testDb()) },
     );
@@ -89,6 +93,9 @@ describe('GET /api/health (PR-04: db is wired)', () => {
         expect(response.body).not.toMatch(/postgres:\/\//);
         expect(response.body).not.toMatch(/localhost/);
         expect(response.body).not.toMatch(/closed|refused|ECONNREFUSED/i);
+        // …and the failure is still the same DTO, not a second undocumented body: `healthResponseSchema`
+        // admits `{error, error}` precisely so a client can read this response with the code it already has.
+        expect(() => healthResponseSchema.parse(response.json())).not.toThrow();
       },
       { checkDb: () => probeDb(pool.db) },
     );

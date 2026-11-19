@@ -1,0 +1,26 @@
+{
+  // The build/export story of docs/plans/mvp/MVP-05.md §4 lives here: `main`, `types` and every
+  // `exports` condition in `package.json` point at `dist`, so **this** config decides what
+  // `apps/server` and `apps/web` actually import — at runtime, in `tsc`, and in the production image
+  // (PR-18 copies compiled JS only, never `.ts`).
+  //
+  // `declaration` is what makes the apps' `import type`s work from `dist`; `rootDir`/`outDir` keep
+  // the entry point at exactly `dist/index.js`, matching the `exports` map.
+  //
+  // Test files are excluded from the emit — a shipped contract must not contain its own suite — and
+  // are typechecked by `tsconfig.test.json` instead (the same split as `apps/server`, which keeps the
+  // suite out of `dist` via `tsconfig.build.json`).
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    // Nothing here reaches Node or the DOM: the package is pure schema and string helpers, so no
+    // ambient `@types` package may leak into the program (`types: []` keeps `Buffer`, `process` and
+    // friends *un*available, which is what forces the byte-size rule in `notes.schemas.ts` to stay
+    // browser-safe).
+    "types": []
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

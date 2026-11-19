@@ -1,3 +1,4 @@
+import { type HealthResponse, ROUTES } from '@note-taker/contracts';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 
 /**
@@ -6,18 +7,15 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
  * `/api/health` is the public one; `/api/healthz` exists so the Docker `HEALTHCHECK` added in
  * PR-18 has a path whose meaning never changes even if the public contract grows.
  *
- * PR-04 wires the pool: pass `checkDb` and the probe runs `SELECT 1`, answering 503 when the database does
+ * PR-04 wires the pool: pass `checkDb` and the probe runs `SELECT 1`, answering `503` when the database does
  * not answer. Leave it out (the unit tests, and any caller that has no pool) and `db` stays the static
- * `'ok'` PR-01 shipped. PR-05 replaces this hand-written type with the Zod schema from
- * `@note-taker/contracts`.
+ * `'ok'` PR-01 shipped.
+ *
+ * The response type is PR-05's `healthResponseSchema` from `@note-taker/contracts` — not a hand-written
+ * interface — so the body this route returns is checked against the same schema the client reads
+ * (`app.test.ts` parses it). That schema therefore describes *both* answers, `ok` and `error`: the probe
+ * failing is a designed response, not an unexpected one.
  */
-export interface HealthResponse {
-  /** `error` means the probe failed: the process is up, but it cannot serve data. */
-  readonly status: 'ok' | 'error';
-  readonly db: 'ok' | 'error';
-  readonly version: string;
-}
-
 export interface HealthRoutesOptions {
   readonly version: string;
   /**
@@ -31,9 +29,11 @@ export interface HealthRoutesOptions {
 export const healthRoutes: FastifyPluginAsync<HealthRoutesOptions> = async (app, { version, checkDb }) => {
   const staticPayload: HealthResponse = { status: 'ok', db: 'ok', version };
 
+  // The paths come from the shared table, so a probe path cannot drift from what the client,
+  // `docs/API.md` and PR-18's `HEALTHCHECK` all spell out.
   if (!checkDb) {
-    app.get('/api/health', () => staticPayload);
-    app.get('/api/healthz', () => staticPayload);
+    app.get(ROUTES.health, () => staticPayload);
+    app.get(ROUTES.healthz, () => staticPayload);
     return;
   }
 
@@ -50,6 +50,6 @@ export const healthRoutes: FastifyPluginAsync<HealthRoutesOptions> = async (app,
     }
   };
 
-  app.get('/api/health', probe);
-  app.get('/api/healthz', probe);
+  app.get(ROUTES.health, probe);
+  app.get(ROUTES.healthz, probe);
 };

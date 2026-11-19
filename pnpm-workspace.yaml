@@ -1,0 +1,22 @@
+# pnpm workspaces (docs/plans/mvp/MVP-01.md §4).
+# `packages/*` is declared before the folder exists: PR-05 creates @note-taker/contracts, and the
+# root `build:packages` filter (called from CI in PR-03) must not need editing when it lands.
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 12 refuses to run a dependency's install scripts until this workspace says they are allowed.
+# esbuild (pulled in by Vite and Vitest) is the only dependency with a postinstall step, and the
+# dev server needs its binary, so it is approved here in the open rather than by running
+# `pnpm approve-builds` on one developer's laptop.
+allowBuilds:
+  esbuild: true
+
+# Written by pnpm, committed on purpose: these releases are exempt from pnpm's default
+# minimumReleaseAge supply-chain gate, so `pnpm install --frozen-lockfile` in CI (PR-03) resolves
+# exactly what this PR was built with instead of refusing a package that is merely recent.
+minimumReleaseAgeExclude:
+  - "@vitest/coverage-v8@5.1.1"
+  - "@vitest/mocker@5.1.1"
+  - "@vitest/spy@5.1.1"
+  - vitest@5.1.1

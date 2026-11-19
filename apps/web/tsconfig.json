@@ -1,0 +1,16 @@
+{
+  // The web app is bundled by Vite, so tsc only ever typechecks (never emits) — which means the
+  // config files below can join the program without disturbing an outDir. `moduleResolution` is
+  // `bundler` because Vite, not Node, resolves these specifiers (no `.js` suffixes on our own
+  // `.tsx` imports).
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client", "node"],
+    "noEmit": true
+  },
+  "include": ["src", "vite.config.ts", "vitest.config.ts"]
+}

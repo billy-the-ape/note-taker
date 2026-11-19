@@ -1,0 +1,16 @@
+{
+  // apps/server is compiled with plain tsc — no bundler — from `src` to `dist` (MVP-01 §6.2),
+  // which is why `rootDir`/`outDir` are pinned here and `include` stays at `src`: a config file in
+  // the program would move the emitted entry out of `dist/index.js`. `vitest.config.ts` is loaded
+  // by Vitest itself; the web app (no tsc emit) typechecks its config files instead.
+  //
+  // `module: NodeNext` (inherited) means relative imports keep their `.js` specifier, which is
+  // what lets the same source run under tsx, under node, and under Vitest unchanged.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["node"]
+  },
+  "include": ["src"]
+}

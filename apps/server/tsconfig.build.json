@@ -1,0 +1,12 @@
+{
+  // Production build only: `tsconfig.json` (used by `typecheck`) keeps the test files in the
+  // program so `pnpm typecheck` covers them, while this one drops them out of `dist` — a shipped
+  // API artifact must not contain the suite that tests it, and PR-18 copies `dist` into an image.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

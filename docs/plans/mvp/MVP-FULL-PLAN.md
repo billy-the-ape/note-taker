@@ -2,8 +2,12 @@
 
 > Status: **plan of record** for the initial MVP. Every implementation PR in this repo should cite a PR ID from
 > [`§12 Work Breakdown`](#12-work-breakdown--pull-requests).
-> Source of requirements: [`README.md`](../../README.md). This document is the single mapping of the whole
-> repository/website and is intended to be sliced into one PR per task.
+> Source of requirements: [`README.md`](../../../README.md). This document is the single mapping of the whole
+> repository/website and is sliced into one PR per task.
+>
+> **Per-task briefs live next to this file:** [`MVP-01.md`](MVP-01.md) … [`MVP-20.md`](MVP-20.md)
+> (index: [`README.md`](README.md)). Each `MVP-NN.md` is the fully self-contained work order for one PR ID below — it
+> duplicates the context it needs, so a coding agent can implement that PR without loading this whole plan.
 >
 > Last updated: MVP planning phase, before any application code exists.
 
@@ -39,13 +43,18 @@
 ## 1. How to use this document
 
 - **One PR = one task ID** (`PR-01` … `PR-20`). Task IDs are stable; do not renumber.
+- **Each task is also a standalone work order:** `docs/plans/mvp/MVP-01.md` … `MVP-20.md` (index:
+  `docs/plans/mvp/README.md`). A brief restates everything its PR needs — context, contracts, acceptance — so the agent
+  coding that PR never has to load this file (each brief is 1.1k–5.2k tokens; this file is ~50k). Each brief also carries
+  its own estimated input/output token cost near the top. When a PR changes a decision recorded here, update both this
+  file and the affected brief(s) in the same PR.
 - Each task lists: goal, dependencies, *in-scope* files, acceptance criteria, test plan, size (`S` ≤ ½ day,
   `M` = 1–2 days, `L` = 3–4 days). Sizes are for one engineer familiar with the stack.
 - **Merge order:** any task may be opened as soon as its dependencies are merged. Where a task only needs the
   *shape* of another task's output (e.g. UI needing API payloads), build against
   `packages/contracts` (PR-05) and mock handlers instead of waiting — see [§13](#13-dependency-graph--parallel-execution-tracks).
 - Every PR must keep CI green (lint + typecheck + tests + coverage gate) and update the docs it invalidates
-  (`README.md`, `docs/ARCHITECTURE.md`, ADRs) in the same PR — required by [`AGENTS.md`](../../AGENTS.md).
+  (`README.md`, `docs/ARCHITECTURE.md`, ADRs) in the same PR — required by [`AGENTS.md`](../../../AGENTS.md).
 - Any decision in [§4](#4-answers-to-the-open-questions-in-readmemd) that a PR needs to change must add a new
   ADR under `docs/adr/` and update this file's decision table in the same PR.
 
@@ -207,7 +216,9 @@ note-taker/
 │                                            (dev DB vars) and PR-06/PR-18 (key + prod vars) — §16
 ├── Makefile                                   PR-02 (dev/db/build/test entry points)
 ├── docs/
-│   ├── plans/MVP-FULL-PLAN.md                 (this file)
+│   ├── plans/mvp/MVP-FULL-PLAN.md             (this file)
+│   ├── plans/mvp/README.md                    (index of the task briefs below)
+│   ├── plans/mvp/MVP-01.md … MVP-20.md        (self-contained work order per PR; this file is the source)
 │   ├── ARCHITECTURE.md                        PR-20
 │   ├── DEPLOY.md                              PR-18
 │   ├── API.md                                 PR-05 (generated-ish reference of §9)
@@ -464,7 +475,8 @@ Base path `/api`. Content type `application/json; charset=utf-8`. All bodies val
 
 ```jsonc
 { "error": { "code": "CONFLICT", "message": "name already exists in this folder",
-             "details": [{ "path": "name", "message": "must be unique among siblings" }], "requestId": "…" } }
+             "details": [{ "path": "name", "message": "must be unique among siblings" }],
+             "data": { "id": "0f6f0c1a-…" }, "requestId": "…" } }
 ```
 
 A sibling-name clash is always `CONFLICT` (409), never `VALIDATION` — see §9.2 notes and PR-09. `VALIDATION` (400)
@@ -476,6 +488,12 @@ PAYLOAD_TOO_LARGE | INTERNAL`. Mapped centrally in `plugins/error-handler.ts` fr
 to `CONFLICT` (409) as well: they are retryable by the client and must never surface as an unexplained `INTERNAL`. PR-05
 wires that mapping; PR-09's folder-move design takes exactly one advisory lock per user precisely so `40P01` is not
 reachable there (§8, PR-09). `requestId` is echoed in logs for support.
+
+`data` is an **optional, code-specific payload object** — the only place structured extras travel, so `details` stays a
+list of field errors. `CONFLICT` from a duplicate create carries `data: { id }` (the existing row, the id referenced by
+the idempotency rule in §9.3), and `VERSION_CONFLICT` carries `data: { content, version }` (the current server plaintext
+plus version, which §11.4's autosave engine compares against the snapshot it sent). Every other code omits `data`.
+PR-05 pins the field names in the envelope schema and `docs/API.md`; PR-09, PR-10 and PR-14 read them.
 
 ### 9.2 Endpoints
 

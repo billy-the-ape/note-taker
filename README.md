@@ -3,7 +3,9 @@
 note-taker is currently in the INITIAL MVP PLANNING PHASE (user generated). 
 
 The full MVP plan (architecture, repository map, and the PR-by-PR task breakdown) lives in
-[docs/plans/MVP-FULL-PLAN.md](docs/plans/MVP-FULL-PLAN.md).
+[docs/plans/mvp/MVP-FULL-PLAN.md](docs/plans/mvp/MVP-FULL-PLAN.md). Each PR is also a standalone work order in the same
+folder ([`MVP-01.md`](docs/plans/mvp/MVP-01.md) … [`MVP-20.md`](docs/plans/mvp/MVP-20.md), indexed by
+[`docs/plans/mvp/README.md`](docs/plans/mvp/README.md)) — an agent implementing one PR needs only that file.
 
 ## It will become:
 

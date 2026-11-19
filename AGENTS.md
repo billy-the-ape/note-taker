@@ -21,7 +21,18 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 | `pnpm test`         | Vitest unit suites (`src/**/*.test.{ts,tsx}`, `*.int.test.ts` excluded).                                                                |
 | `pnpm coverage`     | The same with v8 coverage — this is what the `unit` CI job (PR-03) runs, so keep its thresholds in the Vitest configs, not in CI flags. |
 | `pnpm test:integration` | Declared in PR-01; its Vitest config and first DB-backed tests arrive in **PR-04**, so running it before that fails on the missing `vitest.integration.config.ts`. |
+| `make db-up` / `db-down` / `db-reset` | Dev Postgres 16 in Docker (`docker/compose.dev.yml`, PR-02): start it (and wait for healthy), stop it, or recreate it with its volume. `make dev`/`build`/`test`/`coverage` are the `pnpm` equivalents behind one interface, and `make bootstrap-env` only creates `.env`. No `db:*` target exists yet — PR-04/PR-09 own those scripts. |
 
+- **Compose is always invoked with both flags, from the repo root**:
+  `docker compose --env-file .env -f docker/compose.dev.yml <up|down|…>`. Compose resolves its project
+  directory from the compose file's location, so `-f docker/compose.dev.yml` alone would load `.env` from
+  `docker/` instead of the repo root, and a missing `--env-file` path is a hard error. The `Makefile` pins the
+  invocation so nobody has to remember it; **PR-18 copies this exact rule** for `docker/compose.yml`.
+- **`.env` is bootstrapped, never assumed**: `make bootstrap-env` runs `test -f .env || cp .env.example .env`,
+  and every target that passes `--env-file .env` (`db-up`, `db-down`, `db-reset`, `dev`) depends on it. Only
+  `.env.example` is committed — dev defaults (`POSTGRES_*`, `HOST_PORT`) and, deliberately, **no
+  `DATABASE_URL`**, so `databaseUrl()` derives it and one `POSTGRES_PORT` edit moves the container and every
+  host process together.
 - **No `.env` is needed.** `pnpm dev` boots from a bare clone; `cp .env.example .env` is only for overriding something.
 - **`NODE_ENV` is required and never defaulted** (`env.ts` fails in every mode without it). Every host script that reads
   env declares its own mode on its own command line (`NODE_ENV=development tsx …`, `NODE_ENV=test vitest …`); a line in

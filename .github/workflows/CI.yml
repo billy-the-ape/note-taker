@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   placeholder:
-    name: Success Placeholder until real CI exists
+    name: ci
     runs-on: ubuntu-24.04
     steps: 
       - run: true

@@ -36,10 +36,11 @@ jobs:
           cache: pnpm
       # The lockfile is committed, so CI installs exactly this tree and never resolves anything new.
       - run: pnpm install --frozen-lockfile
-      # A no-op until PR-05 creates packages/, and load-bearing from PR-05 on:
-      # @note-taker/contracts exports `./dist` only, and a fresh checkout has no dist/ — so every job
-      # that typechecks or tests app code has to build the packages first (plan §14). Kept in `unit`
-      # and `build` too, so all three jobs share one identical prefix and PR-05 edits nothing here.
+      # `@note-taker/contracts` will declare `exports`/`main`/`types` → `./dist` only, and a fresh
+      # checkout has no dist/, so this job's `pnpm typecheck` needs the packages compiled here
+      # (plan §14: this step runs in every job that typechecks or tests app code). Actions jobs are
+      # separate runners with separate checkouts, so nothing `build` produces could be reused here;
+      # PR-05 makes this load-bearing.
       - run: pnpm build:packages
       - run: pnpm lint
       - run: pnpm typecheck
@@ -58,6 +59,8 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Same reason as in `quality` (see the comment there): the unit Vitest runs import the packages from
+      # `dist/` too, and this runner shares no files with the other jobs.
       - run: pnpm build:packages
       - run: pnpm coverage
       # Each package writes its own gitignored `coverage/` report; collect them into the single
@@ -93,5 +96,7 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build:packages
+      # No `build:packages` step here on purpose: the root script already is
+      # `pnpm build:packages && pnpm -r --filter './apps/**' build`, so this one step compiles the packages
+      # (a no-op until PR-05) and then both apps — no duplicated step, and PR-05 needs no edit here either.
       - run: pnpm build

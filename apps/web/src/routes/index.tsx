@@ -57,7 +57,7 @@ function HealthBadge() {
   if (health.isPending) {
     return <StatusLine tone="muted" label="Checking the API…" />;
   }
-  if (health.isError || health.data === undefined) {
+  if (health.isError) {
     return (
       <StatusLine
         tone="warn"

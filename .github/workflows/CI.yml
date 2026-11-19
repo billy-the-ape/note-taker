@@ -1,3 +1,13 @@
+# Real CI gates — PR-03 (docs/plans/mvp/MVP-03.md), replacing PR-01's placeholder job.
+#
+# ⚠ `name: CI`, the triggers, `concurrency` and `permissions` below are load-bearing, not cosmetics:
+# `.github/workflows/claude-review.yml` starts on `workflow_run: workflows: ["CI"]`, so renaming this
+# workflow (or narrowing its triggers) silently turns the Claude review off — plan §20 risk R6.
+#
+# A job never enters this file before the files it runs exist (MVP-03 §5): `integration` arrived with PR-04
+# (a `postgres:16` service + `pnpm coverage:integration`), PR-18 adds the `docker build` step inside
+# `build`, PR-19 adds `e2e`. Nothing here pushes an image, and nothing here caches except
+# `actions/setup-node`'s `cache: pnpm` (MVP-03 §7).
 name: CI
 on:
   push:
@@ -9,30 +19,88 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-jobs:
-  placeholder:
-    name: ci
-    runs-on: ubuntu-24.04
-    steps: 
-      - run: true
 
-  # PR-04 (docs/plans/mvp/MVP-04.md §5). The first job that needs a database, and the only place the
-  # `*.int.test.ts` suite and the `apps/server/src/db` coverage row run — `pnpm test`/`pnpm coverage` stay
-  # Postgres-free, which is what the `.int.test.ts` exclusion in `vitest.config.ts` is for.
+jobs:
+  # `biome check .` over the whole workspace, then both apps' typecheck programs.
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Deliberately no `version:` input — the action takes the pnpm version from `packageManager` in
+      # the root package.json, so CI runs exactly the pnpm this repo pins. It must run BEFORE
+      # setup-node, which asks `pnpm store path` what to cache: caching lives on setup-node only.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc # Node 22 — the pin CI reads; keep `engines` in step by hand
+          cache: pnpm
+      # The lockfile is committed, so CI installs exactly this tree and never resolves anything new.
+      - run: pnpm install --frozen-lockfile
+      # `@note-taker/contracts` will declare `exports`/`main`/`types` → `./dist` only, and a fresh
+      # checkout has no dist/, so this job's `pnpm typecheck` needs the packages compiled here
+      # (plan §14: this step runs in every job that typechecks or tests app code). Actions jobs are
+      # separate runners with separate checkouts, so nothing `build` produces could be reused here;
+      # PR-05 makes this load-bearing.
+      - run: pnpm build:packages
+      - run: pnpm lint
+      - run: pnpm typecheck
+
+  # Unit tests + coverage, with no Postgres service on purpose: `*.int.test.ts` are excluded by the
+  # unit Vitest configs, and every threshold that needs a DB is measured by PR-04's `integration`
+  # job. The thresholds themselves live in the Vitest configs that produce the numbers — never in CI
+  # flags — so a local `pnpm coverage` goes red exactly when this job does (plan §14).
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Same reason as in `quality` (see the comment there): the unit Vitest runs import the packages from
+      # `dist/` too, and this runner shares no files with the other jobs.
+      - run: pnpm build:packages
+      - run: pnpm coverage
+      # Each package writes its own gitignored `coverage/` report; collect them into the single
+      # `coverage-unit/` directory .gitignore already reserves. The `packages/*` glob is pre-wired
+      # for PR-05's contracts report.
+      - name: Collect unit coverage
+        run: |
+          mkdir -p coverage-unit
+          for dir in packages/*/coverage apps/*/coverage; do
+            [ -d "$dir" ] || continue
+            target="coverage-unit/$(basename "${dir%/coverage}")"
+            mkdir -p "$target"
+            cp -R "$dir/." "$target"
+          done
+          # A run that produced no report at all is a red gate, not an empty artifact.
+          test -n "$(find coverage-unit -mindepth 1 -type f -print -quit)"
+      - name: Upload unit coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-unit
+          path: coverage-unit
+          if-no-files-found: error
+
+  # PR-04's job — the one MVP-03's "Jobs added later" table reserves for it, and the first that needs a
+  # database. It is the only place the `*.int.test.ts` suite runs and the only place the §14 row over
+  # `apps/server/src/db` is measured; `unit` stays Postgres-free on purpose, which is what the
+  # `.int.test.ts` exclusion in `apps/server/vitest.config.ts` is for.
   #
-  # `DATABASE_URL` is exported here rather than written to a `.env`: a set `DATABASE_URL` wins verbatim in
-  # `databaseUrl()`, exactly as it will in a deployed container, and `loadDevEnvFile()` is a no-op when there is
-  # no `.env` (a CI checkout has none). The coverage threshold lives in `vitest.integration.config.ts`, never in
-  # a CI flag (§6).
-  #
-  # PR-03's `quality`/`unit`/`build` jobs are not in this file yet — PR-03 has not landed on this base. When it
-  # does, this job joins them unchanged.
+  # `DATABASE_URL` is set for the whole job rather than written to a `.env`: a set `DATABASE_URL` wins
+  # verbatim in `databaseUrl()`, exactly as it will in a deployed container, and a CI checkout has no `.env`
+  # for `loadDevEnvFile()` to read. The credentials are the throwaway pair MVP-03 prescribes for a service
+  # container. The coverage threshold lives in `vitest.integration.config.ts`, never in a CI flag.
   integration:
-    name: integration
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16-alpine
+        # `postgres:16`, not `-alpine`: MVP-03's row spells it that way, and the Debian image is glibc like the
+        # dev container, so the CI database sorts and compares text exactly like the one `make db-up` gives a
+        # contributor instead of like musl would.
+        image: postgres:16
         env:
           POSTGRES_USER: notetaker
           POSTGRES_PASSWORD: test
@@ -44,26 +112,42 @@ jobs:
     env:
       DATABASE_URL: postgres://notetaker:test@localhost:5432/notetaker_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - name: Install
-        run: pnpm install --frozen-lockfile
-      - name: Build workspace packages
-        run: pnpm build:packages
-      # `src/test/setup.ts` applies the committed migration before the first test, so a schema that
+      - run: pnpm install --frozen-lockfile
+      # Load-bearing here too, not just in `quality`: `src/test/setup.ts` boots the app under test, which
+      # imports `@note-taker/contracts` from its `dist` (PR-05).
+      - run: pnpm build:packages
+      # `src/test/setup.ts` applies the committed migration before the first test, so a schema
       # `pnpm db:migrate` cannot apply goes red here rather than in someone's deployment.
-      - name: Integration tests
-        run: pnpm test:integration
-      - name: Integration coverage (arms the apps/server/src/db ≥ 80% lines row)
-        run: pnpm coverage:integration
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
+      - run: pnpm test:integration
+      - run: pnpm coverage:integration
+      # This suite has one report directory (`reportsDirectory: coverage-integration` in
+      # `vitest.integration.config.ts`), so it uploads directly instead of going through `unit`'s collect loop.
+      - name: Upload integration coverage
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-integration
           path: apps/server/coverage-integration
-          if-no-files-found: warn
+          if-no-files-found: error
+
+  # `pnpm build`: tsc → apps/server/dist, vite build → apps/web/dist. No `docker build` step yet —
+  # docker/Dockerfile is PR-18's file, and the MVP has no registry to push to (MVP-03 §5).
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # No `build:packages` step here on purpose: the root script already is
+      # `pnpm build:packages && pnpm -r --filter './apps/**' build`, so this one step compiles the packages
+      # (a no-op until PR-05) and then both apps — no duplicated step, and PR-05 needs no edit here either.
+      - run: pnpm build

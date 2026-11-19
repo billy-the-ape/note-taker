@@ -1,0 +1,32 @@
+# --- dependencies -------------------------------------------------------------
+node_modules/
+.pnpm-store/
+
+# --- build output -------------------------------------------------------------
+# Server builds to apps/server/dist with tsc, web builds to apps/web/dist with Vite (PR-01 §6.2).
+dist/
+*.tsbuildinfo
+
+# --- tests & coverage ---------------------------------------------------------
+coverage/
+coverage-unit/
+coverage-integration/
+playwright-report/
+test-results/
+
+# --- environment files --------------------------------------------------------
+# Never commit a real .env (AGENTS.md): only .env.example is a template (plan §16).
+.env
+.env.*
+!.env.example
+
+# --- local scratch ------------------------------------------------------------
+# Dev-only secrets/keys generated on a developer machine (PR-06 stores the dev note key here).
+.dev/
+
+# --- editors, tooling, OS ----------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.log
+npm-debug.log*

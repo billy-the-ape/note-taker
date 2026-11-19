@@ -1,0 +1,26 @@
+{
+  "name": "note-taker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Note Taker — a self-hosted markdown notes app (pnpm monorepo: apps/server + apps/web).",
+  "license": "MIT",
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm build:packages && pnpm -r --parallel --filter './apps/**' dev",
+    "build": "pnpm build:packages && pnpm -r --filter './apps/**' build",
+    "build:packages": "pnpm -r --filter './packages/**' build",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "test:integration": "pnpm -r test:integration",
+    "coverage": "pnpm -r coverage"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
+    "typescript": "^5.9.3"
+  }
+}

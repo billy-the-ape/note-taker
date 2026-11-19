@@ -80,7 +80,7 @@ Workspace names: `apps/server`, `apps/web`, and later `packages/contracts` publi
 `.dockerignore`, `.nvmrc`, `LICENSE` (MIT), `.env.example`, `pnpm-lock.yaml` (committed — CI uses
 `--frozen-lockfile`).
 
-**`apps/server/`:** `package.json`, `tsconfig.json`, `vitest.config.ts`,
+**`apps/server/`:** `package.json`, `tsconfig.json`, `tsconfig.build.json`, `vitest.config.ts`,
 `src/{index.ts,app.ts,env.ts,logger.ts,routes/health.routes.ts}`, `src/env.test.ts`, `src/app.test.ts`.
 
 **`apps/web/`:** `package.json`, `tsconfig.json`, `vite.config.ts`, `vitest.config.ts`, `index.html`,
@@ -119,7 +119,10 @@ the root.
 
 `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`,
 `verbatimModuleSyntax: true`, ESM module settings. Server is built with plain `tsc` (no bundler) to
-`apps/server/dist`; web builds to `apps/web/dist`.
+`apps/server/dist`; web builds to `apps/web/dist`. `apps/server` carries **two programs**: `tsconfig.json` is the one
+`pnpm typecheck` runs and keeps the `*.test.ts` files in it, while `tsconfig.build.json` is the one `pnpm build`
+compiles and excludes them — `tsc` has no CLI `--exclude`, and a shipped artifact must not contain the suite that
+tests it (PR-18 copies `dist` into the image).
 
 ### 6.3 `apps/server/src/env.ts` — the load-bearing file
 
@@ -142,7 +145,9 @@ Zod-parsed `process.env`, failing fast with a readable list of problems. Rules:
     `import.meta.dirname` containing `pnpm-workspace.yaml` (**a fixed `../../.env` is wrong** — under `tsx` from
     `apps/server/src/` it lands on `apps/.env`, and the depth changes again once compiled to `dist/`);
   - `process.loadEnvFile(path)` inside a `try` that swallows **only** `ENOENT` (missing file is normal — a bare clone —
-    while a *malformed* file must fail loudly). Node 22 built-in ⇒ **no `dotenv` dependency**.
+    while any other read failure must fail loudly). Node 22's parser is lenient about file *content*, so a *malformed*
+    file is not detectable as such: an unreadable one (a directory, an unreadable path) is the loud case.
+    Node 22 built-in ⇒ **no `dotenv` dependency**.
   - Why a function and not a flag: `node --env-file` hard-fails when the file is missing (exit 9), and
     `--env-file-if-exists=../../.env` would need a different relative path per entry point and would still have to be
     added to `db:migrate`, `db:seed` and `test:integration` separately.
@@ -193,7 +198,9 @@ dev container and the host tools). The README quick start says `cp .env.example 
 ### 6.7 `apps/web`
 
 Vite 7 + React 19 + Tailwind v4 (`@tailwindcss/vite`) + TanStack Router file-based routes with `__root.tsx` and an
-`index.tsx` "coming soon" card. Vite dev server on `5173` **proxies `/api` to `:3000`**. `index.html` title from
+`index.tsx` "coming soon" card. Vite dev server on `5173` **proxies `/api` to `:3000`** — the target is a plain
+constant, overridable with `VITE_API_TARGET` for the machine where `:3000` is already taken; nothing else about the
+proxy is env-driven and no mode is read in that file. `index.html` title from
 `APP_NAME`-style constant or plain "Note Taker".
 
 ## 7. Acceptance criteria (every box must be provable)
@@ -219,7 +226,8 @@ Vite 7 + React 19 + Tailwind v4 (`@tailwindcss/vite`) + TanStack Router file-bas
 - `src/env.test.ts` —
   prod invariants (TTL > 365, `SECURE_COOKIES=false` + `TRUST_PROXY=true`, open registration over plain HTTP);
   the `.env` loader driven by `DOTENV_PATH` pointing at a temp fixture: file values appear when the process env lacks
-  them, a value already in the process env wins, a missing file is a silent no-op, a malformed file throws, and with
+  them, a value already in the process env wins, a missing file is a silent no-op, an unreadable file throws (only
+  `ENOENT` is tolerated — Node 22's parser tolerates malformed content, so the fixture is a directory), and with
   `NODE_ENV=production` the file is never opened at all;
   `databaseUrl()` as a pure function with **no DB involved**: a set `DATABASE_URL` comes back verbatim; unset ⇒ composed
   from `POSTGRES_*` (changing `POSTGRES_PORT` changes the string every host tool will use); `NODE_ENV=production` with

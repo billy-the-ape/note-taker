@@ -1,0 +1,31 @@
+# Keeps the Docker build context small and keeps host state out of the image.
+# PR-18 owns the multi-stage image: it installs and builds INSIDE the image, so the
+# compiled apps/server/dist and apps/web/dist are produced there rather than copied from
+# a developer machine, and are deliberately NOT ignored (a stale host build must not leak in,
+# and PR-12 serves apps/web/dist from the API process at runtime).
+.git
+.github
+.clinerules
+docs
+
+node_modules
+.pnpm-store
+
+# A real .env must never reach an image; the template is documentation, not runtime input.
+.env
+.env.*
+
+coverage
+coverage-unit
+coverage-integration
+playwright-report
+test-results
+
+# Browser tests run on the host/CI, never inside the image (PR-19).
+apps/web/e2e
+
+.dev
+*.log
+.DS_Store
+.idea
+.vscode

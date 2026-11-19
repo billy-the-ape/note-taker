@@ -64,7 +64,8 @@ on:
 permissions: { contents: read }
 concurrency: { group: "ci-${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }
 jobs:
-  quality:   # checkout → pnpm/action-setup v12 → actions/setup-node (cache: pnpm)
+  quality:   # checkout → pnpm/action-setup v6 (no `version:` input — it installs the pnpm pinned by
+             #   `packageManager`; the action has no v12, only pnpm does) → actions/setup-node (cache: pnpm)
              # → pnpm install --frozen-lockfile → pnpm build:packages → pnpm lint && pnpm typecheck
   unit:      # pnpm build:packages → pnpm coverage  (unit configs only, NO Postgres service) + upload coverage-unit/
   build:     # pnpm build only — NO docker build yet (docker/Dockerfile does not exist until PR-18)

@@ -21,6 +21,9 @@ curl -s http://localhost:3000/api/health      # {"status":"ok","db":"ok","versio
 pg_isready -h localhost -p 5432               # accepts connections to the dev database
 ```
 
+`make db-up` publishes Postgres on `127.0.0.1` only, so the `notetaker`/`notetaker` dev defaults are never
+reachable from the LAN; host tools dial `localhost`, which falls back to IPv4 when it resolves to `::1`.
+
 | Target                                   | What it does                                                                   |
 | ---------------------------------------- | ------------------------------------------------------------------------------ |
 | `make db-up`                             | start the dev Postgres and block until its healthcheck passes                   |
@@ -28,7 +31,7 @@ pg_isready -h localhost -p 5432               # accepts connections to the dev d
 | `make db-reset`                          | `down -v` (destroys `pgdata-dev`) and start a fresh one                         |
 | `make dev`                               | run both apps on the host (`pnpm dev`)                                          |
 | `make build` / `test` / `coverage`       | the `pnpm` equivalents, so the repo root has a single interface                 |
-| `make bootstrap-env`                     | `test -f .env || cp .env.example .env` — every `db-*`/`dev` target runs it first |
+| `make bootstrap-env`                     | `test -f .env \|\| cp .env.example .env` — every `db-*`/`dev` target runs it first |
 
 **`.env` is created for you and is never required.** `make bootstrap-env` copies `.env.example` when no
 `.env` exists (an existing file is left alone), and `pnpm dev` also boots from a bare clone with none at

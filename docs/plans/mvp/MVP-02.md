@@ -68,7 +68,8 @@ and make every target that passes `--env-file .env` (`db-up`, `db-down`, `db-res
 
 1. **`docker/compose.dev.yml`** — one service: `postgres:16-alpine`, named volume (`pgdata-dev`), `POSTGRES_USER` /
    `POSTGRES_PASSWORD` / `POSTGRES_DB` interpolated from `.env` with `${VAR:-notetaker}` defaults, published host port
-   `${POSTGRES_PORT:-5432}:5432`, healthcheck `pg_isready -U …` with the two variables escaped so the container's own
+   `127.0.0.1:${POSTGRES_PORT:-5432}:5432` (loopback-bound, so the `notetaker` defaults are not LAN-reachable),
+   healthcheck `pg_isready -U …` with the two variables escaped so the container's own
    shell expands them (written unescaped, Compose would interpolate them out of `.env` at config time instead),
    `restart: unless-stopped`, and a pinned compose project name so the volume/network names are identical in every
    clone or worktree on a machine.

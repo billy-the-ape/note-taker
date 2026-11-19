@@ -31,11 +31,18 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notetaker}
       POSTGRES_DB: ${POSTGRES_DB:-notetaker}
     ports:
-      # The dev-only host mapping, and the whole point of POSTGRES_PORT: Compose publishes it here, and
-      # env.ts's databaseUrl() reads the same value for the host-side DSN, so one edit in the repo-root
-      # .env moves both (the production db publishes nothing, plan §15). Re-running `make db-up` after
-      # editing it is what re-publishes the container on the new host port.
-      - ${POSTGRES_PORT:-5432}:5432
+      # Loopback-prefixed on purpose: without the `127.0.0.1` this maps on 0.0.0.0/::, and the dev
+      # defaults are the well-known notetaker/notetaker, so the LAN could read and write every note.
+      # The host side always dials `localhost` (env.ts's databaseUrl() and pg_isready), and Node 22 and
+      # libpq both fall back to IPv4 when `localhost` resolves to ::1 first, so IPv4-only is enough —
+      # binding ::1 too would need enable_ipv6 on the network for no extra reachability.
+      #
+      # This is also the dev-only host mapping and the whole point of POSTGRES_PORT: env.ts's
+      # databaseUrl() reads the same value for the host DSN, so one edit in the repo-root .env moves both
+      # (the production db publishes nothing, plan §15). Re-running `make db-up` after editing it is what
+      # re-publishes the container on the new host port. PR-18 copies the --env-file/-f rule from this
+      # file, NOT this binding: the prod app publishes ${HOST_PORT} on all interfaces on purpose.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       # Named volume, not a bind mount: the image's own initdb permissions survive on macOS/Windows.
       # Compose prefixes it with the project name, so `docker volume ls` shows `note-taker-dev_pgdata-dev`;

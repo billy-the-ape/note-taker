@@ -15,3 +15,55 @@ jobs:
     runs-on: ubuntu-24.04
     steps: 
       - run: true
+
+  # PR-04 (docs/plans/mvp/MVP-04.md §5). The first job that needs a database, and the only place the
+  # `*.int.test.ts` suite and the `apps/server/src/db` coverage row run — `pnpm test`/`pnpm coverage` stay
+  # Postgres-free, which is what the `.int.test.ts` exclusion in `vitest.config.ts` is for.
+  #
+  # `DATABASE_URL` is exported here rather than written to a `.env`: a set `DATABASE_URL` wins verbatim in
+  # `databaseUrl()`, exactly as it will in a deployed container, and `loadDevEnvFile()` is a no-op when there is
+  # no `.env` (a CI checkout has none). The coverage threshold lives in `vitest.integration.config.ts`, never in
+  # a CI flag (§6).
+  #
+  # PR-03's `quality`/`unit`/`build` jobs are not in this file yet — PR-03 has not landed on this base. When it
+  # does, this job joins them unchanged.
+  integration:
+    name: integration
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: notetaker
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: notetaker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://notetaker:test@localhost:5432/notetaker_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Build workspace packages
+        run: pnpm build:packages
+      # `src/test/setup.ts` applies the committed migration before the first test, so a schema that
+      # `pnpm db:migrate` cannot apply goes red here rather than in someone's deployment.
+      - name: Integration tests
+        run: pnpm test:integration
+      - name: Integration coverage (arms the apps/server/src/db ≥ 80% lines row)
+        run: pnpm coverage:integration
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-integration
+          path: apps/server/coverage-integration
+          if-no-files-found: warn

@@ -15,6 +15,11 @@ export interface BuildAppOptions {
   readonly logger?: FastifyBaseLogger;
   /** Reported by `/api/health`. Defaults to the version in `apps/server/package.json`. */
   readonly version?: string;
+  /**
+   * The `/api/health` database probe (`probeDb(getDb().db)` in `index.ts`). Absent means the probe reports
+   * the static `'ok'` it shipped with in PR-01, which is what every unit test and any pool-less boot uses.
+   */
+  readonly checkDb?: () => Promise<unknown>;
 }
 
 const UNKNOWN_VERSION = '0.0.0-unknown';
@@ -85,7 +90,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     reply.status(status).send({ error: { code: 'bad_request', message } });
   });
 
-  await app.register(healthRoutes, { version: options.version ?? serverVersion() });
+  await app.register(healthRoutes, {
+    version: options.version ?? serverVersion(),
+    // `exactOptionalPropertyTypes` means `{ checkDb: undefined }` is not the same as omitting the key, so the
+    // option is spread only when there is a probe to pass (PR-01's static `'ok'` otherwise).
+    ...(options.checkDb === undefined ? {} : { checkDb: options.checkDb }),
+  });
 
   return app;
 }

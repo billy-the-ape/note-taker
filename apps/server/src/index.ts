@@ -1,7 +1,10 @@
 import process from 'node:process';
 
 import { buildApp } from './app.js';
+import { closeDb, getDb, probeDb } from './db/client.js';
+import { migrateDatabase } from './db/migrate.js';
 import { EnvError, loadDevEnvFile, parseEnv } from './env.js';
+import { createLogger } from './logger.js';
 
 /** Reports a boot failure with no logger: there may be no valid configuration to build one from. */
 function reportBootFailure(error: unknown): void {
@@ -21,19 +24,25 @@ async function main(): Promise<void> {
   loadDevEnvFile();
   const env = parseEnv();
 
-  const app = await buildApp({ env });
+  const logger = createLogger(env.LOG_LEVEL, env.NODE_ENV);
 
-  // ── migrations slot (owned by PR-04) ──────────────────────────────────────────────────────
-  // PR-04 creates `db/migrate.ts` and runs it here — after the configuration is valid and BEFORE
-  // listen() — so a container never serves traffic against an unmigrated schema:
-  //
-  //   const { migrateDatabase } = await import('./db/migrate.js');
-  //   await migrateDatabase(env);
-  //
-  // PR-01 ships no database code at all, so the slot stays empty instead of pretending otherwise.
-  // That also means nothing here resolves a DSN yet: `databaseUrl()` (plan §16) is called by
-  // `db/client.ts`, `db/migrate.ts`, `drizzle.config.ts` and `scripts/seed-demo.ts` in PR-04/PR-09,
-  // and calling it now would make a scaffold with no queries depend on a database.
+  // ── migrations: after the configuration is valid, BEFORE listen() ───────────────────────────
+  // Plan §6: "migrations run at container start before `listen()`", and PR-18's container entrypoint is only
+  // `exec node dist/index.js`, so this is the migration step a container gets — there is no `db:migrate` in
+  // the image. A DSN that cannot be resolved or a statement that fails is a boot failure with the port still
+  // unbound, and the pool is released on the way out so the process is actually able to exit.
+  const { db, close: closePool } = getDb();
+  try {
+    await migrateDatabase({ db, log: logger });
+  } catch (error) {
+    await closePool();
+    throw error;
+  }
+
+  const app = await buildApp({ env, logger, checkDb: () => probeDb(db) });
+  app.addHook('onClose', async () => {
+    await closeDb();
+  });
 
   await app.listen({ host: env.HOST, port: env.PORT });
   app.log.info({ host: env.HOST, port: env.PORT, appName: env.APP_NAME }, 'note-taker API listening');

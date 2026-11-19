@@ -910,8 +910,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
 
 - **Modify:** `.github/workflows/CI.yml` — **delete the `placeholder` job but keep `name: CI` and the same
   triggers**, because `claude-review.yml` runs `on: workflow_run: workflows: ["CI"]`. Do not rename the workflow.
-- **Jobs shipped by this PR:** `quality` (checkout → `pnpm/action-setup` v12 → `actions/setup-node` cache `pnpm` →
-  `pnpm install --frozen-lockfile` → `pnpm build:packages` → `pnpm lint && pnpm typecheck`), `unit` (`pnpm build:packages` →
+- **Jobs shipped by this PR:** `quality` (checkout → `pnpm/action-setup` v6 — no `version:` input, so it
+  installs the pnpm pinned by `packageManager` (there is no v12 of that action, only of pnpm itself) →
+  `actions/setup-node` cache `pnpm` → `pnpm install --frozen-lockfile` → `pnpm build:packages` →
+  `pnpm lint && pnpm typecheck`), `unit` (`pnpm build:packages` →
   `pnpm coverage` — the **unit** configs only,
   no Postgres service, so it can only enforce the pure-code rows of the §14 table; it uploads `coverage-unit/`),
   `build` (`pnpm build` only — **no `docker build` yet**, because

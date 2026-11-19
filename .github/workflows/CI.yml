@@ -1,3 +1,13 @@
+# Real CI gates — PR-03 (docs/plans/mvp/MVP-03.md), replacing PR-01's placeholder job.
+#
+# ⚠ `name: CI`, the triggers, `concurrency` and `permissions` below are load-bearing, not cosmetics:
+# `.github/workflows/claude-review.yml` starts on `workflow_run: workflows: ["CI"]`, so renaming this
+# workflow (or narrowing its triggers) silently turns the Claude review off — plan §20 risk R6.
+#
+# A job never enters this file before the files it runs exist (MVP-03 §5): PR-04 adds `integration`
+# (a `postgres:16` service + `pnpm coverage:integration`), PR-18 adds the `docker build` step inside
+# `build`, PR-19 adds `e2e`. Nothing here pushes an image, and nothing here caches except
+# `actions/setup-node`'s `cache: pnpm` (MVP-03 §7).
 name: CI
 on:
   push:
@@ -9,9 +19,84 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
-  placeholder:
-    name: ci
+  # `biome check .` over the whole workspace, then both apps' typecheck programs.
+  quality:
     runs-on: ubuntu-24.04
-    steps: 
-      - run: true
+    steps:
+      - uses: actions/checkout@v7
+      # Deliberately no `version:` input — the action takes the pnpm version from `packageManager` in
+      # the root package.json, so CI runs exactly the pnpm this repo pins. It must run BEFORE
+      # setup-node, which asks `pnpm store path` what to cache: caching lives on setup-node only.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc # Node 22 — the pin CI reads; keep `engines` in step by hand
+          cache: pnpm
+      # The lockfile is committed, so CI installs exactly this tree and never resolves anything new.
+      - run: pnpm install --frozen-lockfile
+      # `@note-taker/contracts` will declare `exports`/`main`/`types` → `./dist` only, and a fresh
+      # checkout has no dist/, so this job's `pnpm typecheck` needs the packages compiled here
+      # (plan §14: this step runs in every job that typechecks or tests app code). Actions jobs are
+      # separate runners with separate checkouts, so nothing `build` produces could be reused here;
+      # PR-05 makes this load-bearing.
+      - run: pnpm build:packages
+      - run: pnpm lint
+      - run: pnpm typecheck
+
+  # Unit tests + coverage, with no Postgres service on purpose: `*.int.test.ts` are excluded by the
+  # unit Vitest configs, and every threshold that needs a DB is measured by PR-04's `integration`
+  # job. The thresholds themselves live in the Vitest configs that produce the numbers — never in CI
+  # flags — so a local `pnpm coverage` goes red exactly when this job does (plan §14).
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Same reason as in `quality` (see the comment there): the unit Vitest runs import the packages from
+      # `dist/` too, and this runner shares no files with the other jobs.
+      - run: pnpm build:packages
+      - run: pnpm coverage
+      # Each package writes its own gitignored `coverage/` report; collect them into the single
+      # `coverage-unit/` directory .gitignore already reserves. The `packages/*` glob is pre-wired
+      # for PR-05's contracts report.
+      - name: Collect unit coverage
+        run: |
+          mkdir -p coverage-unit
+          for dir in packages/*/coverage apps/*/coverage; do
+            [ -d "$dir" ] || continue
+            target="coverage-unit/$(basename "${dir%/coverage}")"
+            mkdir -p "$target"
+            cp -R "$dir/." "$target"
+          done
+          # A run that produced no report at all is a red gate, not an empty artifact.
+          test -n "$(find coverage-unit -mindepth 1 -type f -print -quit)"
+      - name: Upload unit coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-unit
+          path: coverage-unit
+          if-no-files-found: error
+
+  # `pnpm build`: tsc → apps/server/dist, vite build → apps/web/dist. No `docker build` step yet —
+  # docker/Dockerfile is PR-18's file, and the MVP has no registry to push to (MVP-03 §5).
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # No `build:packages` step here on purpose: the root script already is
+      # `pnpm build:packages && pnpm -r --filter './apps/**' build`, so this one step compiles the packages
+      # (a no-op until PR-05) and then both apps — no duplicated step, and PR-05 needs no edit here either.
+      - run: pnpm build

@@ -46,8 +46,11 @@ length, padding, reserved-name, and extension rules.
   `stripMd(stripMd(n)) === stripMd(n)`, equivalently `!endsInMd(stripMd(n))`. Stated over already
   stored names, `stripMd(stored) === stored`. It is deliberately **not** `stripMd(n) === n`: `Draft.md`
   is valid and `stripMd` shortens it.
-- `notes.name` stores the stripped value. **PR-23's migration check** asserts that no stored name
-  ends in `.md` (plan §8); this module is why that check can hold.
+- `notes.name` stores the stripped value. PR-04's column is `text NOT NULL CHECK (name <> '')`, commented
+  "WITHOUT the `.md` suffix" (plan §8) — the database therefore enforces non-emptiness, which matches the
+  `'empty'` rule here, but nothing in the DDL enforces the suffix rule. That half of the invariant holds
+  because the service writes `stripMd(name)` (PR-09's `note.service.ts`) and this module refuses any name
+  that would store anything else.
 
 ## Worked examples
 

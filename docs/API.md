@@ -1,15 +1,19 @@
 # API reference
 
-The prose version of plan [§9](plans/mvp/MVP-FULL-PLAN.md#9-api). The machine-readable version is the
-[`@note-taker/contracts`](../packages/contracts/src) package: [`routes.ts`](../packages/contracts/src/routes.ts)
-holds every path, the schema files hold every body/query/response shape, and
-[`api-envelope.ts`](../packages/contracts/src/api-envelope.ts) holds the error contract. **PR-06**
-generates the OpenAPI document from those schemas, so this file and the package must not diverge — a
-route that contradicts them fails CI.
+The prose version of plan [§9](plans/mvp/MVP-FULL-PLAN.md#9-api). The machine-readable half is the
+[`@note-taker/contracts`](../packages/contracts/src) package, which **both apps import**:
+[`routes.ts`](../packages/contracts/src/routes.ts) holds every path, the schema files hold every
+body/query/response shape, and [`api-envelope.ts`](../packages/contracts/src/api-envelope.ts) holds the
+error contract. That shared import is what keeps the two sides in step — a path or a field renamed in the
+package stops compiling in an app that missed the rename — and `json({ schema })` in the client re-checks a
+response body against the schema it names. Nothing generates this file and no CI job diffs it against the
+routes: it is maintained by hand, and `AGENTS.md` requires it to change in the same PR as the contract it
+describes.
 
 > **Status.** Only `GET /api/health` and `GET /api/healthz` are implemented today (by `apps/server`).
-> Everything else below is the contract this PR pins and the route PRs (**PR-07…PR-17**) implement;
-> the "Lands in" column says which one. Until then an unknown path answers the envelope with
+> Everything else below is the contract this PR pins, which the route PRs (**PR-07**, **PR-09**,
+> **PR-10**, **PR-11**) implement; the "Lands in" column says which one, and the UI PRs (**PR-08**,
+> **PR-12…PR-17**) only consume it. Until then an unknown path answers the envelope with
 > `NOT_FOUND`, which is the shape every later route keeps.
 
 ## Conventions
@@ -80,7 +84,7 @@ conflict (plan §11.4).
 
 | # | Method + path | Auth | Request | Success | Lands in |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `GET /api/health`, `GET /api/healthz` | none | — | `{status:'ok', db:'ok', version}` | **PR-05** (probe, `db` from PR-04) |
+| 1 | `GET /api/health`, `GET /api/healthz` | none | — | `{status:'ok', db:'ok', version}` | **PR-05** (the probe; `db` is a placeholder until PR-04 wires the pool) |
 | 2 | `GET /api/auth/status` | none | — | `{needsSetup, registrationOpen}` | PR-07 |
 | 3 | `POST /api/auth/setup` | none, only while `needsSetup` | `registerSchema` | `200 {user}` + cookie | PR-07 |
 | 4 | `POST /api/auth/register` | none, only when registration is open **and** an owner exists | `registerSchema` | `201 {user}` + cookie | PR-07 |
@@ -91,16 +95,16 @@ conflict (plan §11.4).
 | 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | PR-07 |
 | 10 | `POST /api/users` | owner | `createUserSchema` | `201 {user}` | PR-07 |
 | 11 | `GET /api/users` | owner | — | `usersResponseSchema` (`{users: SessionUser[]}`) | PR-07 |
-| 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | PR-10 |
+| 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | PR-09 |
 | 13 | `POST /api/folders` | yes | `createFolderSchema` | `201 FolderNode` | PR-09 |
 | 14 | `PATCH /api/folders/:id` | yes | `patchFolderSchema` | `200 FolderNode` | PR-09 |
 | 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` (`folderDeletePath()`) | `204` | PR-09 |
 | 16 | `POST /api/notes` | yes | `createNoteSchema` | `201 NoteWithContent` | PR-09 |
 | 17 | `GET /api/notes/:id` | yes | — | `NoteWithContent` + `ETag: W/"v<version>"` | PR-09 |
-| 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) | PR-09 |
+| 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) | PR-10 (the read side, #17, is PR-09) |
 | 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | PR-09 |
 | 20 | `DELETE /api/notes/:id` | yes | — | `204` | PR-09 |
-| 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | — | `searchResponseSchema` | PR-12 |
+| 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | — | `searchResponseSchema` | PR-11 |
 | 22 | `GET /api/settings`, `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | PR-09 |
 
 ## Examples

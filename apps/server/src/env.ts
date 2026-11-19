@@ -1,7 +1,7 @@
 /**
  * The one place this repository reads `process.env`.
  *
- * Three exports, and later PRs may not build a fourth way of reaching the same values
+ * Three entry points, and later PRs may not build a fourth way of reaching the same values
  * (docs/plans/mvp/MVP-FULL-PLAN.md §16):
  *
  *   * `parseEnv()` — Zod-parsed configuration that fails fast with a readable LIST of problems.
@@ -16,7 +16,7 @@
  * own mode on its own command line (`NODE_ENV=development tsx …`, `NODE_ENV=test vitest …`) and
  * why nothing here papers over a missing value with a default.
  *
- * Keys outside the schema (PATH, HOME, SHL, …) are ignored on purpose: `process.env` is a shared
+ * Keys outside the schema (PATH, HOME, SHLVL, …) are ignored on purpose: `process.env` is a shared
  * namespace, so "unknown" is enforced per variable (an unknown *value*, e.g.
  * `LOG_LEVEL=verbose`) rather than by refusing to start next to `PATH`.
  */
@@ -305,7 +305,7 @@ function warnDatabaseUrlMismatch(
     return; // Not a URL this can compare (e.g. a socket path): nothing to warn about.
   }
 
-  const port = parsed.port !== '' ? parsed.port : '5432';
+  const port = parsed.port !== '' ? parsed.port : DSN_DEFAULTS.POSTGRES_PORT;
   const database = decodedURIComponentSafely(parsed.pathname.replace(/^\//, ''));
   const disagreements: string[] = [];
   if (

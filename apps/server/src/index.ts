@@ -41,7 +41,7 @@ async function main(): Promise<void> {
   let shuttingDown = false;
   const shutdown = (signal: NodeJS.Signals): void => {
     if (shuttingDown) {
-      // A second signal means the first one hit something that will not finish: stop politely.
+      // A second signal means the first one hit something that will not finish: exit immediately.
       app.log.warn({ signal }, 'second signal during shutdown, exiting now');
       process.exit(1);
     }

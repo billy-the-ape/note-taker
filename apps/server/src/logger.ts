@@ -33,7 +33,7 @@ export function createLogger(level: LogLevels, nodeEnv: NodeEnv): Logger {
   return pino(loggerOptions(level, nodeEnv));
 }
 
-/** A logger for tests: nothing but real errors reaches stdout, so suites stay readable. */
+/** A logger for tests: silent, so suites stay readable. */
 export function createTestLogger(): Logger {
   return createLogger('silent', 'test');
 }

@@ -1,0 +1,14 @@
+{
+  // Typechecks the contract **suite** (`src/**/*.test.ts`) and `vitest.config.ts`, which
+  // `tsconfig.json` deliberately leaves out of the program so `dist` stays test-free. It extends the
+  // base rather than `tsconfig.json` on purpose: with no emit there is no `rootDir`/`outDir` to keep,
+  // and the config file at the package root would otherwise sit outside `rootDir: "src"`.
+  //
+  // Run by `pnpm --filter @note-taker/contracts typecheck`, i.e. by `pnpm -w typecheck`.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": []
+  },
+  "include": ["src", "vitest.config.ts"]
+}

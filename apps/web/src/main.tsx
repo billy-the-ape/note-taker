@@ -1,22 +1,18 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { createRouter, RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
+import { queryClient } from './lib/queryClient';
 import { routeTree } from './routeTree.gen';
 import './styles/globals.css';
 
 /**
  * The providers every later PR hangs off (plan §11.2): TanStack Router for file-based routes and
- * TanStack Query for server state. `lib/queryClient.ts` moves the client out of here in PR-05, when
- * the typed API client arrives and the defaults stop being placeholders.
+ * TanStack Query for server state. PR-05 moved the client to `lib/queryClient.ts`, where its defaults
+ * stop being placeholders (a `4xx` is never retried) and its cache keys are shared with the tests —
+ * which is why this file no longer constructs one.
  */
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: { staleTime: 30_000, refetchOnWindowFocus: false, retry: 1 },
-  },
-});
-
 const router = createRouter({ routeTree });
 
 declare module '@tanstack/react-router' {

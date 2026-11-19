@@ -12,6 +12,7 @@
     "coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@note-taker/contracts": "workspace:*",
     "@tanstack/react-query": "^5.108.0",
     "@tanstack/react-router": "^1.170.46",
     "react": "^19.3.1",

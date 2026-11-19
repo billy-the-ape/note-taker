@@ -4,6 +4,7 @@ import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 
 import type { Env } from './env.js';
 import { createLogger } from './logger.js';
+import { registerErrorHandlers } from './plugins/error-handler.js';
 import { healthRoutes } from './routes/health.routes.js';
 
 export interface BuildAppOptions {
@@ -37,24 +38,18 @@ function serverVersion(): string {
 }
 
 /**
- * Fastify's error handler receives `unknown` on purpose (a plugin or hook can throw anything), so
- * reading `statusCode` needs a narrow look rather than a cast to a shape that may not be there.
- */
-function statusCodeOf(error: unknown): number {
-  const candidate: unknown =
-    error instanceof Error ? (error as { readonly statusCode?: unknown }).statusCode : undefined;
-  return typeof candidate === 'number' && candidate >= 400 && candidate <= 599 ? candidate : 500;
-}
-
-/**
- * Builds the Fastify instance: logger, health routes, error placeholders. **Dependency injection
- * is the point** — `app.inject()` in `app.test.ts` (and every `*.int.test.ts` from PR-04) exercises
- * the API without binding a port.
+ * Builds the Fastify instance: logger, the §9.1 error envelope, health routes. **Dependency
+ * injection is the point** — `app.inject()` in `app.test.ts` (and every `*.int.test.ts` from PR-04)
+ * exercises the API without binding a port.
+ *
+ * PR-05 replaced PR-01's two placeholder handlers with `registerErrorHandlers()`, so an unknown
+ * route, an over-cap body and an unhandled failure all answer the same envelope the client reads.
  *
  * Deliberately absent here:
  * * `@fastify/cookie`, the auth guard and CSRF (PR-07) — no auth in this PR;
- * * the Zod type provider and the §9.1 error envelope (PR-05);
- * * `@fastify/static` + SPA fallback (PR-12).
+ * * `fastify-type-provider-zod`, which the first route that validates a body registers (PR-07);
+ * * `@fastify/static` + SPA fallback (PR-12), which will own the not-found answer for non-`/api`
+ *   paths and must be registered before that changes anything here.
  */
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const { env } = options;
@@ -67,23 +62,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     bodyLimit: env.MAX_NOTE_BYTES,
   });
 
-  app.setNotFoundHandler((request, reply) => {
-    reply
-      .status(404)
-      .send({ error: { code: 'not_found', message: `no route for ${request.method} ${request.url}` } });
-  });
-
-  app.setErrorHandler((error: unknown, request, reply) => {
-    const status = statusCodeOf(error);
-    if (status >= 500) {
-      request.log.error({ err: error }, 'request failed');
-      // Never leak the internal failure to the client; PR-05 turns this into a trace id.
-      reply.status(status).send({ error: { code: 'internal_error', message: 'internal error' } });
-      return;
-    }
-    const message = error instanceof Error ? error.message : 'bad request';
-    reply.status(status).send({ error: { code: 'bad_request', message } });
-  });
+  // App-level, so one registration covers every route the later PRs add, `/api`-prefixed or not.
+  registerErrorHandlers(app);
 
   await app.register(healthRoutes, { version: options.version ?? serverVersion() });
 

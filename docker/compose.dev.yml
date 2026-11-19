@@ -1,0 +1,54 @@
+# Note Taker — development stack: Postgres ONLY (docs/plans/mvp/MVP-02.md).
+#
+# **Never invoke this file without both flags, and always from the repo root:**
+#
+#     docker compose --env-file .env -f docker/compose.dev.yml <up|down|ps|logs|…>
+#
+# Compose resolves its project directory from the compose file's location, so `-f docker/compose.dev.yml`
+# on its own would auto-load `.env` from `docker/` — not from the repo root, where the file lives — and a
+# missing `--env-file` is a hard error before Docker is even contacted. Nobody is supposed to remember
+# that, which is why `make db-up|db-down|db-reset` are the documented interface (the `Makefile` pins this
+# exact invocation) and why PR-18 follows the same rule for `docker/compose.yml`.
+#
+# The app is deliberately NOT in this file: dev runs it on the host (`make dev` → `pnpm dev`), so the
+# editor and the API hot-reload and no source ever needs baking into an image. The containerized app
+# service belongs to the production stack in PR-18.
+
+# Pinning the project name keeps the volume, network and container names identical in every clone or
+# git worktree on this machine instead of following the checkout directory name.
+name: note-taker-dev
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # Interpolated from the repo-root .env (see --env-file above); the defaults mirror
+      # `DSN_DEFAULTS` in apps/server/src/env.ts, so a host process with no .env at all composes the
+      # same DSN this container answers. POSTGRES_PASSWORD stays URL-safe: env.ts embeds it raw in the
+      # DSN and nothing percent-encodes on the way.
+      POSTGRES_USER: ${POSTGRES_USER:-notetaker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notetaker}
+      POSTGRES_DB: ${POSTGRES_DB:-notetaker}
+    ports:
+      # The dev-only host mapping, and the whole point of POSTGRES_PORT: Compose publishes it here, and
+      # env.ts's databaseUrl() reads the same value for the host-side DSN, so one edit in the repo-root
+      # .env moves both (the production db publishes nothing, plan §15). Re-running `make db-up` after
+      # editing it is what re-publishes the container on the new host port.
+      - ${POSTGRES_PORT:-5432}:5432
+    volumes:
+      # Named volume, not a bind mount: the image's own initdb permissions survive on macOS/Windows.
+      # Compose prefixes it with the project name, so `docker volume ls` shows `note-taker-dev_pgdata-dev`;
+      # `make db-reset` is the supported way to destroy it (it runs `down -v`).
+      - pgdata-dev:/var/lib/postgresql/data
+    healthcheck:
+      # `$$` is Compose's escape: the two variables are expanded by the container's shell from the
+      # environment above, not interpolated out of .env at config time.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata-dev:

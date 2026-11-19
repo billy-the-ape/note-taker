@@ -68,7 +68,10 @@ and make every target that passes `--env-file .env` (`db-up`, `db-down`, `db-res
 
 1. **`docker/compose.dev.yml`** — one service: `postgres:16-alpine`, named volume (`pgdata-dev`), `POSTGRES_USER` /
    `POSTGRES_PASSWORD` / `POSTGRES_DB` interpolated from `.env` with `${VAR:-notetaker}` defaults, published host port
-   `${POSTGRES_PORT:-5432}:5432`, healthcheck `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB`, `restart: unless-stopped`.
+   `${POSTGRES_PORT:-5432}:5432`, healthcheck `pg_isready -U …` with the two variables escaped so the container's own
+   shell expands them (written unescaped, Compose would interpolate them out of `.env` at config time instead),
+   `restart: unless-stopped`, and a pinned compose project name so the volume/network names are identical in every
+   clone or worktree on a machine.
 2. **`Makefile`** — targets `bootstrap-env`, `db-up`, `db-down`, `db-reset`, `dev`, `build`, `test`, `coverage`.
    **No `db:seed`/`db-reset`-with-migrations target**: seeding arrives with PR-09 (there is no schema and no auth service
    to hash a demo password with yet).
@@ -84,7 +87,8 @@ and make every target that passes `--env-file .env` (`db-up`, `db-down`, `db-res
 ## 6. Required behavior
 
 - `make db-up` on a cold clone: creates `.env` from `.env.example` if missing, then starts a healthy Postgres on
-  `localhost:5432` (or `${POSTGRES_PORT}`).
+  `localhost:5432` (or `${POSTGRES_PORT}`). The target runs `up -d --wait`, so it returns only once the container's
+  healthcheck passes and a following `pg_isready` cannot race initdb.
 - `make db-down` stops it; `make db-reset` recreates it (down `-v` for the dev volume, then up).
 - `make dev` runs the app on the host (`pnpm dev`: `tsx watch` API `:3000`, Vite `:5173`) — Docker is used for the DB
   only; the app is never containerized in dev (the prod image is PR-18).

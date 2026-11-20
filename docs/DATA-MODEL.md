@@ -72,6 +72,15 @@ Column types are what `information_schema` reports after `pnpm db:migrate`.
 | `created_at`      | `timestamptz NOT NULL DEFAULT now()` |                                              |
 | `updated_at`      | `timestamptz NOT NULL DEFAULT now()` |                                              |
 
+*As-built* (PR-07): `password_hash` is written by `auth/passwords.ts` (argon2id, one random salt per
+password) and replaced only through `setUserPassword()`, the single statement that also moves
+`password_set_at` — the only evidence after the fact that a credential was rotated. The one supported
+recovery path is `apps/server/src/scripts/reset-password.ts`, which updates those two columns and `DELETE`s
+that user's `sessions` rows, and touches nothing else: every other `user_id` foreign key in this file is
+`ON DELETE CASCADE`, so "delete the account and create it again" is data destruction followed by a
+`POST /api/auth/setup` that answers `409` forever. `src/scripts/reset-password.int.test.ts` runs the script
+as a subprocess and asserts the notes, folders and settings of the account are still there afterwards.
+
 ### `sessions`
 
 | Column         | Type                                 | Notes                                                       |
@@ -140,8 +149,11 @@ a user row created by a fixture or a future import path.
 | `succeeded` | `boolean NOT NULL`                       | only failures count against the lockout (PR-07)            |
 | `at`        | `timestamptz NOT NULL DEFAULT now()`     | written by the caller; `between` filters are bound as timestamp parameters |
 
-Append-only, never cascaded (it has no `user_id`), and pruned by the maintenance cron in PR-07 — which is what
-`auth_attempts_key_at_idx` exists for.
+Append-only, never cascaded (it has no `user_id`). PR-07 writes the rows and reads them back through
+`auth_attempts_key_at_idx`; retention is not its job — plan §17 gives the prune job to PR-20's maintenance
+cron, which is also what that index exists for. A self-hosted note app has too few login attempts for a
+retention rule to be a real problem before then, and inventing one here would delete the audit trail the
+rows exist to be.
 
 ## 3. The root, and why the sibling indexes use `COALESCE`
 
@@ -192,12 +204,13 @@ UPDATE notes
 The database is the layer that decides these, and the services map them. Note where the code actually is:
 drizzle-orm catches the driver's error and rethrows its own `DbError`/`DrizzleQueryError`, so **the SQLSTATE is
 on `error.cause.code`**, not on the thrown error. Reading `error.code` returns `undefined`, which is how a
-constraint you forgot to map becomes a 500. `apps/server/src/test/helpers/pg-error.ts` walks the `cause` chain
-for the tests, and is the shape the services layer should follow.
+constraint you forgot to map becomes a 500. `apps/server/src/db/pg-error.ts` (PR-07) is the production reader —
+`isUniqueViolation()` and `constraintOf()` — and `apps/server/src/test/helpers/pg-error.ts` is its twin for the
+tests, which cannot import it because that file imports `expect` from Vitest.
 
 | SQLSTATE | Means                                                              | Rendered as (PR-07/09/10) |
 | -------- | ------------------------------------------------------------------ | ------------------------- |
-| `23505`  | unique violation — `users_username_lower_uidx`, `users_one_owner_uidx`, `folders_unique_sib`, `notes_unique_sib` | `409` (or `422` for a username that is taken) |
+| `23505`  | unique violation — `users_username_lower_uidx`, `users_one_owner_uidx`, `folders_unique_sib`, `notes_unique_sib` | `409 CONFLICT` for all four, as of PR-07: plan §9.1's code list has no `422`, and "that username is taken" and "this install already has an owner" are the same statement to a client — the constraint name that tells them apart goes in the log, not in a new status code |
 | `23503`  | foreign key failed — a `folder_id`/`user_id` that is not there       | `400` (a UI that cannot send this is fine) |
 | `23514`  | CHECK violated — empty name, a role outside `(owner, member)`, a theme outside the three | `400` |
 | `22P02`  | invalid input syntax for a `uuid` (a malformed id in the route)      | `400` |
@@ -214,7 +227,7 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | Invariant | Where it is enforced | Proof |
 | --- | --- | --- |
 | Username unique case-insensitively | `users_username_lower_uidx` on `lower(username)` | `schema.int.test.ts` (definition + `Kayla`/`kayla` → `23505`) |
-| Exactly one owner | `users_one_owner_uidx` (partial unique on `role = 'owner'`) | `schema.int.test.ts` (a second explicit `role='owner'` insert → `23505` from that constraint) |
+| Exactly one owner | `users_one_owner_uidx` (partial unique on `role = 'owner'`) | `schema.int.test.ts` (a second explicit `role='owner'` insert → `23505` from that constraint); the concurrent-`/setup` race is `routes/auth.routes.int.test.ts` (three simultaneous setups → one `200`, two `409`, one owner row) |
 | A role-less insert is never an owner | column `DEFAULT 'member'` | `schema.int.test.ts` (two raw role-less inserts coexist, both `member`) |
 | One name per `(user, folder)`, root included | `folders_unique_sib` / `notes_unique_sib` + `COALESCE` | `folders.repo.int.test.ts`, `notes.repo.int.test.ts` (inside a folder **and** at the root) |
 | Two users may use the same name in the same place | `user_id` is the first index column | `folders.repo.int.test.ts` |
@@ -224,8 +237,8 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | Cross-user reads return nothing | every repository statement filters by `user_id` | both repository tests, on every read and write |
 | `word_count` / `content_bytes` / `content_updated_at` always exist | `NOT NULL DEFAULT 0/now()` | `schema.int.test.ts` (defaults present) + `notes.repo.int.test.ts` (an insert without them) |
 | Ciphertext is never plaintext | no plaintext column, flag or code path; `crypto/envelope.ts` is the only writer (PR-06) | the column list above; `notes.repo.int.test.ts` round-trips bytes that are not valid UTF-8 |
-| One `settings` row per user | `user_id` is the PK | `schema.int.test.ts` (the fixture's two users get one row each) |
-| An install has an owner before anyone joins | `users_one_owner_uidx` here + service guards in PR-07 | as above |
+| One `settings` row per user, in the user's own transaction | `user_id` is the PK, and `insertUserWithSettings()` is the only writer that pairs them | `schema.int.test.ts` (the fixture's two users get one row each); `users.repo.int.test.ts` (a transaction aborted between the two inserts leaves neither row) |
+| An install has an owner before anyone joins | `users_one_owner_uidx` here + `auth.service.ts`'s two guards | `routes/registration.int.test.ts` (`POST /api/auth/register` answers `403` on an empty database even with `ALLOW_REGISTRATION=true`, and `needsSetup` stays `true`) |
 
 ## 7. How the schema is built and checked
 

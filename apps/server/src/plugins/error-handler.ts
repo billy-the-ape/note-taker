@@ -41,6 +41,8 @@ export interface MappedError {
   readonly message: string;
   readonly details?: readonly ErrorDetail[];
   readonly data?: ErrorData;
+  /** Whole seconds to put in `Retry-After`; only a domain error can ask for it (PR-07's login window). */
+  readonly retryAfterSeconds?: number;
 }
 
 /**
@@ -142,6 +144,7 @@ export function mapError(error: unknown): MappedError {
       message: error.message,
       ...(error.details === undefined ? {} : { details: error.details }),
       ...(error.data === undefined ? {} : { data: error.data }),
+      ...(error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: error.retryAfterSeconds }),
     };
   }
 
@@ -216,17 +219,23 @@ export function registerErrorHandlers(app: FastifyInstance): void {
       request.log.debug({ err: error, code: mapped.code, requestId }, 'request rejected');
     }
 
-    reply
-      .status(mapped.status)
-      .header('x-request-id', requestId)
-      .send(
-        errorResponseBody({
-          code: mapped.code,
-          message: mapped.message,
-          ...(mapped.details === undefined ? {} : { details: mapped.details }),
-          ...(mapped.data === undefined ? {} : { data: mapped.data }),
-          requestId,
-        }),
-      );
+    // Split out of the chain because one header here is optional, and a conditional in the middle of a
+    // fluent call is how people end up sending `undefined` as a string.
+    const response = reply.status(mapped.status).header('x-request-id', requestId);
+    if (mapped.retryAfterSeconds !== undefined) {
+      // Plan §10: the `429` from the login window says when to come back. Seconds rather than an HTTP-date,
+      // because the value comes from a sliding window this process owns and a date would be a guess about
+      // the client's clock.
+      response.header('Retry-After', String(mapped.retryAfterSeconds));
+    }
+    response.send(
+      errorResponseBody({
+        code: mapped.code,
+        message: mapped.message,
+        ...(mapped.details === undefined ? {} : { details: mapped.details }),
+        ...(mapped.data === undefined ? {} : { data: mapped.data }),
+        requestId,
+      }),
+    );
   });
 }

@@ -49,7 +49,7 @@ export async function createUser(db: Db, input: CreateUserInput): Promise<User> 
           input.passwordHash ??
           // Not a password hash — a placeholder with the shape of an argon2id encoded string, so nothing
           // later mistakes it for a verifiable one. PR-07 writes the real thing.
-          '$argon2id$v=19$m=65536,t=3,p=4$c2FsdEBzaXplMTY$notarealhashforkatamafixtures',
+          '$argon2id$v=19$m=65536,t=3,p=4$c2FsdEBzaXplMTY$notarealhashforfixtures',
         displayName: input.displayName ?? null,
         role: input.role,
       })

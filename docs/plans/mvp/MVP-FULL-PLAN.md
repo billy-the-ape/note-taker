@@ -356,7 +356,9 @@ Rules the map enforces:
 ## 8. Data model
 
 Postgres 16. Drizzle schema is the source of truth; `drizzle-kit generate` produces committed SQL in
-`apps/server/migrations/`. UUID PKs — **UUIDv7 preferred** (one `newId()` helper wrapping `@uuidjs/uuid-v7`);
+`apps/server/migrations/`. UUID PKs — **UUIDv7 preferred** (one `newId()` helper wrapping `uuid`'s `v7` — the
+scoped `@uuidjs/uuid-v7` named here before PR-04 has never been published, so PR-04 shipped `uuid` and corrected
+this line);
 Node's `crypto.randomUUID()` is **v4** and is an acceptable fallback because nothing in the MVP orders rows by id.
 Either way there is exactly one `newId()`, and every insert goes through it.
 

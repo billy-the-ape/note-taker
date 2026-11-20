@@ -21,7 +21,9 @@ database, and an integration test that would fail if it were dropped.
 ## 1. Conventions
 
 - **Identifiers** are `uuid` primary keys, generated in the application by exactly one helper —
-  `newId()` in `apps/server/src/db/ids.ts`, UUIDv7 (`uuid`'s `v7`) as chosen in plan §5. Postgres'
+  `newId()` in `apps/server/src/db/ids.ts`, UUIDv7 (`uuid`'s `v7`) as chosen in plan §8 (Data model); the
+  package the plan and the brief named, `@uuidjs/uuid-v7`, does not exist on the registry, and §8 below
+  records that substitution. Postgres'
   `gen_random_uuid()` stays unused, which is why `pgcrypto` exists in the schema as an operational
   affordance (§8) rather than as a code path.
 - **Ownership** is explicit on every table that holds user data (`user_id`), and every repository function
@@ -46,8 +48,10 @@ database, and an integration test that would fail if it were dropped.
   its `lower()` index.
 - **Listing order is the database's.** `listFolders`/`listNotes` order by `name` and never re-sort in
   JavaScript, so the tree PR-16 renders matches `folders_user_parent_idx`/`notes_user_folder_idx` and matches
-  another installation running the same collation. Names compare as text, which is why `10-second` sorts
-  before `1-first`.
+  another installation running the same collation. Names compare as *text*, which is why `10` follows `1` and
+  precedes `2` in a file tree. How punctuation and mixed case rank is the **cluster's collation**, not a promise
+  this schema makes — `C` puts `-` (0x2D) before `0` (0x30) where glibc `en_US.UTF-8` ignores it at the primary
+  level — so nothing in this repository, least of all a test, may spell out an order that depends on it.
 - **Deletes are hard.** No soft-delete column and no trash (backlog PR-23); `ON DELETE CASCADE` does the
   cascade and the tests prove it.
 
@@ -264,6 +268,10 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 - `pgcrypto` is created but unused by the MVP: ids come from `newId()` in the application, not
   `gen_random_uuid()`. It is there because plan §8 asks for it and because operators debugging a production
   database expect it.
+- `newId()` wraps `v7` from **`uuid`**, not the `@uuidjs/uuid-v7` that plan §8 and MVP-04 §4/§5 name. That
+  scoped package has never existed — `https://registry.npmjs.org/@uuidjs%2fuuid-v7` answers 404 — and `uuid` is
+  the uuidjs project itself, which exports `v7` from its public entry point. PR-04 shipped `uuid` and corrected
+  both documents to say so; nothing else in the plan depends on the scoped name.
 - `notes.word_count` is **whatever the caller that sealed the ciphertext supplies**; the database neither stores
   nor computes the plaintext, so it cannot tokenise anything. PR-12's preview needs a count, not a dictionary,
   and a later PR that wants different tokenisation changes the caller rather than the column.

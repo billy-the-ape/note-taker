@@ -33,7 +33,7 @@ if (env.NODE_ENV !== 'test') {
 }
 
 /** The DSN this run is against. Resolved once, here, so a bad configuration fails before any test loads. */
-export const INTEGRATION_DATABASE_URL: string = databaseUrl();
+const INTEGRATION_DATABASE_URL: string = databaseUrl();
 
 await migrateDatabase({ url: INTEGRATION_DATABASE_URL });
 

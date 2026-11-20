@@ -89,9 +89,9 @@ describe('folders.repo', () => {
     await createFolder(db, { userId: owner.id, name: 'Bravo' });
     await createFolder(db, { userId: owner.id, name: 'alpha' });
     await createFolder(db, { userId: owner.id, name: 'Child', parentId: top.id });
-    await createFolder(db, { userId: owner.id, name: '2-second', parentId: top.id });
-    await createFolder(db, { userId: owner.id, name: '1-first', parentId: top.id });
-    await createFolder(db, { userId: owner.id, name: '10-tenth', parentId: top.id });
+    await createFolder(db, { userId: owner.id, name: '2', parentId: top.id });
+    await createFolder(db, { userId: owner.id, name: '1', parentId: top.id });
+    await createFolder(db, { userId: owner.id, name: '10', parentId: top.id });
 
     // The repository must not re-sort. Whatever collation the cluster has, its order is the API's order:
     // PR-16 renders this list, and a JS `sort()` would disagree with the index and with the server. (`C` and
@@ -105,13 +105,11 @@ describe('folders.repo', () => {
     expect(listed).toStrictEqual(fromDatabase.map((row) => String(row.name)));
 
     // And one ordering every supported collation agrees on, so the direction is asserted and not assumed:
-    // names compare as text, which is why `10-tenth` precedes `1-first` in the file tree.
-    await expect(namesAt(owner.id, top.id)).resolves.toStrictEqual([
-      '10-tenth',
-      '1-first',
-      '2-second',
-      'Child',
-    ]);
+    // names compare as text digit by digit, which is why `10` follows `1` and precedes `2` in a file tree.
+    // The names carry no punctuation on purpose: `-` (0x2D) sorts before `0` (0x30) under `C`, while glibc's
+    // `en_US.UTF-8` ignores it at the primary level, so `1-first`/`10-tenth` flipped order with the cluster
+    // and turned a `postgres:16-alpine` CI database red. Prefixes and digits-before-letters hold in both.
+    await expect(namesAt(owner.id, top.id)).resolves.toStrictEqual(['1', '10', '2', 'Child']);
   });
 
   it('lists a whole tree, and never another user’s rows', async () => {

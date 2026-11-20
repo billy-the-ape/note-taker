@@ -8,9 +8,10 @@
  * second source of ids to fall out of sync with.
  *
  * The package is `uuid` (the uuidjs library) and its `v7`. The brief named `@uuidjs/uuid-v7`, which has
- * never existed on the registry; `uuid` is the same project and exports `v7` directly (see
- * `docs/DATA-MODEL.md`, "Decisions"). Node's built-in `crypto.randomUUID()` would be the acceptable fallback
- * the brief allows (it is v4, and nothing in the MVP orders rows by id), but it is not needed.
+ * never existed on the registry (that scoped name answers 404 today); `uuid` is the same project and exports
+ * `v7` directly, and the swap is recorded in `docs/DATA-MODEL.md` §8 next to the plan §8 wording it deviates
+ * from. Node's built-in `crypto.randomUUID()` would be the acceptable fallback the brief allows (it is v4, and
+ * nothing in the MVP orders rows by id), but it is not needed.
  */
 import { v7 as uuidv7 } from 'uuid';
 

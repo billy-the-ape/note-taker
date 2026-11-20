@@ -44,7 +44,7 @@ export function createDb(options: CreateDbOptions = {}): DbHandle {
 
   const pool = postgres(url, {
     max,
-    // A self-hosted app talks to a database on the same machine or network: keep one idle connection warm,
+    // A self-hosted app talks to a database on the same machine or network: close connections idle for 30s,
     // and recycle anything older than an hour so a restarted `db` container is not reached through a
     // half-open socket forever.
     idle_timeout: 30,

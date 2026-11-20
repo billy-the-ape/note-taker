@@ -205,6 +205,22 @@ describe('healthResponseSchema', () => {
     );
     expect(healthResponseSchema.safeParse({ status: 'ok', db: 'ok', version: '' }).success).toBe(false);
   });
+
+  it('accepts the 503 a failing probe answers (PR-04), and only with both fields errored', () => {
+    // The probe is real from PR-04 on, so the failure is a designed answer whose body is the same DTO —
+    // which is why `health.routes.ts` may return it without inventing a second response type.
+    expect(healthResponseSchema.safeParse({ status: 'error', db: 'error', version: '0.1.0' }).success).toBe(
+      true,
+    );
+    // Paired, never mixed: a route that reports a broken database while claiming to be healthy is a bug.
+    expect(healthResponseSchema.safeParse({ status: 'error', db: 'ok', version: '0.1.0' }).success).toBe(
+      false,
+    );
+    // And there is no third state.
+    expect(
+      healthResponseSchema.safeParse({ status: 'degraded', db: 'degraded', version: '0.1.0' }).success,
+    ).toBe(false);
+  });
 });
 
 describe('isoDateTimeSchema', () => {

@@ -19,7 +19,10 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       // The bootstrap is exercised by the acceptance checks (a real `listen()`), not by unit tests,
       // and generated/typed route files arrive in later PRs.
-      exclude: ['src/index.ts', 'src/**/*.test.ts'],
+      //
+      // `src/test/**` and `*.int.test.ts` are excluded because the integration suite (PR-04) is the only
+      // place they load: reporting them here as 0% would describe a scope this config never runs.
+      exclude: ['src/index.ts', 'src/**/*.test.ts', 'src/**/*.int.test.ts', 'src/test/**'],
       /**
        * No `thresholds` yet, deliberately: §14's server rows are `src/{crypto,domain}` (armed by
        * PR-06, which creates those directories) and `src/{services,db,routes}` (armed by PR-04 in

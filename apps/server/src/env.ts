@@ -179,7 +179,7 @@ export function parseEnv(source: EnvSource = process.env): Env {
  * `apps/.env`, and the depth changes again once the file is compiled into `apps/server/dist/`.
  * Walking up to a marker file is the one expression that stays true in all three places.
  */
-export function repoRoot(startDir: string = import.meta.dirname): string {
+export function repoRoot(startDir: string = import.meta.dirname ?? process.cwd()): string {
   let dir = path.resolve(startDir);
   for (;;) {
     if (existsSync(path.join(dir, 'pnpm-workspace.yaml'))) return dir;
@@ -194,8 +194,18 @@ export function repoRoot(startDir: string = import.meta.dirname): string {
   }
 }
 
-/** The file `loadDevEnvFile()` reads: `$DOTENV_PATH`, else `<repo root>/.env`. */
-export function dotenvPath(source: EnvSource = process.env, startDir: string = import.meta.dirname): string {
+/**
+ * The file `loadDevEnvFile()` reads: `$DOTENV_PATH`, else `<repo root>/.env`.
+ *
+ * The `?? process.cwd()` on the default is for `drizzle.config.ts`, the one consumer that is not run as ESM:
+ * drizzle-kit bundles the config graph to CommonJS, where `import.meta.dirname` is `undefined` and
+ * `path.resolve(undefined)` fails with Node's `paths[0]` type error instead of anything naming this file. Both
+ * walk-up defaults (`dotenvPath()` and `repoRoot()`) keep the same fallback so the two cannot drift.
+ */
+export function dotenvPath(
+  source: EnvSource = process.env,
+  startDir: string = import.meta.dirname ?? process.cwd(),
+): string {
   const override = source.DOTENV_PATH;
   if (typeof override === 'string' && override.trim() !== '') return override;
   return path.join(repoRoot(startDir), '.env');

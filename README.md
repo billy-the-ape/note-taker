@@ -49,8 +49,12 @@ invocation, always run from the repo root — the same rule PR-18 follows for `d
 docker compose --env-file .env -f docker/compose.dev.yml <up|down|ps|logs>
 ```
 
-There is nothing to migrate or seed yet: `pnpm db:migrate` arrives with PR-04 (schema + migration
-runner) and `pnpm db:seed` with PR-09 (demo data), and there is no `make` target pretending otherwise.
+The database is real from PR-04 on: `make db-up`, then `pnpm db:migrate` applies the committed migrations in
+`apps/server/migrations/`, and `pnpm dev` (or `node apps/server/dist/index.js`) runs the same migration runner
+at boot before it starts listening, so a fresh volume is servable without a second command. `pnpm test:integration`
+is the only test suite that needs a database; `pnpm test` never touches one. `pnpm db:seed` (demo data) arrives
+with PR-09, and there is no `make` target pretending otherwise. `docs/DATA-MODEL.md` documents the schema, the
+indexes and the invariants the server relies on.
 
 ## It will become:
 

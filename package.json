@@ -17,6 +17,9 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "test:integration": "pnpm -r test:integration",
+    "coverage:integration": "pnpm -r coverage:integration",
+    "db:generate": "pnpm -r db:generate",
+    "db:migrate": "pnpm -r db:migrate",
     "coverage": "pnpm -r coverage"
   },
   "devDependencies": {

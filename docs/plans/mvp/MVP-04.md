@@ -45,9 +45,10 @@ no secrets, only dev defaults.
 
 ## 4. The schema (reproduce exactly; it is the contract PR-06/07/09/10 build on)
 
-UUID PKs — **UUIDv7 preferred**: one `newId()` helper wrapping `@uuidjs/uuid-v7`; Node's `crypto.randomUUID()` (v4) is
-an acceptable fallback because nothing in the MVP orders rows by id. Either way there is **exactly one `newId()`** and
-every insert goes through it.
+UUID PKs — **UUIDv7 preferred**: one `newId()` helper wrapping `uuid`'s `v7` (the scoped `@uuidjs/uuid-v7` first
+named here has never been published, so PR-04 shipped `uuid` and corrected this line and §5); Node's
+`crypto.randomUUID()` (v4) is an acceptable fallback because nothing in the MVP orders rows by id. Either way there
+is **exactly one `newId()`** and every insert goes through it.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid() fallback for defaults
@@ -190,9 +191,10 @@ No soft-delete/trash (backlog PR-23): deletes are hard, guarded by a typed confi
   (`coverage:integration` adds `--coverage`), plus root passthroughs.
   Without the inline `NODE_ENV` these commands hit the missing-`NODE_ENV` failure or run with the loader disabled, and
   the acceptance below cannot pass.
-- `apps/server/package.json` deps: `drizzle-orm`, `postgres`, `@uuidjs/uuid-v7`; dev: `drizzle-kit`,
-  `@vitest/coverage-v8`. Pin the `postgres` version — **PR-19 declares the same version as a devDependency of
-  `apps/web`** for its e2e DB reader.
+- `apps/server/package.json` deps: `drizzle-orm`, `postgres`, `uuid`; dev: `drizzle-kit`,
+  `@vitest/coverage-v8`. `uuid` (its `v7`) replaces the `@uuidjs/uuid-v7` this brief first named — that scoped
+  package has never been published. Pin the `postgres` version — **PR-19 declares the same version as a
+  devDependency of `apps/web`** for its e2e DB reader.
 - `apps/server/src/index.ts` — call the migration runner before `listen()`.
 - `.github/workflows/CI.yml` — add the `integration` job: `services: postgres:16` with `POSTGRES_PASSWORD: test` and an
   exported `DATABASE_URL`, then `pnpm build:packages && pnpm test:integration`, **plus the `pnpm coverage:integration`

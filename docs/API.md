@@ -84,7 +84,7 @@ conflict (plan §11.4).
 
 | # | Method + path | Auth | Request | Success | Lands in |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `GET /api/health`, `GET /api/healthz` | none | — | `{status:'ok', db:'ok', version}` | **PR-05** (the probe; `db` is a placeholder until PR-04 wires the pool) |
+| 1 | `GET /api/health`, `GET /api/healthz` | none | — | `200 {status:'ok', db:'ok', version}`, or `503 {status:'error', db:'error', version}` when the pool does not answer | **PR-05** (the DTO) + **PR-04** (a real `SELECT 1`; the probe is not a placeholder any more) |
 | 2 | `GET /api/auth/status` | none | — | `{needsSetup, registrationOpen}` | PR-07 |
 | 3 | `POST /api/auth/setup` | none, only while `needsSetup` | `registerSchema` | `200 {user}` + cookie | PR-07 |
 | 4 | `POST /api/auth/register` | none, only when registration is open **and** an owner exists | `registerSchema` | `201 {user}` + cookie | PR-07 |

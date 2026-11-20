@@ -171,12 +171,19 @@ export function apiErrorCodeForStatus(status: number): ApiErrorCode | undefined 
   return STATUS_TO_CODE.get(status);
 }
 
-/** `GET /api/health` and `GET /api/healthz` (plan §9.2 #1) — `db` is a real probe from PR-04 on. */
-export const healthResponseSchema = z.object({
-  status: z.literal('ok'),
-  db: z.literal('ok'),
-  version: z.string().min(1),
-});
+/**
+ * `GET /api/health` and `GET /api/healthz` (plan §9.2 #1).
+ *
+ * PR-04 wired the probe, so there are exactly two answers and both are described here: a `200` answers
+ * `{status:'ok', db:'ok', version}`, and the `503` a probe that failed to answer sends
+ * `{status:'error', db:'error', version}`. They are paired rather than independent fields, because a route
+ * that reports the database as broken while claiming to be healthy is a bug, not a state — which is also why
+ * `{status:'ok', db:'error'}` stays rejected.
+ */
+export const healthResponseSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('ok'), db: z.literal('ok'), version: z.string().min(1) }),
+  z.object({ status: z.literal('error'), db: z.literal('error'), version: z.string().min(1) }),
+]);
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 
 /**

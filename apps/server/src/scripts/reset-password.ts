@@ -54,7 +54,7 @@ import { loadDevEnvFile, parseEnv } from '../env.js';
 
 const SCRIPT_NAME = 'reset-password';
 
-/** Anything the operator can fix by typing something else, reported with usage and exit `2`/`1`. */
+/** Anything the operator can fix by typing something else, reported as one line on stderr with exit `1`. */
 class UsageError extends Error {}
 
 const USAGE = `usage: ${SCRIPT_NAME} <username> [new-password]
@@ -177,15 +177,18 @@ export async function run(options: RunOptions): Promise<number> {
   const err = options.err ?? process.stderr;
   const [username, passwordFromArgv] = options.argv;
 
+  // The one path that prints usage *and* exits `2`: no username was given, so there is nothing to fix by
+  // retyping a password and no `UsageError` to report. A `UsageError` — the name is about the operator's input,
+  // not about this exit code — is always one line on stderr and exit `1`.
   if (username === undefined || username === '--help' || username === '-h') {
     (username === undefined ? err : out).write(`${USAGE}\n`);
     return username === undefined ? 2 : 0;
   }
 
-  // Whether the database has been written to yet, which decides whether the operator is told "nothing
-  // changed". After the hash lands, half the work *is* done, and saying otherwise would send them to
-  // `UPDATE users` by hand.
-  let wrote = false;
+  // Whether the database has been written to yet used to decide what the operator is told, and the reason it no
+  // longer does is the reason this whole block is one transaction: once the hash was written and the revocation
+  // had not run, "nothing was changed" would have been a lie, and the honest sentence sent people to `UPDATE
+  // users` by hand with every session of the account still valid. There is no such middle state any more.
   try {
     const password = await readNewPassword(passwordFromArgv, out);
     assertUsablePassword(username, password);
@@ -198,28 +201,32 @@ export async function run(options: RunOptions): Promise<number> {
       throw new UsageError(`no account named ${username}`);
     }
 
-    const updated = await setUserPassword(db, {
-      userId: user.id,
-      passwordHash: await createArgon2Hasher().hash(password),
-    });
-    if (updated === undefined) {
-      // Deleted between the read and the write. Not something a keyboard can do on purpose, and answering that
-      // the password was set would be the worse lie.
-      throw new UsageError(`no account named ${username}`);
-    }
-    wrote = true;
+    // Hashed outside the transaction: it is the half a second of argon2, and there is no reason to hold a row
+    // lock on `users` through it (the same argument as `services/auth.service.ts`).
+    const passwordHash = await createArgon2Hasher().hash(password);
 
-    // Every device goes. The point of a reset is that whoever held the old password cannot stay signed in, and
-    // unlike `POST /api/auth/password` there is no acting cookie to keep, so this is the whole table for one
-    // user rather than the table minus one row.
-    const revoked = await deleteSessionsOfUser(db, { userId: user.id });
+    const revoked = await db.transaction(async (tx) => {
+      const updated = await setUserPassword(tx, { userId: user.id, passwordHash });
+      if (updated === undefined) {
+        // Deleted between the read and the write. Not something a keyboard can do on purpose, and answering that
+        // the password was set would be the worse lie.
+        throw new UsageError(`no account named ${username}`);
+      }
+
+      // Every device goes, atomically with the new hash. The point of a reset is that whoever held the old
+      // password cannot stay signed in, and unlike `POST /api/auth/password` there is no acting cookie to keep,
+      // so this is the whole table for one user rather than the table minus one row.
+      return await deleteSessionsOfUser(tx, { userId: user.id });
+    });
 
     out.write(`password updated for ${user.username}; ${String(revoked)} session(s) signed out\n`);
     return 0;
   } catch (error) {
     const isUsage = error instanceof UsageError;
     err.write(`${SCRIPT_NAME}: ${isUsage ? error.message : describeUnexpected(error)}\n`);
-    if (!isUsage && !wrote) err.write(`${SCRIPT_NAME}: nothing was changed\n`);
+    // True unconditionally now, which is what the transaction above buys: either both statements committed or
+    // neither did, so a failure at any point leaves the old password and every old session exactly as they were.
+    if (!isUsage) err.write(`${SCRIPT_NAME}: nothing was changed\n`);
     return 1;
   } finally {
     // The pool is the only reason this process could still be alive, and it is a singleton: closing it is what

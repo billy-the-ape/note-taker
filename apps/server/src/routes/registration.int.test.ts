@@ -183,6 +183,56 @@ describe('POST /api/auth/register (§9.2 #4)', () => {
       { db: testDb(), env: { ALLOW_REGISTRATION: 'true' } },
     );
   });
+
+  it('throttles a sweep of usernames by address, and records the taken ones', async () => {
+    await withApp(
+      async (app) => {
+        await ownerJar(app);
+
+        // Four attempts at names, three of them a `409`. Under a username-keyed window every one of these would
+        // have been a fresh budget — which is the entire reason this window is the address's
+        // (`registerRateLimitKey` in `http/rate-limit.ts`): the attack plan §17 worries about is a *sweep*, and a
+        // sweep renames itself. `LOGIN_RATE_LIMIT_MAX=3` keeps the proof to four argon2 hashes instead of eleven.
+        expect((await register(app, 'colleague')).statusCode).toBe(201); // slot 1
+        for (const username of ['colleague', 'COLLEAGUE']) {
+          expect((await register(app, username)).statusCode).toBe(409); // slots 2 and 3
+        }
+
+        const refused = await register(app, 'Colleague');
+        expect(refused.statusCode).toBe(429);
+        expect(refused.json()).toMatchObject({ error: { code: 'RATE_LIMITED' } });
+        expect(Number(refused.headers['retry-after'])).toBeGreaterThan(0);
+
+        // The other address still has its own window: this is a memory of one address, not a punishment for a
+        // name. It is a `409` rather than a `429`, which is the same answer the same request got a moment ago.
+        const elsewhere = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.register,
+          payload: { username: 'colleague', password: MEMBER_PASSWORD },
+          remoteAddress: '198.51.100.9',
+        });
+        expect(elsewhere.statusCode).toBe(409);
+
+        // Plan §9.2 #4's other half: every one of these is a durable row, so an operator can see the sweep after
+        // the process forgets it. `lower(username)` is the key even though two of the names were typed upper-case,
+        // and the request the window refused contributed nothing — the count that would grow on a flood is the
+        // one thing this endpoint must not do.
+        expect(
+          await catalogRows(
+            sql`select user_key, succeeded, count(*)::int as n from auth_attempts where user_key <> 'owner' group by 1, 2 order by 1, 2`,
+          ),
+        ).toEqual([
+          { user_key: 'colleague', succeeded: false, n: 3 },
+          { user_key: 'colleague', succeeded: true, n: 1 },
+        ]);
+
+        // …and the flood created nobody: one owner, one member, and one settings row each.
+        expect(await catalogRows(sql`select count(*)::int as n from users`)).toEqual([{ n: 2 }]);
+        expect(await catalogRows(sql`select count(*)::int as n from settings`)).toEqual([{ n: 2 }]);
+      },
+      { db: testDb(), env: { ALLOW_REGISTRATION: 'true', LOGIN_RATE_LIMIT_MAX: '3' } },
+    );
+  });
 });
 
 describe('POST /api/users and GET /api/users (§9.2 #10, #11)', () => {

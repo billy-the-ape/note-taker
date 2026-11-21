@@ -19,10 +19,13 @@
  *   `POST /api/auth/login` cannot enumerate accounts or measure the password policy — the same reasoning that
  *   makes `loginSchema` permissive in the contract.
  * * **`auth_attempts` records credential outcomes; the sliding window does the blocking.** A login that
- *   succeeded and one that failed both get a durable row. A request the limiter refused does not: it never
- *   checked a credential, and letting a blocked client write a row per attempt turns a lockout into a way to
- *   fill someone's disk. (`POST /api/auth/register` records the account it created; a refusal there is the
- *   operator's `ALLOW_REGISTRATION` or the one-owner rule, which is not an attempt on anything.)
+ *   succeeded and one that failed both get a durable row, and so does a self-sign-up whose username was taken:
+ *   plan §9.2 #4 asks for both halves on `register`, and a taken-username flood is an enumeration of accounts.
+ *   A request the limiter refused gets no row on either endpoint: it never checked a credential, and letting a
+ *   blocked client write a row per attempt turns a lockout into a way to fill someone's disk. The two `403`s on
+ *   `register` are refused for the same reason — `ALLOW_REGISTRATION` is off, or the install has no owner — they
+ *   are the instance saying "not here", not an attempt on anything, and an unauthenticated flood would grow the
+ *   audit table for free.
  * * **`POST /api/auth/setup` is deliberately not rate-limited** (plan §9.2 #3): there is no credential to guess
  *   before the install exists, and the one-owner index is the thing that actually stops a second attempt.
  */
@@ -40,6 +43,7 @@ import {
 } from '../db/repositories/sessions.repo.js';
 import {
   createUserWithSettings,
+  isUsernameTakenConflict,
   listUsers,
   ownerExists,
   setUserPassword,
@@ -47,7 +51,7 @@ import {
 } from '../db/repositories/users.repo.js';
 import type { User } from '../db/schema.js';
 import { ConflictError, ForbiddenError, RateLimitedError, UnauthorizedError } from '../domain/errors.js';
-import { loginRateLimitKey, type RateLimiter } from '../http/rate-limit.js';
+import { loginRateLimitKey, type RateLimiter, registerRateLimitKey } from '../http/rate-limit.js';
 
 /** What a request carried with it that a session row records about the device. */
 export interface RequestFacts {
@@ -197,14 +201,23 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
   /**
    * `POST /api/auth/register` — self-sign-up; the account is always a `member`.
    *
-   * Two doors, in this order: the limiter (so a flood costs a map lookup rather than argon2), then the flag
+   * Three doors, in this order: the limiter (so a flood costs a map lookup rather than argon2), then the flag
    * (the operator's choice), then the owner row (the install's state). The third is not redundant with the
    * second: without it, the first visitor to a fresh database with `ALLOW_REGISTRATION=true` creates a
    * `member`, `needsSetup` is false forever, and the install is left with no owner and no `/setup` —
    * recoverable only by editing the database by hand (plan §9.2 #4).
+   *
+   * The window is the **address's**, not the username's ({@link registerRateLimitKey} says why: the failure
+   * being throttled is a sweep of usernames, and a username-keyed window is evaded by typing a new one every
+   * request), and every attempt spends a slot — including the ones answered `403`, which is what keeps a flood
+   * from reading the role query over and over. Plan §9.2 #4 asks for "rate-limited + `auth_attempts` like
+   * login", so the taken-username `CONFLICT` writes a `succeeded=false` row too: one window's worth of guesses
+   * per address (10 per 15 minutes unless the operator moves `LOGIN_RATE_LIMIT_MAX`), each with a durable line
+   * for the operator, is the shape of the username enumeration the plan names as the reason
+   * `ALLOW_REGISTRATION` defaults to off.
    */
   async function register(input: CreateAccountInput, facts: RequestFacts): Promise<SignedIn> {
-    refuseWhenRateLimited(input.username, facts.ip);
+    takeWhenRateLimited(registerRateLimitKey(facts.ip));
 
     if (!allowRegistration) {
       throw new ForbiddenError('self-sign-up is closed on this instance');
@@ -213,12 +226,24 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
       throw new ForbiddenError('this instance has no owner yet, so only setup can create accounts');
     }
 
-    const user = await createUserWithSettings(db, {
-      username: input.username,
-      passwordHash: await passwords.hash(input.password),
-      role: 'member',
-      displayName: input.displayName ?? null,
-    });
+    let user: User;
+    try {
+      user = await createUserWithSettings(db, {
+        username: input.username,
+        passwordHash: await passwords.hash(input.password),
+        role: 'member',
+        displayName: input.displayName ?? null,
+      });
+    } catch (error) {
+      // Only the username index is an attempt on something. The one-owner `CONFLICT` cannot reach this path (the
+      // role is `member`, and `users_one_owner_uidx` is partial on `role='owner'`), and any other failure is a
+      // bug that must arrive at the handler unmapped — so neither gets an audit row.
+      if (isUsernameTakenConflict(error)) {
+        await recordAuthAttempt(db, { userKey: attemptKey(input.username), succeeded: false });
+      }
+      throw error;
+    }
+
     await recordAuthAttempt(db, { userKey: attemptKey(input.username), succeeded: true });
     return signIn(user, facts);
   }
@@ -228,12 +253,14 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
    *
    * Order matters twice over. The limiter is consulted **before** argon2, so a flood costs a map lookup rather
    * than 64 MiB per request — which would turn a brute-force attempt into denial of service on a machine with
-   * 128 MiB to spare. And the failure path is a single `throw`: the unknown-user branch runs the dummy verify
-   * first and then falls into the same statement, so "no such user" and "wrong password" cannot be told apart
-   * by the message, the code, or the time it took.
+   * 128 MiB to spare — and consulting it *takes the slot* rather than asking whether one is free: N
+   * simultaneous guesses would all see an empty window and all reach argon2, which is how the eleventh bad login
+   * stops being the eleventh. And the failure path is a single `throw`: the unknown-user branch runs the dummy
+   * verify first and then falls into the same statement, so "no such user" and "wrong password" cannot be told
+   * apart by the message, the code, or the time it took.
    */
   async function login(input: LoginInput, facts: RequestFacts): Promise<SignedIn> {
-    refuseWhenRateLimited(input.username, facts.ip);
+    takeWhenRateLimited(loginRateLimitKey(input.username, facts.ip));
 
     const user = await userByUsername(db, input.username);
     const passwordMatches =
@@ -242,7 +269,8 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
         : await passwords.verify(user.passwordHash, input.password);
 
     if (!passwordMatches || user === undefined) {
-      rateLimiter.recordFailure(loginRateLimitKey(input.username, facts.ip));
+      // Nothing records the failure here: `take` already charged this attempt the moment it arrived, and
+      // charging it twice would make the window tighten by one every time it is reported.
       await recordAuthAttempt(db, { userKey: attemptKey(input.username), succeeded: false });
       throw new UnauthorizedError('wrong username or password');
     }
@@ -254,9 +282,13 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
     return signIn(user, facts);
   }
 
-  /** `429 RATE_LIMITED` with the window's own `Retry-After`, or nothing to complain about. */
-  function refuseWhenRateLimited(username: string, ip: string): void {
-    const decision = rateLimiter.check(loginRateLimitKey(username, ip));
+  /**
+   * Takes a slot in `key`'s window, and answers `429 RATE_LIMITED` with the window's own `Retry-After` if the
+   * window was already full. Takes rather than asks — see {@link RateLimiter.take} for why a check that records
+   * nothing is not a rate limit on an endpoint whose work is asynchronous.
+   */
+  function takeWhenRateLimited(key: string): void {
+    const decision = rateLimiter.take(key);
     if (decision.allowed) return;
     throw new RateLimitedError(undefined, { retryAfterSeconds: decision.retryAfterSeconds });
   }
@@ -270,13 +302,20 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
   /**
    * `POST /api/auth/password` — rotate the password, keep this device, sign out every other one.
    *
-   * Three statements, and the order is the design. Write the new hash first, so a failure part-way through
-   * leaves a working (if unchanged) account rather than a session nobody can authenticate as. Then delete
-   * every *other* session of this user. Then **rotate this session's token hash in place**, so the acting
-   * session survives as the same row — same `created_at`, same `user_agent` — while the cookie it was
+   * Three statements in **one transaction**. This is the endpoint you reach for when someone else is signed in
+   * as you, so the half-applied version — the new hash committed, the sweep of the other sessions failed, `500`
+   * to the caller and the stolen session still alive — is precisely the state it must not be able to leave
+   * behind. `docs/API.md` row 9 says "one transaction"; here it is, with the two statements' repositories
+   * taking `DbOrTx` so they can be embedded. Order inside the transaction is still the design: write the new
+   * hash, delete every *other* session of this user, then **rotate this session's token hash in place** so the
+   * acting row survives as the same row — same `created_at`, same `user_agent` — while the cookie it was
    * authenticated with stops working. Plan §9.2 #9 asks for both halves ("rotates … the acting session
    * survives"); a delete-then-insert would satisfy only the first, and would leave the old cookie valid until
    * its `Max-Age` if the insert half failed.
+   *
+   * The argon2 hash is computed **before** the transaction opens: it is the step that costs half a second and
+   * 64 MiB, and a row lock held across it would let one slow client block the next password change of the same
+   * account, which is the same request doing two denial-of-service tricks at once.
    */
   async function changePassword(input: ChangePasswordInput): Promise<IssuedSession> {
     const currentMatches = await passwords.verify(input.user.passwordHash, input.currentPassword);
@@ -286,31 +325,37 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
       throw new UnauthorizedError('the current password is not right');
     }
 
-    const updated = await setUserPassword(db, {
-      userId: input.user.id,
-      passwordHash: await passwords.hash(input.newPassword),
-    });
-    if (updated === undefined) {
-      // The account was deleted while this request was in flight — which, for `role='owner'`, is the whole
-      // install disappearing. Nothing here may create a user as a side effect, so this is a refusal.
-      throw new UnauthorizedError('this account no longer exists');
-    }
-
-    await deleteSessionsOfUser(db, { userId: input.user.id, exceptTokenHash: input.actingTokenHash });
-
+    // Both are decided before the transaction opens, so that nothing asynchronous is awaited inside it and so
+    // that the token handed to the caller below is the same one whose hash is written above — whichever of the
+    // two statements fails, the cookie is never issued for a row that does not exist.
+    const passwordHash = await passwords.hash(input.newPassword);
     const token = newToken();
     const expiresAt = sessionExpiresAt(sessionTtlDays, now());
-    const rotated = await rotateSessionToken(db, {
-      fromTokenHash: input.actingTokenHash,
-      toTokenHash: hashToken(token),
-      expiresAt,
+
+    await db.transaction(async (tx) => {
+      const updated = await setUserPassword(tx, { userId: input.user.id, passwordHash });
+      if (updated === undefined) {
+        // The account was deleted while this request was in flight — which, for `role='owner'`, is the whole
+        // install disappearing. Nothing here may create a user as a side effect, so this is a refusal, and the
+        // rollback takes back the update that made the refusal necessary.
+        throw new UnauthorizedError('this account no longer exists');
+      }
+
+      await deleteSessionsOfUser(tx, { userId: input.user.id, exceptTokenHash: input.actingTokenHash });
+
+      const rotated = await rotateSessionToken(tx, {
+        fromTokenHash: input.actingTokenHash,
+        toTokenHash: hashToken(token),
+        expiresAt,
+      });
+      if (rotated === undefined) {
+        // The session that authenticated this request vanished mid-flight (signed out from another tab). Under
+        // the transaction that is a clean no-op rather than a half-applied change — the password is still the
+        // old one and no other device was touched — so `401` is simply the truth, and the client signs in again.
+        throw new UnauthorizedError('this session is no longer signed in');
+      }
     });
-    if (rotated === undefined) {
-      // The session that authenticated this request vanished mid-flight (signed out from another tab). The
-      // password *is* changed, so answering that the call failed would be a lie, and handing out a cookie for
-      // a row that no longer exists would be worse: say `401` and let the client sign in again.
-      throw new UnauthorizedError('this session is no longer signed in');
-    }
+
     return { token, expiresAt };
   }
 

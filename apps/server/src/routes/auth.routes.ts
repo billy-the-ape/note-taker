@@ -1,5 +1,6 @@
 /**
- * The auth routes: the ten endpoints of plan §9.2 #2–#9 (docs/plans/mvp/MVP-07.md §4).
+ * The auth routes: the eight endpoints of plan §9.2 #2–#9 (docs/plans/mvp/MVP-07.md §4); the other two of the
+ * ten this PR ships are `users.routes.ts`.
  *
  * A route here does four things and no more: parse the body with the shared contract schema, ask
  * `services/auth.service.ts` to do the work, translate a success into cookies and a status code, and let every
@@ -67,9 +68,10 @@ export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, { s
   });
 
   /**
-   * §9.2 #3 — the first-run bootstrap: 200, and the only endpoint that is CSRF-exempt *and* creates something.
-   * 200 rather than 201 because the resource being created is the install, and `POST /setup` against a server
-   * that is already set up is a `409`, not a second creation.
+   * §9.2 #3 — the first-run bootstrap: 200; CSRF-exempt like `register` and `login`, because the caller has no
+   * cookie yet (see `CSRF_EXEMPT_ROUTES` in `plugins/csrf.ts`, which lists exactly those three). 200 rather than
+   * 201 because the resource being created is the install, and `POST /setup` against a server that is already
+   * set up is a `409`, not a second creation.
    */
   app.post(ROUTES.auth.setup, async (request, reply) => {
     const input = setupSchema.parse(request.body);
@@ -78,7 +80,9 @@ export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, { s
 
   /**
    * §9.2 #4 — self-sign-up: 201. `403` when `ALLOW_REGISTRATION` is off or no owner exists yet, `409` when the
-   * username is taken, `429` when this address has tried and failed too often.
+   * username is taken — which also writes an `auth_attempts` row — and `429` when this address has tried too
+   * often. That window is keyed by the address, not by the username: what it throttles is a sweep of usernames,
+   * and a username-keyed window is evaded by typing a new one every request (`http/rate-limit.ts`).
    */
   app.post(ROUTES.auth.register, async (request, reply) => {
     const input = setupSchema.parse(request.body);

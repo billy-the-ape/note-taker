@@ -119,6 +119,22 @@ export function mapUsernameOrOwnerConflict(error: unknown): unknown {
 }
 
 /**
+ * Is this the `CONFLICT` this file creates for `users_username_lower_uidx`, and not the one it creates for
+ * `users_one_owner_uidx`?
+ *
+ * The two arrive as the same class, and only the field detail says which index fired — which is exactly what
+ * `POST /api/auth/register` needs, because a taken username is an attempt on the account list and earns an
+ * `auth_attempts` row, while a second-owner race is a fact about the install. The coupling to the mapping above
+ * is deliberate and it is one screen away: a caller that had to re-read the SQLSTATE would be reading an error
+ * this module already interpreted, badly.
+ */
+export function isUsernameTakenConflict(error: unknown): boolean {
+  return (
+    error instanceof ConflictError && (error.details?.some((detail) => detail.path === 'username') ?? false)
+  );
+}
+
+/**
  * The one username lookup in the codebase: case-insensitive, so `Bob` and `bob` are one account, and
  * parameterised so the `lower()` is a function over a bind value rather than a string anyone assembled.
  */
@@ -156,13 +172,17 @@ export async function ownerExists(db: Db): Promise<boolean> {
  * That column is the only evidence an operator has of when a credential last changed, and a reset that
  * leaves it at row-creation time makes "has anyone rotated since the incident?" unanswerable. `undefined`
  * means the id was not there (a deleted user), which the caller renders as `NOT_FOUND`.
+ *
+ * `DbOrTx`, because both of its callers have to be atomic: "the password changed and my other devices are
+ * still signed in" is the failure this row is supposed to make impossible, so the write is one statement inside
+ * a transaction whose other half deletes the sessions (`auth.service.ts`, `reset-password.ts`).
  */
 export async function setUserPassword(
-  db: Db,
+  executor: DbOrTx,
   input: { readonly userId: string; readonly passwordHash: string },
 ): Promise<User | undefined> {
   const now = new Date();
-  const updated = await db
+  const updated = await executor
     .update(users)
     .set({ passwordHash: input.passwordHash, passwordSetAt: now, updatedAt: now })
     .where(eq(users.id, input.userId))

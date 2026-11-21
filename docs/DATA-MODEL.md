@@ -76,7 +76,8 @@ Column types are what `information_schema` reports after `pnpm db:migrate`.
 password) and replaced only through `setUserPassword()`, the single statement that also moves
 `password_set_at` — the only evidence after the fact that a credential was rotated. The one supported
 recovery path is `apps/server/src/scripts/reset-password.ts`, which updates those two columns and `DELETE`s
-that user's `sessions` rows, and touches nothing else: every other `user_id` foreign key in this file is
+that user's `sessions` rows **in one transaction** (there is no state in which the password changed and the
+sessions survived), and touches nothing else: every other `user_id` foreign key in this file is
 `ON DELETE CASCADE`, so "delete the account and create it again" is data destruction followed by a
 `POST /api/auth/setup` that answers `409` forever. `src/scripts/reset-password.int.test.ts` runs the script
 as a subprocess and asserts the notes, folders and settings of the account are still there afterwards.
@@ -149,11 +150,13 @@ a user row created by a fixture or a future import path.
 | `succeeded` | `boolean NOT NULL`                       | only failures count against the lockout (PR-07)            |
 | `at`        | `timestamptz NOT NULL DEFAULT now()`     | written by the caller; `between` filters are bound as timestamp parameters |
 
-Append-only, never cascaded (it has no `user_id`). PR-07 writes the rows and reads them back through
-`auth_attempts_key_at_idx`; retention is not its job — plan §17 gives the prune job to PR-20's maintenance
-cron, which is also what that index exists for. A self-hosted note app has too few login attempts for a
-retention rule to be a real problem before then, and inventing one here would delete the audit trail the
-rows exist to be.
+Append-only, never cascaded (it has no `user_id`). PR-07 writes a row for every credential outcome it is asked
+about — each login attempt, either answer, and each self-sign-up whose username was already taken — and none for
+a request a rate window refused, on either endpoint: a blocked client would otherwise grow this table for free.
+It reads them back through `auth_attempts_key_at_idx`; retention is not its job — plan §17 gives the prune job to
+PR-20's maintenance cron, which is also what that index exists for. A self-hosted note app has too few login
+attempts for a retention rule to be a real problem before then, and inventing one here would delete the audit
+trail the rows exist to be.
 
 ## 3. The root, and why the sibling indexes use `COALESCE`
 
@@ -238,6 +241,7 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | `word_count` / `content_bytes` / `content_updated_at` always exist | `NOT NULL DEFAULT 0/now()` | `schema.int.test.ts` (defaults present) + `notes.repo.int.test.ts` (an insert without them) |
 | Ciphertext is never plaintext | no plaintext column, flag or code path; `crypto/envelope.ts` is the only writer (PR-06) | the column list above; `notes.repo.int.test.ts` round-trips bytes that are not valid UTF-8 |
 | One `settings` row per user, in the user's own transaction | `user_id` is the PK, and `insertUserWithSettings()` is the only writer that pairs them | `schema.int.test.ts` (the fixture's two users get one row each); `users.repo.int.test.ts` (a transaction aborted between the two inserts leaves neither row) |
+| A password change changes the password and revokes the other devices together | one transaction in `auth.service.ts` — `setUserPassword`, `deleteSessionsOfUser` and `rotateSessionToken` all run on the caller's `tx` | `services/auth.service.int.test.ts` (a change whose last statement fails leaves the old hash and both sessions exactly as they were, and still refuses with the service's own `401`) |
 | An install has an owner before anyone joins | `users_one_owner_uidx` here + `auth.service.ts`'s two guards | `routes/registration.int.test.ts` (`POST /api/auth/register` answers `403` on an empty database even with `ALLOW_REGISTRATION=true`, and `needsSetup` stays `true`) |
 
 ## 7. How the schema is built and checked

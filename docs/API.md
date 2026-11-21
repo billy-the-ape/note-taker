@@ -67,10 +67,14 @@ Status is **not** the discriminator: `CONFLICT` and `VERSION_CONFLICT` share 409
 to `CONFLICT`/409 rather than an unexplained 500 — all three are retryable, and a client that saw 500
 would not retry.
 
-One number a client may act on is not in the body: a `429` from the login rate limit carries
-`Retry-After` in whole seconds — the time the sliding window itself reports — and nothing else writes
-that header. The envelope above has nine codes and no retry shape, so the seconds stay a header instead
-of becoming a field only one endpoint had (**PR-07**).
+One number a client may act on is not in the body: a `429` from a rate limit carries `Retry-After` in whole
+seconds — the time the sliding window itself reports — and nothing else writes that header. The envelope above
+has nine codes and no retry shape, so the seconds stay a header instead of becoming a field only one endpoint
+had (**PR-07**). Two properties of the window are worth stating where a client reads about it: it counts
+**attempts**, and a slot is taken synchronously when the request arrives rather than when its outcome is known,
+so `N` simultaneous guesses cannot all pass the gate and then all be verified; and it counts **failed** logins
+as failures only in the sense that a successful login gives the whole window back, so one mistyping person at a
+shared address cannot lock the household out of the account next door.
 
 The two `data` shapes plan §9.1 pins:
 
@@ -92,12 +96,12 @@ conflict (plan §11.4).
 | 1 | `GET /api/health`, `GET /api/healthz` | none | — | `200 {status:'ok', db:'ok', version}`, or `503 {status:'error', db:'error', version}` when the pool does not answer | **PR-05** (the DTO) + **PR-04** (a real `SELECT 1`; the probe is not a placeholder any more) |
 | 2 | `GET /api/auth/status` | none | — | `{needsSetup, registrationOpen}` | **PR-07** (issues `note_csrf`; `registrationOpen` mirrors the operator's flag and is not conditioned on `needsSetup`) |
 | 3 | `POST /api/auth/setup` | none, only while `needsSetup` | `registerSchema` | `200 {user}` + cookie | **PR-07** (`409 CONFLICT` once an owner exists — including a different username, where `users_one_owner_uidx` is the guard rather than the `needsSetup` read) |
-| 4 | `POST /api/auth/register` | none, only when registration is open **and** an owner exists | `registerSchema` | `201 {user}` + cookie | **PR-07** (`403 FORBIDDEN` when `ALLOW_REGISTRATION=false` **or** when no owner exists yet: an install with zero owners would lock `/setup` out) |
-| 5 | `POST /api/auth/login` | none | `loginSchema` | `200 {user}` + `note_session` | **PR-07** (`401 UNAUTHORIZED` for an unknown username and a wrong password alike, one message; `429` + `Retry-After` after `LOGIN_RATE_LIMIT_MAX` failures per `lower(username)`+IP) |
+| 4 | `POST /api/auth/register` | none, only when registration is open **and** an owner exists | `registerSchema` | `201 {user}` + cookie | **PR-07** (`403 FORBIDDEN` when `ALLOW_REGISTRATION=false` **or** when no owner exists yet: an install with zero owners would lock `/setup` out; `429` + `Retry-After` after `LOGIN_RATE_LIMIT_MAX` attempts per **address** — a username-keyed window would be evaded by renaming every request — and a taken username is `409` plus a failed `auth_attempts` row) |
+| 5 | `POST /api/auth/login` | none | `loginSchema` | `200 {user}` + `note_session` | **PR-07** (`401 UNAUTHORIZED` for an unknown username and a wrong password alike, one message; `429` + `Retry-After` after `LOGIN_RATE_LIMIT_MAX` **attempts** per `lower(username)`+IP — the slot is taken as the request arrives, not when it fails, so a burst cannot slip through) |
 | 6 | `POST /api/auth/logout` | yes | — | `204` | **PR-07** (deletes the row; the cleared cookie alone would be replayable from a request that never sends cookies) |
 | 7 | `POST /api/auth/logout-all` | yes | — | `204` | **PR-07** (used by PR-16; deletes every session of the caller) |
 | 8 | `GET /api/auth/session` | optional | — | `{user\|null, expiresAt?}` | **PR-07** (`expiresAt` only with a user; an expired row is deleted on the request that proves it is dead) |
-| 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | **PR-07** (the acting session is rotated and kept, every other session of that user is deleted, and the old password stops working — one transaction) |
+| 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | **PR-07** (the acting session is rotated and kept, every other session of that user is deleted, and the old password stops working — one transaction, so a failure at any of the three statements leaves the old password and every session exactly as they were) |
 | 10 | `POST /api/users` | owner | `createUserSchema` | `201 {user}` | **PR-07** (no `role` in the body, so this route can never mint a second owner; creates no session for the new account) |
 | 11 | `GET /api/users` | owner | — | `usersResponseSchema` (`{users: SessionUser[]}`) | **PR-07** (the whole list, oldest first, unpaginated) |
 | 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | PR-09 |

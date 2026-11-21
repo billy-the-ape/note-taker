@@ -24,7 +24,7 @@
  */
 import { and, eq, ne } from 'drizzle-orm';
 
-import type { Db } from '../client.js';
+import type { Db, DbOrTx } from '../client.js';
 import { expectOne, firstOrNone } from '../rows.js';
 import { type Session, sessions, type User, users } from '../schema.js';
 
@@ -119,12 +119,15 @@ export async function touchSession(
  * "the acting session survives the password change" a sentence about the HTTP response rather than about the
  * row. Postgres rewrites the row and re-indexes it; there is one row per session and one update per
  * password change, so the cost is nothing and the meaning is exact.
+ *
+ * `DbOrTx`: the password change is three statements that have to land together (see
+ * {@link deleteSessionsOfUser}), so this runs inside that transaction rather than beside it.
  */
 export async function rotateSessionToken(
-  db: Db,
+  executor: DbOrTx,
   input: { readonly fromTokenHash: Uint8Array; readonly toTokenHash: Uint8Array; readonly expiresAt: Date },
 ): Promise<Session | undefined> {
-  const updated = await db
+  const updated = await executor
     .update(sessions)
     .set({ tokenHash: input.toTokenHash, expiresAt: input.expiresAt, lastSeenAt: new Date() })
     .where(eq(sessions.tokenHash, input.fromTokenHash))
@@ -148,9 +151,13 @@ export async function deleteSessionByTokenHash(db: Db, tokenHash: Uint8Array): P
  * `POST /api/auth/password` (keep the acting session, which is then rotated by {@link rotateSessionToken}).
  * Returning the count is what lets the routes and the tests say *how many* devices stopped working, which is
  * the difference between a 204 and a 204 that did nothing.
+ *
+ * `DbOrTx` for the second of those: a password change that wrote the new hash and then failed to sweep the
+ * other sessions would answer `500` with the stolen-session case still open, which is the one thing that
+ * endpoint exists to close. Both statements therefore run in the caller's transaction.
  */
 export async function deleteSessionsOfUser(
-  db: Db,
+  executor: DbOrTx,
   input: { readonly userId: string; readonly exceptTokenHash?: Uint8Array },
 ): Promise<number> {
   const where =
@@ -163,6 +170,6 @@ export async function deleteSessionsOfUser(
           ne(sessions.tokenHash, input.exceptTokenHash),
         );
 
-  const deleted = await db.delete(sessions).where(where).returning({ tokenHash: sessions.tokenHash });
+  const deleted = await executor.delete(sessions).where(where).returning({ tokenHash: sessions.tokenHash });
   return deleted.length;
 }

@@ -112,7 +112,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
 /**
  * Puts the authenticated half of the API on an instance: cookie parsing, security headers, the two guards, and
- * the thirteen routes of `auth.routes.ts` + `users.routes.ts`.
+ * the ten routes of `auth.routes.ts` (8) + `users.routes.ts` (2).
  *
  * The order of the first three statements is load-bearing and easy to break later. `@fastify/cookie` has to be
  * registered **before** {@link registerCsrfGuard} adds its `onRequest` hook, because Fastify runs root

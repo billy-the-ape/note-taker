@@ -353,6 +353,45 @@ describe('POST /api/auth/login (§9.2 #5)', () => {
       { db: testDb() },
     );
   });
+
+  it('refuses a burst of simultaneous logins instead of verifying them all', async () => {
+    await withApp(
+      async (app) => {
+        await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.setup,
+          payload: { username: 'owner', password: PASSWORD },
+        });
+        await testDb().execute(sql`delete from sessions`);
+
+        // Three guesses dispatched together, none awaited before the next is sent. Under the limiter this endpoint
+        // first shipped with — ask whether the window is full, verify, *then* record the failure — all three
+        // would have read an empty window on their way in, and the box would have run three argon2 verifications
+        // to answer `401` three times. `take` is synchronous, so exactly `max` requests get a slot and the rest
+        // are refused **whatever order the first ones finish in**: that is the property, and it does not need ten
+        // concurrent 64 MiB verifications to be proven, so `LOGIN_RATE_LIMIT_MAX=2` says the same sentence at a
+        // fifth of the cost — and shows the operator's knob being read by the window rather than defaulted.
+        const burst = await Promise.all(
+          Array.from({ length: 3 }, () => loginAs(app, 'owner', 'not-the-password')),
+        );
+        const codes = burst.map((response) => response.statusCode);
+
+        expect(codes.filter((code) => code === 401)).toHaveLength(2);
+        expect(codes.filter((code) => code === 429)).toHaveLength(1);
+        // …and the one refusal is the same `429` the sequential test inspects, header and all: a burst must not
+        // be answerable with a bare `429` that leaves the client guessing when to come back.
+        const refused = burst.find((response) => response.statusCode === 429);
+        expect(String(refused?.headers['retry-after'])).toMatch(/^[1-9][0-9]*$/);
+
+        // The durable half agrees with the in-memory one: two attempts reached the code that writes rows, and the
+        // refused one wrote nothing — the same rule `registration.int.test.ts` checks from the other side.
+        expect(
+          await catalogRows(sql`select count(*)::int as n from auth_attempts where not succeeded`),
+        ).toEqual([{ n: 2 }]);
+      },
+      { db: testDb(), env: { LOGIN_RATE_LIMIT_MAX: '2' } },
+    );
+  });
 });
 
 describe('GET /api/auth/session (§9.2 #8)', () => {

@@ -20,6 +20,7 @@
     "coverage:integration": "pnpm -r coverage:integration",
     "db:generate": "pnpm -r db:generate",
     "db:migrate": "pnpm -r db:migrate",
+    "generate:key": "pnpm --filter @note-taker/server exec tsx ../../scripts/generate-keys.ts",
     "coverage": "pnpm -r coverage"
   },
   "devDependencies": {

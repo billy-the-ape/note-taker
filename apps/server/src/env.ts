@@ -182,7 +182,7 @@ export type DecodedKey =
   | { readonly ok: true; readonly bytes: Uint8Array }
   | { readonly ok: false; readonly problem: string };
 
-/** `[A-Za-z0-9+/]` with optional `=` padding: the two readers of this file agree on this shape. */
+/** True when the variable is set to something other than whitespace; the base64 shape is checked on decode. */
 function isConfigured(value: string | undefined): value is string {
   return typeof value === 'string' && value.trim() !== '';
 }

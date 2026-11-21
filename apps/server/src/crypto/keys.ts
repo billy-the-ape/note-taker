@@ -45,7 +45,7 @@ import {
 } from '../env.js';
 import { createLogger } from '../logger.js';
 
-/** `NOTES_ENCRYPTION_KEY_VERSION`'s documented default (plan §16). */
+/** `NOTE_ENCRYPTION_KEY_VERSION`'s documented default (plan §16). */
 export const DEFAULT_KEY_VERSION = 1;
 
 /** `notes.key_version` is an `integer`, so a version above this cannot be written at all. */
@@ -124,9 +124,14 @@ function parsePreviousKeys(source: EnvSource, problems: string[]): Map<number, U
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw) as unknown;
-  } catch (error) {
+  } catch {
+    // Deliberately **not** `(error as Error).message`: V8 quotes a snippet of the input around the failing
+    // position — `Unexpected token '"', "{"1":"AbCdEf…"… is not valid JSON` — and this variable holds key
+    // material. The very mistake the hint below warns about (an unquoted inner value mangled by the shell)
+    // would therefore print real key characters into the log this file promises carries only a fingerprint
+    // (rule 4), on both boot and `rotate-note-key.ts`. The shape is all an operator needs to fix it.
     problems.push(
-      `${PREVIOUS_KEYS_VARIABLE} must be a JSON object like {"1":"<base64>"}: ${(error as Error).message} ` +
+      `${PREVIOUS_KEYS_VARIABLE} must be a JSON object like {"1":"<base64>"} ` +
         '(in .env, write the whole value single-quoted so the shell can source the file)',
     );
     return previous;
@@ -140,8 +145,13 @@ function parsePreviousKeys(source: EnvSource, problems: string[]): Map<number, U
 
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!/^\d+$/.test(key)) {
+      // The same rule as the parse failure above: an entry key is arbitrary operator text, and
+      // `{ "<the base64 key>": … }` is a real typo shape, so the offending key's *shape* is reported and its
+      // characters never are.
       problems.push(
-        `${PREVIOUS_KEYS_VARIABLE} has the entry ${JSON.stringify(key)}: keys are key versions, i.e. "1", "2", …`,
+        `${PREVIOUS_KEYS_VARIABLE} has an entry whose key is not a version number ` +
+          `(${key.length} characters, not repeated here because this variable holds key material): ` +
+          'keys are key versions, i.e. "1", "2", …',
       );
       continue;
     }

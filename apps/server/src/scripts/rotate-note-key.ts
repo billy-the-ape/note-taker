@@ -362,9 +362,16 @@ async function rotateBatch(
 }
 
 /**
- * Walks the table to the end. The loop terminates on `rows === 0` because the cursor only ever moves forward
- * — a row that fails to decrypt is skipped, and keyset pagination means it is not selected again next batch
- * (which is why the failure list is reported rather than silently dropped).
+ * Walks the table to the end, and terminates on `rows === 0` and on nothing else: the cursor only ever moves
+ * forward (a row that fails to decrypt is skipped, and keyset pagination means it is not selected again next
+ * batch, which is why the failure list is reported rather than silently dropped), so an empty batch is the only
+ * statement that is ever true at the end of the table.
+ *
+ * A batch shorter than `--batch` is **not** that proof. Each batch is its own READ COMMITTED snapshot, so a row
+ * that a writer commits after this batch's snapshot was taken — the realistic case during a rolling restart,
+ * where an app instance still seals with the retired key — is absent from the result even though its id is
+ * above the cursor. Stopping at `rows < batch` would leave it on the retired key permanently, so the walk pays
+ * one extra cheap query per run instead. `--verify` remains the operator's stopping condition either way.
  */
 export async function rotate(
   db: Db,
@@ -384,7 +391,6 @@ export async function rotate(
     if (batch.rows === 0) break;
     batches += 1;
     cursor = batch.lastId;
-    if (batch.rows < options.batch) break;
     logger.debug({ batch: batches, cursor }, 'rotation batch committed');
   }
 
@@ -394,7 +400,6 @@ export async function rotate(
       batches,
       keyVersion: keyring.current.version,
       dryRun: options.dryRun,
-      failed: summary.failed,
     },
     options.dryRun
       ? `dry run: ${summary.resealed === 0 ? 'nothing would be rewritten' : 'would rewrite rows'} ` +

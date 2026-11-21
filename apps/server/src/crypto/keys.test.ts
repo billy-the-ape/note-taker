@@ -243,6 +243,32 @@ describe('NOTE_ENCRYPTION_KEY_PREVIOUS', () => {
     expect(problemsOf(() => withPrevious(previous))).toContain(phrase);
   });
 
+  /**
+   * These `problems` are logged — at boot and by `rotate-note-key.ts` — and V8's `JSON.parse` message quotes
+   * the input around the failing position, so ~10 real key characters used to ride along (`{"1":CwwNDg8QER` is
+   * what Node 22 printed for the first case below). Both inputs are the shell-mangling mistake the hint in the
+   * message exists to prevent, so the leak was reachable by following the very footgun.
+   */
+  it.each([
+    ['an unquoted value', `{"1":${KEY_1_B64}}`],
+    ['a single-quoted inner value', `{"1":'${KEY_1_B64}"}`],
+  ])('reports %s without repeating key material', (_mistake, previous) => {
+    const problems = problemsOf(() => withPrevious(previous));
+    expect(problems).toContain('must be a JSON object');
+    // The parser's own sentence is what carried the snippet, so its absence is the assertion that matters; the
+    // prefix is the belt to it — V8 truncates, so the whole key was never in one message anyway.
+    expect(problems).not.toMatch(/Unexpected token|is not valid JSON/);
+    expect(problems).not.toContain(KEY_1_B64.slice(0, 10));
+  });
+
+  it('describes a non-version entry key by shape, since an entry key can itself be a key', () => {
+    // `{ "<the base64 key>": "<the base64 key>" }` parses happily and reaches the entry-key branch, which used
+    // to quote the offending key verbatim — the same leak, one branch further down.
+    const problems = problemsOf(() => withPrevious(JSON.stringify({ [KEY_1_B64]: KEY_1_B64 })));
+    expect(problems).toContain('keys are key versions');
+    expect(problems).not.toContain(KEY_1_B64.slice(0, 10));
+  });
+
   it('refuses to shadow the current version', () => {
     // A key that both seals new rows and sits in the decrypt-only map makes `key_version` a lie about
     // which key wrote a row, which is the one thing the column exists for.

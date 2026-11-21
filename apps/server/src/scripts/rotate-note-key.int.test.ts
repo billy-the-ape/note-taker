@@ -12,6 +12,10 @@
  *   wrap — against a row the rotation is walking. Rotation never bumps `notes.version`, so a late autosave is
  *   a legitimate write and must win; if this file ever passes while a real edit could be lost, it is this
  *   file's bug.
+ * * The short-batch test drives the walk's **termination rule**. Every batch is its own READ COMMITTED
+ *   snapshot, so a row a writer commits after that snapshot is missing from a batch that is already short —
+ *   the rolling-restart case, where another instance still seals with the retired key. Ending the walk on
+ *   `rows < batch`, which an earlier revision did, abandons that row on the retired key permanently.
  *
  * The env fixtures are what an operator would set (§7's sequence, with the two operator steps — editing
  * `.env` and restarting the app — already done for us): the old key in `_PREVIOUS`, the new key current, the
@@ -153,6 +157,23 @@ function stored(userId: string, id: string): Promise<Note | undefined> {
 
 function summarise(counts: Map<number, number>): Record<number, number> {
   return Object.fromEntries(counts);
+}
+
+/**
+ * How many sessions are right now blocked on a row lock inside a `… for update` walk of `notes`. Polling this
+ * instead of sleeping a fixed time is what makes the short-batch test deterministic: the condition it needs is
+ * precisely "the script is queued behind the locker", and nothing else.
+ */
+async function blockedWalkers(db: Db): Promise<number> {
+  const rows = (await db.execute(
+    sql`select count(*)::int as waiting
+          from pg_stat_activity
+         where state = 'active' and wait_event_type = 'Lock'
+           and query ilike '%key_version%'
+           and query ilike '%from notes%'
+           and query ilike '%for update%'`,
+  )) as unknown as { waiting: number }[];
+  return rows[0]?.waiting ?? 0;
 }
 
 describe('rotate-note-key', () => {
@@ -378,5 +399,63 @@ describe('rotate-note-key', () => {
     expect(summarise(await rowsPerKeyVersion(testDb()))).toEqual({ 2: 5 });
     const verified = await runRotate(envAfter, ['--verify']);
     expect(verified.code).toBe(0);
+  }, 60_000);
+
+  it('does not mistake a short batch for the end of the table', async () => {
+    const owner = await createOwner(testDb());
+    const first = await seedNote(testDb(), owner.id, 'row-1', 'body 1', keyring1);
+
+    const locker = createDb({ max: 1 });
+
+    try {
+      // One transaction parks the script's first `select … limit 2 for update` on a row lock and commits a
+      // *second* row that is also behind the current version six seconds later — a rolling restart, in which
+      // another instance is still sealing with the retired key. `pg_sleep`, not a hand-held gate, so the commit
+      // lands while that parked statement is mid-scan even when `tsx` takes a second or two to boot; and it
+      // lands after the parked statement took its READ COMMITTED snapshot, so the batch comes back with 1 row
+      // although a higher id exists. A walk that ends on `rows < batch` leaves the new row on the retired key
+      // permanently, and `--verify` only notices on the operator's next command.
+      const inserting = locker.db.transaction(async (tx) => {
+        await tx.execute(sql`select id from notes where id = ${first.id} for update`);
+        await tx.execute(sql`select pg_sleep(6)`);
+        const late = newId(); // v7, so it is above `first.id` by construction
+        await tx.insert(notes).values({
+          id: late,
+          userId: owner.id,
+          name: 'row-2',
+          ...sealNoteContent('body 2', late, keyring1),
+          contentUpdatedAt: new Date(),
+          updatedAt: new Date(),
+        });
+      });
+
+      const running = runRotate(envAfter, ['--batch=2']);
+
+      // Watch for the parked statement instead of sleeping a guess: `pg_stat_activity` shows the script waiting
+      // on the row lock. If nobody was ever blocked the run proved nothing about the termination rule, so the
+      // observation is asserted rather than assumed — a test that can miss its own race is how this bug shipped.
+      const watching = (async () => {
+        for (let tick = 0; tick < 80; tick += 1) {
+          if ((await blockedWalkers(testDb())) > 0) return true;
+          await sleep(100);
+        }
+        return false;
+      })();
+
+      const [run, blocked] = await Promise.all([running, watching, inserting]);
+      expect(
+        blocked,
+        'the script never queued behind the row lock, so the termination rule was never exercised',
+      ).toBe(true);
+
+      expect(run.code, run.stderr).toBe(0);
+      const finished = logLines(run.stdout).find((line) => line.msg === 'note-key rotation finished');
+      // At least two commits, and never one fewer: the short batch, then a later batch that finds the row the
+      // short batch would have abandoned, then the empty batch that really ends the walk.
+      expect(Number(finished?.batches)).toBeGreaterThanOrEqual(2);
+      expect(summarise(await rowsPerKeyVersion(testDb()))).toEqual({ 2: 2 });
+    } finally {
+      await locker.close();
+    }
   }, 60_000);
 });

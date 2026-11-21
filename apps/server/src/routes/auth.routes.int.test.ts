@@ -758,6 +758,67 @@ describe('the CSRF guard (§9.3, plan §10)', () => {
       { db: testDb() },
     );
   });
+
+  it('follows `X-Forwarded-Host` under TRUST_PROXY, and refuses the same pair without it', async () => {
+    await withApp(
+      async (app) => {
+        const setup = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.setup,
+          payload: { username: 'owner', password: PASSWORD },
+        });
+        expect(setup.statusCode, setup.body).toBe(200);
+
+        // The pair PR-07's review found: a proxy that rewrote `Host` to the API target while the browser kept its
+        // own `Origin`. `POST /api/auth/login` is decided by the origin half alone — exempt from the token check,
+        // and needing no cookie — so it is the request that tells the two configurations apart, and the reason
+        // `apps/web/vite.config.ts` pins `changeOrigin: false` rather than depending on this flag being set.
+        const proxied = { host: '127.0.0.1:3000', origin: 'http://localhost:5173' };
+        const credentials = { username: 'owner', password: PASSWORD };
+
+        // Without the flag a rewrite by a proxy this process knows nothing about is indistinguishable from a
+        // hostile one, so it stays a `403`: the guard fails closed on evidence it does not trust.
+        const refused = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.login,
+          headers: proxied,
+          payload: credentials,
+        });
+        expect(refused.statusCode).toBe(403);
+        // A request the guard refused never reached the route, so it minted nothing: still the one session
+        // `/setup` created.
+        expect(await scalarCount('sessions')).toBe(1);
+
+        const accepted = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.login,
+          headers: { ...proxied, 'x-forwarded-host': 'localhost:5173', 'x-forwarded-proto': 'http' },
+          payload: credentials,
+        });
+        expect(accepted.statusCode, accepted.body).toBe(200);
+        expect(jarAfter(accepted).session).toBeTruthy();
+
+        // The forwarded host names *an* origin; it does not vouch for every `Origin` that turns up. Same headers,
+        // hostile page, still `403` — which is the difference between trusting a proxy and trusting the client.
+        const hostile = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.login,
+          headers: {
+            'x-forwarded-host': 'localhost:5173',
+            'x-forwarded-proto': 'http',
+            origin: 'http://evil.example',
+          },
+          payload: credentials,
+        });
+        expect(hostile.statusCode).toBe(403);
+
+        // …and both refusals cost nothing: two sessions exist, the one `/setup` minted and the one the accepted
+        // login did. A request the guard refused never reached the route that would have minted a third.
+        expect(await scalarCount('sessions')).toBe(2);
+      },
+      { db: testDb(), env: { TRUST_PROXY: 'true' } },
+    );
+  });
 });
 
 describe('the security headers of plan §10', () => {

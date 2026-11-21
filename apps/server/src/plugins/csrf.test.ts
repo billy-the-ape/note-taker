@@ -6,10 +6,15 @@
  * `routes/auth.routes.int.test.ts`, including the one-shot re-issue-and-replay the client of PR-05 performs.
  * What is worth pinning here is *which* branch refused, because the response never says (`403 FORBIDDEN` for
  * every reason) while the log line does.
+ *
+ * {@link ownOriginOf} — the origin the comparison uses — belongs in this file for the same reason: it is where a
+ * deployment fails in silence, because a proxy that rewrites `Host` makes every mutation look cross-site. That
+ * is a fact about the rule, not about the three-line hook around it, and PR-07's review found the dev proxy
+ * doing exactly that.
  */
 import { describe, expect, it } from 'vitest';
 
-import { type CsrfRequestFacts, decideCsrf } from './csrf.js';
+import { type CsrfRequestFacts, decideCsrf, ownOriginOf } from './csrf.js';
 
 const OWN = 'http://localhost:3000';
 
@@ -104,6 +109,95 @@ describe('the Origin / Sec-Fetch-Site half', () => {
     expect(decideCsrf(facts({ origin: undefined, secFetchSite: undefined }))).toEqual({ ok: true });
     // A same-origin `POST` from a command line is a supported way to run this server's API; it is the reason
     // the token check is the second half rather than the only one.
+  });
+});
+
+describe('the origin the comparison is made against (ownOriginOf)', () => {
+  it('refuses the proxy-shaped Host/Origin pair the review found, rather than guessing about it', () => {
+    // Exactly what `changeOrigin: true` produced in `pnpm dev`: the browser's truthful `Origin`, and a `Host`
+    // the proxy had rewritten to the API target. With no `TRUST_PROXY` there is nothing else to go on — a proxy
+    // this process has never heard of is not something the check can distinguish from a hostile rewrite — so the
+    // answer is a refusal, and the fix belongs on the proxy (`vite.config.ts` pins `changeOrigin: false`).
+    const proxied = { protocol: 'http', host: '127.0.0.1:3000' };
+    expect(ownOriginOf(proxied)).toBe('http://127.0.0.1:3000');
+    expect(
+      decideCsrf(
+        facts({
+          path: '/api/auth/login',
+          ownOrigin: ownOriginOf(proxied),
+          origin: 'http://localhost:5173',
+          cookieToken: undefined,
+          headerToken: undefined,
+        }),
+      ),
+    ).toEqual({ ok: false, reason: 'cross-site' });
+  });
+
+  it('follows the forwarded pair once the operator says a proxy is in front of us', () => {
+    // The same request, now with `TRUST_PROXY=true`: `Host` says the machine, `X-Forwarded-Host` says the
+    // authority the browser used, and that is the origin the `Origin` header has to match.
+    const forwarded = {
+      protocol: 'http',
+      host: '127.0.0.1:3000',
+      forwardedHost: 'localhost:5173',
+      forwardedProto: 'http',
+      trustProxy: true,
+    };
+    expect(ownOriginOf(forwarded)).toBe('http://localhost:5173');
+    expect(decideCsrf(facts({ ownOrigin: ownOriginOf(forwarded), origin: 'http://localhost:5173' }))).toEqual(
+      { ok: true },
+    );
+
+    // The TLS case `TRUST_PROXY` exists for: terminated upstream, so the app speaks http to its own proxy while
+    // the browser is on https.
+    const tls = { ...forwarded, forwardedHost: 'notes.example', forwardedProto: 'https' };
+    expect(ownOriginOf(tls)).toBe('https://notes.example');
+    // Trust in the forwarded host is not a blanket pass: another page's `Origin` is still a different origin,
+    // which is the whole reason this half of the check exists.
+    expect(decideCsrf(facts({ ownOrigin: ownOriginOf(tls), origin: 'https://evil.example' }))).toEqual({
+      ok: false,
+      reason: 'cross-site',
+    });
+  });
+
+  it('ignores a forwarded pair it was not told to trust, and takes the last value when it was', () => {
+    // Without the flag these are ordinary client headers: believing them would let any caller name its own
+    // origin and walk straight through step 2.
+    expect(ownOriginOf({ protocol: 'http', host: 'api.internal:3000', forwardedHost: 'evil.example' })).toBe(
+      'http://api.internal:3000',
+    );
+
+    // A proxy that appends writes what it saw *after* whatever the client sent, so the leftmost entry is the
+    // least trustworthy one and the one nearest to us is the last.
+    expect(
+      ownOriginOf({
+        protocol: 'http',
+        host: 'api.internal:3000',
+        forwardedHost: 'evil.example, notes.example',
+        trustProxy: true,
+      }),
+    ).toBe('http://notes.example');
+
+    // A scheme that is not http(s) is not believed either — the request's own protocol is — and whitespace from
+    // a hand-typed header does not survive the comparison.
+    expect(
+      ownOriginOf({ protocol: 'http', host: 'notes.example', forwardedProto: 'gopher', trustProxy: true }),
+    ).toBe('http://notes.example');
+    expect(
+      ownOriginOf({
+        protocol: 'https',
+        host: 'api.internal:3000',
+        forwardedHost: ' Notes.Example ',
+        trustProxy: true,
+      }),
+    ).toBe('https://notes.example');
+  });
+
+  it('is the same shape as a browser Origin, which is what makes an exact comparison enough', () => {
+    expect(ownOriginOf({ protocol: 'http', host: 'LocalHost:3000' })).toBe('http://localhost:3000');
+    // An HTTP/1.0 client with no `Host` still gets a comparable origin rather than `http://undefined`, and the
+    // tests above pin that a mismatch on it is a `403` either way.
+    expect(ownOriginOf({ protocol: 'http' })).toBe('http://localhost');
   });
 });
 

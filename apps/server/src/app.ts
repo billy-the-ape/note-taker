@@ -139,7 +139,7 @@ async function registerAuth(app: FastifyInstance, env: Env, db: Db): Promise<voi
   });
 
   registerAuthGuard(app);
-  registerCsrfGuard(app);
+  registerCsrfGuard(app, { trustProxy: env.TRUST_PROXY });
 
   await app.register(authRoutes, { service, guard, cookies });
   await app.register(usersRoutes, { service, guard });

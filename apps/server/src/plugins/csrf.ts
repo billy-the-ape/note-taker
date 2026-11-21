@@ -11,7 +11,11 @@
  *    same `403`. A request with *neither* header is allowed, because that is what a non-browser client
  *    (curl, a monitoring script, the test harness) sends, and there is no third-party context to defend
  *    against: the attacker in this model is a *page in the victim's browser*, and a browser says which page
- *    it is on every single time.
+ *    it is on every single time. "This server's own origin" is `protocol` + `Host`, with one exception worth
+ *    knowing before debugging a `403` at 3 a.m.: under `TRUST_PROXY` the `X-Forwarded-Host`/`X-Forwarded-Proto`
+ *    pair wins, because a TLS-terminating proxy that rewrites `Host` is otherwise indistinguishable from a
+ *    cross-site request ({@link ownOriginOf} is that rule, and it is why `apps/web/vite.config.ts` pins
+ *    `changeOrigin: false`).
  * 3. **The three login-family routes are exempt from the header check** — `isCsrfExempt` reads the shared
  *    route list — because a first-time visitor has no `note_csrf` cookie to echo, and step 2 is what guards
  *    them. Every other mutation needs `X-CSRF-Token` to be present and to equal the `note_csrf` cookie.
@@ -43,7 +47,7 @@ export interface CsrfRequestFacts {
   readonly method: string;
   /** The request path without its query string. */
   readonly path: string;
-  /** This server's own origin, e.g. `http://localhost:3000`, from the request's own `Host`. */
+  /** This server's own origin, e.g. `http://localhost:3000` — {@link ownOriginOf} says where it comes from. */
   readonly ownOrigin: string;
   readonly cookieToken?: string | undefined;
   readonly headerToken?: string | undefined;
@@ -111,10 +115,67 @@ export function decideCsrf(facts: CsrfRequestFacts): CsrfVerdict {
   return { ok: true };
 }
 
-/** The origin a request claims to belong to, from its own protocol and `Host` header. */
-function originOf(request: FastifyRequest): string {
-  const host = request.headers.host ?? 'localhost';
-  return `${request.protocol}://${host}`.toLowerCase();
+/** The facts {@link ownOriginOf} needs, kept apart from Fastify so the rule is testable with an object. */
+export interface OwnOriginFacts {
+  /** The protocol Fastify resolved for the request (`http` or `https`). */
+  readonly protocol: string;
+  /** The `Host` header, which is where the origin comes from unless a proxy is in the picture. */
+  readonly host?: string | undefined;
+  /** `X-Forwarded-Host`, verbatim — a comma list is legal, and {@link lastHeaderValue} is why. */
+  readonly forwardedHost?: string | undefined;
+  /** `X-Forwarded-Proto`, verbatim. */
+  readonly forwardedProto?: string | undefined;
+  /** `env.TRUST_PROXY`: the operator's statement that the client in front of us is *our* proxy. */
+  readonly trustProxy?: boolean;
+}
+
+/**
+ * This server's own origin — the value an `Origin` has to equal for a mutation to count as same-origin.
+ *
+ * Normally that is `protocol` + `Host`, and it is worth saying out loud why that is safe: a browser puts the
+ * real authority in `Host`, and no page can arrange for a request to arrive with `Host` set to somewhere other
+ * than the API it is calling. The one thing that *can* rewrite `Host` is a proxy the operator installed, and a
+ * rewrite is exactly what makes a same-origin browser request *look* cross-site — nginx's default
+ * `proxy_set_header Host $proxy_host` does it, and until PR-07's review so did this repo's own dev proxy
+ * (`changeOrigin: true` answered `/api` with `Host: 127.0.0.1:3000` against
+ * `Origin: http://localhost:5173`, i.e. `403` on every mutation of the dev SPA) — which is why
+ * `apps/web/vite.config.ts` now pins that flag to `false`.
+ *
+ * Under `TRUST_PROXY` the forwarded pair therefore wins, and that is the same trust the repository already
+ * places in the flag: `env.ts` refuses to boot in production with `TRUST_PROXY` and non-`Secure` cookies
+ * because the flag means "TLS is terminated upstream", and `http/rate-limit.ts` takes the login window's IP
+ * half from `X-Forwarded-For`. It does not open the CSRF door either, because the requests this half exists to
+ * refuse arrive from *the victim's browser*, and a browser cannot set `X-Forwarded-Host` (forbidden header
+ * name) while it always tells the truth about `Origin`. Two rules are not accidents:
+ *
+ * * the **last** value of a comma-separated forwarded header wins, since a proxy that appends writes the value
+ *   it saw *after* whatever the client sent, so the leftmost entry is the least trustworthy one;
+ * * a forwarded scheme that is not `http`/`https` is ignored rather than believed.
+ *
+ * A forwarded host that is not a host at all (`notes.example/path`, `not a host`) can only cause refusals:
+ * `isCrossSite` parses the *client's* origin and compares exact strings, so a malformed own-origin matches
+ * nothing. Failing closed is the right direction for a value this process does not own.
+ */
+export function ownOriginOf(facts: OwnOriginFacts): string {
+  const trusted = facts.trustProxy ?? false;
+  const host = (trusted ? lastHeaderValue(facts.forwardedHost) : undefined) ?? facts.host ?? 'localhost';
+  const scheme =
+    (trusted ? forwardedScheme(lastHeaderValue(facts.forwardedProto)) : undefined) ?? facts.protocol;
+  return `${scheme}://${host}`.toLowerCase();
+}
+
+/** The last value of a comma-separated forwarded header, trimmed, or `undefined` when there is nothing. */
+function lastHeaderValue(value: string | undefined): string | undefined {
+  const parts = value?.split(',');
+  const last = parts?.[parts.length - 1]?.trim();
+  return last === undefined || last === '' ? undefined : last;
+}
+
+/** A forwarded scheme worth building an origin from, or `undefined` to fall back to the request's own. */
+function forwardedScheme(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const scheme = value.toLowerCase();
+  return scheme === 'http' || scheme === 'https' ? scheme : undefined;
 }
 
 /** The path only: `isCsrfExempt` compares route paths, and a query string is not part of one. */
@@ -127,19 +188,37 @@ function pathOnly(url: string): string {
 const CSRF_FORBIDDEN_MESSAGE =
   'the CSRF check failed (stale or missing X-CSRF-Token, or a cross-origin request)';
 
+/** What `buildApp()` hands the guard, so this module never reaches for `env.ts` itself. */
+export interface CsrfGuardOptions {
+  /** `env.TRUST_PROXY` — {@link ownOriginOf} explains what that flag is trusted to mean here. */
+  readonly trustProxy?: boolean;
+}
+
 /**
  * Installs the guard on an instance.
  *
  * `onRequest` rather than `preHandler`, so a mutation that fails CSRF never reaches a route and never has its
  * body parsed: the refusal is not about the body. And registered app-wide — a function `buildApp()` calls, not
  * a nested plugin — so no route can later be added inside a scope that quietly skipped it.
+ *
+ * `trustProxy` arrives as a parameter rather than being read here, because only `env.ts` reads the environment
+ * (PR-01) and `buildApp()` passes down what it parsed; a test that wants the forwarded behaviour therefore says
+ * so in its own call rather than by setting a variable.
  */
-export function registerCsrfGuard(app: FastifyInstance): void {
+export function registerCsrfGuard(app: FastifyInstance, options: CsrfGuardOptions = {}): void {
+  const trustProxy = options.trustProxy ?? false;
+
   app.addHook('onRequest', async (request: FastifyRequest) => {
     const verdict = decideCsrf({
       method: request.method,
       path: pathOnly(request.url),
-      ownOrigin: originOf(request),
+      ownOrigin: ownOriginOf({
+        protocol: request.protocol,
+        host: request.headers.host,
+        forwardedHost: request.headers['x-forwarded-host']?.toString(),
+        forwardedProto: request.headers['x-forwarded-proto']?.toString(),
+        trustProxy,
+      }),
       cookieToken: request.cookies[CSRF_COOKIE_NAME],
       headerToken: request.headers[CSRF_HEADER_NAME.toLowerCase()]?.toString(),
       origin: request.headers.origin,

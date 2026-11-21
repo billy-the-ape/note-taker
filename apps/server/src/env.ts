@@ -1,13 +1,17 @@
 /**
  * The one place this repository reads `process.env`.
  *
- * Three entry points, and later PRs may not build a fourth way of reaching the same values
+ * Four entry points, and later PRs may not build a fifth way of reaching the same values
  * (docs/plans/mvp/MVP-FULL-PLAN.md §16):
  *
  *   * `parseEnv()` — Zod-parsed configuration that fails fast with a readable LIST of problems.
  *   * `loadDevEnvFile()` — loads the repo-root `.env` into `process.env` for host processes only.
  *   * `databaseUrl()` — the single Postgres DSN resolver (`db/client.ts`, `db/migrate.ts`,
  *     `drizzle.config.ts` and `scripts/seed-demo.ts` all go through it, in PR-04/PR-09).
+ *   * `readNoteEncryptionKey()` / `noteEncryptionKeyBytes()` — the single reader of the note-encryption
+ *     key material (PR-06), which is what lets the production boot guard below and `crypto/keys.ts`
+ *     apply one rule rather than two. Building the *keyring* (versions, `_PREVIOUS`, the dev key file)
+ *     is `crypto/keys.ts`, on top of these bytes.
  *
  * The rule the rest of the file is organised around: **`NODE_ENV` is required and never
  * defaulted**, in every environment. A container that forgot it must not boot in the
@@ -20,7 +24,7 @@
  * namespace, so "unknown" is enforced per variable (an unknown *value*, e.g.
  * `LOG_LEVEL=verbose`) rather than by refusing to start next to `PATH`.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -61,6 +65,13 @@ const ENV_DEFAULTS = {
   LOGIN_RATE_LIMIT_MAX: '10',
   MAX_NOTE_BYTES: '1048576',
   APP_NAME: 'Note Taker',
+  /**
+   * The version tag `crypto/envelope.ts` stamps into `notes.key_version` for the *current* key
+   * (PR-06). It is a variable of its own and never derived from `NOTE_ENCRYPTION_KEY_PREVIOUS`:
+   * deriving it as `max(previous)+1` collapses back to `1` the moment the map is emptied and silently
+   * orphans every row tagged 2.
+   */
+  NOTE_ENCRYPTION_KEY_VERSION: '1',
 } as const;
 
 function booleanFrom(name: string) {
@@ -105,6 +116,22 @@ const envShape = z.object({
   LOGIN_RATE_LIMIT_MAX: integerFrom('LOGIN_RATE_LIMIT_MAX', { minValue: 1, maxValue: 1_000_000 }),
   MAX_NOTE_BYTES: integerFrom('MAX_NOTE_BYTES', { minValue: 1_024, maxValue: 1_073_741_824 }),
   APP_NAME: z.string().min(1, { error: 'APP_NAME must be a non-empty title' }),
+  /**
+   * The note-encryption key material (PR-06). Only the *shape* is checked here; the value is read by
+   * {@link readNoteEncryptionKey}, because a key that is set but wrong has to be reported in
+   * development and test too, where the production boot guard below is not armed.
+   */
+  NOTE_ENCRYPTION_KEY: z.string().optional(),
+  /** Alternative to the variable above: the key lives in a mounted file, so it never appears in a shell. */
+  NOTE_ENCRYPTION_KEY_FILE: z.string().optional(),
+  /** JSON map `{"1": "<base64>"}` of **older** keys; decrypt-only, and only during a rotation. */
+  NOTE_ENCRYPTION_KEY_PREVIOUS: z.string().optional(),
+  // The upper bound is `notes.key_version`'s: it is an `integer`, so a version above this could be
+  // configured and then fail on the first write (crypto/keys.ts applies the same range).
+  NOTE_ENCRYPTION_KEY_VERSION: integerFrom('NOTE_ENCRYPTION_KEY_VERSION', {
+    minValue: 1,
+    maxValue: 2_147_483_647,
+  }),
 });
 
 /** The validated configuration of one process. */
@@ -129,12 +156,163 @@ function formatIssues(
   });
 }
 
+// ── the note-encryption key (PR-06) ──────────────────────────────────────────────────────────────
+//
+// Reading the *variables* is env's job, because the production boot guard below has to apply the same
+// rule the keyring builder will, and two implementations of "did the operator hand us 32 bytes" drift
+// the first time one of them is fixed. Turning those bytes into a keyring — the versioned current key
+// plus the decrypt-only `_PREVIOUS` map — is `crypto/keys.ts`.
+
+/** An AES-256 key is 32 bytes. Nothing else is accepted, in any environment, ever. */
+export const NOTE_ENCRYPTION_KEY_BYTES = 32;
+
+/** The two variables that can supply the *current* key, in the order they are tried. */
+export const NOTE_ENCRYPTION_KEY_VARIABLES = ['NOTE_ENCRYPTION_KEY', 'NOTE_ENCRYPTION_KEY_FILE'] as const;
+export type NoteEncryptionKeyVariable = (typeof NOTE_ENCRYPTION_KEY_VARIABLES)[number];
+
 /**
- * The cross-field rules that only bite in production (plan §10). The remaining production
- * invariants arrive with the features that need them: the encryption key in PR-06, the rate
- * limiter and CSRF pair in PR-07, the DSN and the key in `scripts/check-env.ts` (PR-18).
+ * `[A-Za-z0-9+/]+={0,2}` — deliberately stricter than `Buffer.from(…, 'base64')`, which silently
+ * discards anything outside the alphabet. A URL-safe key (`-`/`_`), a key with a space in it, or a
+ * truncated one must be a reported failure, not a *different key* that decrypts nothing.
  */
-function productionInvariants(env: Env): string[] {
+const BASE64_ONLY = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** A key that is present, or the sentence that tells an operator how to fix it. */
+export type DecodedKey =
+  | { readonly ok: true; readonly bytes: Uint8Array }
+  | { readonly ok: false; readonly problem: string };
+
+/** True when the variable is set to something other than whitespace; the base64 shape is checked on decode. */
+function isConfigured(value: string | undefined): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/**
+ * Decodes one base64 key.
+ *
+ * @param label the name that appears in the failure text — the variable, or the variable plus the file
+ *   it names, so a bad key inside `NOTE_ENCRYPTION_KEY_FILE` is not mistaken for the inline one.
+ */
+export function decodeNoteEncryptionKey(
+  raw: string,
+  label: string = NOTE_ENCRYPTION_KEY_VARIABLES[0],
+): DecodedKey {
+  const value = raw.trim();
+  if (value === '') return { ok: false, problem: `${label} is set but empty` };
+  if (!BASE64_ONLY.test(value)) {
+    return {
+      ok: false,
+      problem: `${label} must be base64 ([A-Za-z0-9+/], optionally padded with =) — this is not`,
+    };
+  }
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length !== NOTE_ENCRYPTION_KEY_BYTES) {
+    return {
+      ok: false,
+      problem: `${label} must decode to exactly ${NOTE_ENCRYPTION_KEY_BYTES} bytes (AES-256), got ${bytes.length}`,
+    };
+  }
+  // Not the `Buffer`: every caller of this function is the crypto layer, and the schema's `bytea`
+  // columns are typed `Uint8Array` (docs/DATA-MODEL.md §1).
+  return { ok: true, bytes: new Uint8Array(bytes) };
+}
+
+/** The reason nothing was configured at all — the sentence the boot guard and the keyring share. */
+export function missingNoteEncryptionKeyProblem(): string {
+  return (
+    `no note-encryption key: set ${NOTE_ENCRYPTION_KEY_VARIABLES[0]} to base64 for 32 bytes ` +
+    `or ${NOTE_ENCRYPTION_KEY_VARIABLES[1]} to a readable file containing it (generate one with ` +
+    "`node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"`. There is no " +
+    'plaintext mode: development and test generate a key and persist it to .dev/note-key, production refuses to boot'
+  );
+}
+
+/** Reads the key out of a mounted file. A trailing newline is tolerated, because that is what `echo` writes. */
+function readKeyFile(file: string): DecodedKey {
+  const label = `${NOTE_ENCRYPTION_KEY_VARIABLES[1]} (${file})`;
+  let contents: string;
+  try {
+    contents = readFileSync(file, 'utf8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? 'an unknown error';
+    return { ok: false, problem: `${label} could not be read: ${code}` };
+  }
+  return decodeNoteEncryptionKey(contents, label);
+}
+
+/** What the configured key material amounted to. */
+export interface NoteEncryptionKeyReading {
+  /** The current key; absent exactly when there is something an operator has to be told about. */
+  readonly key?: Uint8Array;
+  /** Which variable it came from, for the startup log line. */
+  readonly from?: NoteEncryptionKeyVariable;
+  /** Everything wrong with what was configured; empty when nothing was configured at all. */
+  readonly problems: readonly string[];
+  /**
+   * `true` when either variable is set. A key that is set but broken is **never** replaced by a
+   * generated dev key: that would encrypt new rows with a key nobody configured and leave the rows
+   * the operator was trying to read exactly as unreadable as before.
+   */
+  readonly configured: boolean;
+}
+
+/**
+ * Reads the *current* note-encryption key from `NOTE_ENCRYPTION_KEY`, or from
+ * `NOTE_ENCRYPTION_KEY_FILE` when only that is set (a mounted secret file, with no shell in the way).
+ *
+ * Reports rather than throws: `parseEnv()` needs every production problem at once, and
+ * `crypto/keys.ts` needs to tell "nothing configured" (the dev/test generated key) apart from
+ * "configured badly" (a failure in every mode).
+ */
+export function readNoteEncryptionKey(source: EnvSource = process.env): NoteEncryptionKeyReading {
+  const inline = source.NOTE_ENCRYPTION_KEY;
+  const file = source.NOTE_ENCRYPTION_KEY_FILE;
+
+  if (isConfigured(inline)) {
+    const decoded = decodeNoteEncryptionKey(inline);
+    // A readable file next to a broken inline key is not a fallback: the operator set one of the two
+    // wrong, and quietly using the other is how a database gets written with a key nobody meant.
+    return decoded.ok
+      ? { key: decoded.bytes, from: NOTE_ENCRYPTION_KEY_VARIABLES[0], problems: [], configured: true }
+      : { problems: [decoded.problem], configured: true };
+  }
+
+  if (isConfigured(file)) {
+    const decoded = readKeyFile(file.trim());
+    return decoded.ok
+      ? { key: decoded.bytes, from: NOTE_ENCRYPTION_KEY_VARIABLES[1], problems: [], configured: true }
+      : { problems: [decoded.problem], configured: true };
+  }
+
+  return { problems: [], configured: false };
+}
+
+/** The problem list for a reading that found no key, whether or not anything was configured. */
+export function keyProblems(reading: NoteEncryptionKeyReading): readonly string[] {
+  return reading.problems.length > 0 ? reading.problems : [missingNoteEncryptionKeyProblem()];
+}
+
+/**
+ * The current key, or an {@link EnvError} naming the variable to set.
+ *
+ * Use this when a process may simply not continue without a key (`crypto/keys.ts`). Use
+ * {@link readNoteEncryptionKey} when the caller has its own report to write.
+ */
+export function noteEncryptionKeyBytes(source: EnvSource = process.env): Uint8Array {
+  const reading = readNoteEncryptionKey(source);
+  if (reading.key === undefined) throw new EnvError(keyProblems(reading));
+  return reading.key;
+}
+
+/**
+ * The cross-field rules that only bite in production (plan §10). PR-06 armed the note-encryption key
+ * here; the rate limiter and CSRF pair arrive in PR-07, and `scripts/check-env.ts` (PR-18) mirrors
+ * these rules for an operator-facing preflight that judges the repo-root `.env` instead of the process.
+ *
+ * The key rule reads the **raw source** rather than the parsed `env`, because the value it has to
+ * judge is a file (`NOTE_ENCRYPTION_KEY_FILE`), and `Env` is the parsed shape (plan §16).
+ */
+function productionInvariants(env: Env, source: EnvSource): string[] {
   if (env.NODE_ENV !== 'production') return [];
   const problems: string[] = [];
   if (env.SESSION_TTL_DAYS > 365) {
@@ -152,6 +330,8 @@ function productionInvariants(env: Env): string[] {
       'SECURE_COOKIES must be true when ALLOW_REGISTRATION is true in production: never hand out session cookies over plain HTTP',
     );
   }
+  const key = readNoteEncryptionKey(source);
+  if (key.key === undefined) problems.push(...keyProblems(key));
   return problems;
 }
 
@@ -162,11 +342,12 @@ function productionInvariants(env: Env): string[] {
  *   and violated production invariants.
  */
 export function parseEnv(source: EnvSource = process.env): Env {
-  const result = envShape.safeParse(withDefaults(source));
+  const merged = withDefaults(source);
+  const result = envShape.safeParse(merged);
   if (!result.success) throw new EnvError(formatIssues(result.error.issues));
 
   const env = result.data;
-  const problems = productionInvariants(env);
+  const problems = productionInvariants(env, merged);
   if (problems.length > 0) throw new EnvError(problems);
   return env;
 }
@@ -212,7 +393,7 @@ export function dotenvPath(
 }
 
 /** `NODE_ENV` as a validated mode, or `undefined` when it is absent, empty or unrecognised. */
-function modeOf(source: EnvSource): NodeEnv | undefined {
+export function nodeEnvOf(source: EnvSource): NodeEnv | undefined {
   const value = source.NODE_ENV;
   return typeof value === 'string' && (NODE_ENV_VALUES as readonly string[]).includes(value.trim())
     ? (value.trim() as NodeEnv)
@@ -234,7 +415,7 @@ function modeOf(source: EnvSource): NodeEnv | undefined {
  *   lenient about file *content*, so a read failure is what "malformed" can mean here.
  */
 export function loadDevEnvFile(source: EnvSource = process.env): void {
-  const mode = modeOf(source);
+  const mode = nodeEnvOf(source);
   if (mode !== 'development' && mode !== 'test') return;
 
   const file = dotenvPath(source);
@@ -365,7 +546,7 @@ function decodedURIComponentSafely(value: string): string {
  */
 export function databaseUrl(source: EnvSource = process.env, options: DatabaseUrlOptions = {}): string {
   const explicit = source.DATABASE_URL;
-  const mode = modeOf(source);
+  const mode = nodeEnvOf(source);
 
   if (typeof explicit === 'string' && explicit.trim() !== '') {
     const value = explicit.trim();

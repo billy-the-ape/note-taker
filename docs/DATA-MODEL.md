@@ -106,9 +106,9 @@ derived from `expires_at`; a column nothing reads would only create a second, co
 | `folder_id`          | `uuid → folders(id) CASCADE`            | `NULL` = root, mirroring `folders.parent_id`             |
 | `name`               | `text NOT NULL` + `notes_name_check` (`name <> ''`) | WITHOUT the `.md` suffix; `stripMd()` (PR-05) is applied by PR-09 |
 | `version`            | `integer NOT NULL DEFAULT 1`             | optimistic lock, §4                                     |
-| `content_cipher`     | `bytea NOT NULL`                         | **no default** (§1); only `crypto/envelope.ts` (PR-06) writes it |
-| `content_iv`         | `bytea NOT NULL`                         | **no default**                                          |
-| `key_version`        | `integer NOT NULL DEFAULT 1`             | key rotation, PR-15                                     |
+| `content_cipher`     | `bytea NOT NULL`                         | `ciphertext ‖ 16-byte GCM tag`; **no default** (§1), and only `crypto/envelope.ts` (PR-06) writes it |
+| `content_iv`         | `bytea NOT NULL`                         | 12 bytes, fresh per write; **no default**               |
+| `key_version`        | `integer NOT NULL DEFAULT 1`             | which key sealed *this row*; rewritten by `scripts/rotate-note-key.ts` (PR-06) |
 | `content_format`     | `text NOT NULL DEFAULT 'markdown'`       | forward-compatible; a later upload PR writes `'html'`   |
 | `content_bytes`      | `integer NOT NULL DEFAULT 0`             | plaintext bytes, so the 1 MiB limit is answerable without decrypting (PR-10) |
 | `word_count`         | `integer NOT NULL DEFAULT 0`              | recents + PR-12 search preview                          |
@@ -118,6 +118,17 @@ derived from `expires_at`; a column nothing reads would only create a second, co
 
 `word_count`/`content_bytes` describe the *decrypted* document and are supplied by the caller that sealed the
 ciphertext; the database cannot compute them and does not pretend to.
+
+Those three columns are one envelope, and only `crypto/envelope.ts` (PR-06) knows its shape: AES-256-GCM with a
+fresh 12-byte IV per write, the auth tag appended to the ciphertext (`node:crypto` never appends it), and
+`AAD = "note:" || notes.id`. A body therefore cannot be copied onto another row and read, and a row whose tag
+does not verify raises instead of serving an empty note. `key_version` means *the key that sealed this row*, not
+"the version this server is configured with": rows written under an older version stay readable for exactly as
+long as that key sits in `NOTE_ENCRYPTION_KEY_PREVIOUS` (decrypt-only), and the explicit
+`NOTE_ENCRYPTION_KEY_VERSION` exists so a rotation never has to infer the current version from that map.
+`apps/server/src/scripts/rotate-note-key.ts` rewrites rows onto the current version so the old entry can
+eventually be dropped. Losing the current key makes every note body unrecoverable; that is ADR-0002's (PR-20)
+accepted trade and PR-18's backup drill, not a bug this schema can fix.
 
 ### `settings`
 
@@ -186,6 +197,19 @@ UPDATE notes
   `updated_at` and leave `version` alone, so renaming or re-filing a note never invalidates an open editor.
 - Two writers that read the same version: exactly one wins, asserted concurrently in
   `notes.repo.int.test.ts`. Nothing is merged and nothing is lost silently.
+- The key rotation (PR-06's `apps/server/src/scripts/rotate-note-key.ts`) is the only other writer of these
+  columns, and it is deliberately **not** a content write:
+
+  ```sql
+  UPDATE notes SET content_cipher = …, content_iv = …, key_version = $current, updated_at = now()
+   WHERE id = $1 AND version = $2 AND key_version = $old
+  ```
+
+  It never bumps `version` (that would push every open tab's autosave into a 409) and never touches
+  `content_updated_at` (that would reshuffle the recents list), yet it still carries `version` in its `WHERE`
+  for the reason this section exists: zero rows back means someone edited the note in the meantime, and the
+  rotation re-reads the row rather than writing the ciphertext it had already buffered. Each batch is one
+  transaction that starts `SELECT … FOR UPDATE`, so the read and the reseal are atomic against the app.
 
 ## 5. Error contract
 
@@ -223,7 +247,8 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | A content write to a stale `version` writes nothing | `WHERE id AND version AND user_id RETURNING` | `notes.repo.int.test.ts` (stale write → `undefined`, row unchanged; three-way race → one winner) |
 | Cross-user reads return nothing | every repository statement filters by `user_id` | both repository tests, on every read and write |
 | `word_count` / `content_bytes` / `content_updated_at` always exist | `NOT NULL DEFAULT 0/now()` | `schema.int.test.ts` (defaults present) + `notes.repo.int.test.ts` (an insert without them) |
-| Ciphertext is never plaintext | no plaintext column, flag or code path; `crypto/envelope.ts` is the only writer (PR-06) | the column list above; `notes.repo.int.test.ts` round-trips bytes that are not valid UTF-8 |
+| Ciphertext is never plaintext | no plaintext column, flag or code path; `crypto/envelope.ts` is the only writer (PR-06) | the column list above; `notes.repo.int.test.ts` round-trips bytes that are not valid UTF-8; `crypto/envelope.test.ts` (a flipped byte, a foreign key, or another row's AAD throws rather than yielding blank content) |
+| A key rotation never overwrites a concurrent edit | `rotate-note-key.ts`: one transaction per batch, `SELECT … FOR UPDATE`, `WHERE id AND version AND key_version`, and it never bumps `version` | `rotate-note-key.int.test.ts` (the autosave wins, `version` incremented exactly once, `--verify` exits 0 afterwards) |
 | One `settings` row per user | `user_id` is the PK | `schema.int.test.ts` (the fixture's two users get one row each) |
 | An install has an owner before anyone joins | `users_one_owner_uidx` here + service guards in PR-07 | as above |
 

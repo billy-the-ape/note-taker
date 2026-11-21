@@ -4,8 +4,10 @@
  * **It never sees plaintext and never holds a key.** `notes.content_cipher`/`content_iv`/`key_version` are one
  * opaque triple that the caller hands over already sealed, because the schema has no plaintext representation
  * at all — there is no column, flag, or code path that could store a note in the clear in any environment.
- * PR-04's tests insert fixed test blobs through this same interface; PR-06 plugs `crypto/envelope.ts` in
- * behind it, and PR-09/PR-10 call the same functions from the services.
+ * PR-06's `crypto/envelope.ts` is what produces that triple (`sealNoteContent()` returns exactly a
+ * `SealedContent`; `envelope.test.ts` assigns one to this type so the two shapes cannot drift silently),
+ * PR-04's tests here still insert fixed test blobs through the same interface because this layer must not care
+ * which envelope it is holding, and PR-09/PR-10 call the same functions from the services.
  *
  * Like `folders.repo.ts`: `db` is injected, every statement is scoped by `user_id` (someone else's note is
  * "not found", a 404), and `folderId: null` is the root — where `notes_unique_sib` compares

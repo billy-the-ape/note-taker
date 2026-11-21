@@ -79,7 +79,11 @@ same PR (add an auth section to `docs/API.md` if PR-05's draft drifted; note `re
 | 11 | `GET /api/users` | owner | `{users:[{id,username,role,createdAt}]}` | Minimal admin surface |
 
 CSRF: every mutation needs `X-CSRF-Token` **except** `login`/`setup`/`register` — those have no session and, on a first
-visit, no `note_csrf` cookie, so they are guarded by an `Origin`/`Sec-Fetch-Site` check instead.
+visit, no `note_csrf` cookie, so they are guarded by an `Origin`/`Sec-Fetch-Site` check instead. As built, the origin
+that check compares against is the API's own `protocol` + `Host`, or — under `TRUST_PROXY=true` — the
+`X-Forwarded-Host`/`X-Forwarded-Proto` pair, which is why `apps/web/vite.config.ts` keeps `changeOrigin: false`: a proxy
+that rewrites `Host` makes every same-origin browser mutation look cross-origin (PR-07's review found exactly that;
+`docs/API.md` §CSRF carries the operator rule).
 
 ## 5. Security rules (implement exactly)
 

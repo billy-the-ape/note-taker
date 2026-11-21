@@ -33,13 +33,17 @@ async function main(): Promise<void> {
   // unbound, and the pool is released on the way out so the process is actually able to exit.
   const { db, close: closePool } = getDb();
   try {
+    // `migrateDatabase` logs `{ migrations: { total, applied, folder } }` itself (plan §6), which is the boot
+    // line PR-07's brief asks for: an operator reading the container log can see whether the schema moved.
     await migrateDatabase({ db, log: logger });
   } catch (error) {
     await closePool();
     throw error;
   }
 
-  const app = await buildApp({ env, logger, checkDb: () => probeDb(db) });
+  // `db` here is what turns the auth routes on: `buildApp()` registers them only for an instance that has a
+  // pool to look sessions up in (see `app.ts`), and every unit test still builds the pool-less app.
+  const app = await buildApp({ env, logger, db, checkDb: () => probeDb(db) });
   app.addHook('onClose', async () => {
     await closeDb();
   });

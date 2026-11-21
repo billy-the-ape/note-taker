@@ -58,7 +58,7 @@ they list them).
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
 | `SESSION_TTL_DAYS` | `30` | — | session cookie + DB expiry (> 365 refused in prod) |
 | `SECURE_COOKIES` | `false` | ✔ `true` behind TLS | `Secure` flag; refused `false` when `TRUST_PROXY=true` or registration is open |
-| `TRUST_PROXY` | `false` | ✔ if behind a proxy | accurate client IPs for rate limiting |
+| `TRUST_PROXY` | `false` | ✔ if behind a proxy | accurate client IPs for rate limiting; PR-07 also reads `X-Forwarded-Host`/`X-Forwarded-Proto` as the CSRF origin, so the proxy in front of `app` has to pass `Host` through or send both |
 | `ALLOW_REGISTRATION` | `false` | — | opens `POST /api/auth/register` |
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to the key var | key read from a mounted file by `crypto/keys.ts` at boot |

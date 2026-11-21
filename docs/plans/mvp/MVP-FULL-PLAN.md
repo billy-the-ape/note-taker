@@ -1878,7 +1878,7 @@ docker compose --env-file .env -f docker/compose.yml ps        # app reported he
 | `DB_POOL_MAX` | `10` | — | postgres.js pool size |
 | `SESSION_TTL_DAYS` | `30` | — | session cookie + DB expiry |
 | `SECURE_COOKIES` | `false` (dev) | ✔ `true` behind TLS | `Secure` cookie flag |
-| `TRUST_PROXY` | `false` | ✔ if behind a proxy | accurate client IPs for rate limiting |
+| `TRUST_PROXY` | `false` | ✔ if behind a proxy | accurate client IPs for rate limiting (`X-Forwarded-For`); since PR-07 also the authority the CSRF `Origin`/`Sec-Fetch-Site` check compares against, taken from `X-Forwarded-Host` + `X-Forwarded-Proto` (last value wins). A proxy that rewrites `Host` and sends neither header turns every same-origin browser mutation into a `403` |
 | `ALLOW_REGISTRATION` | `false` | — | when true, `POST /api/auth/register` (PR-07) opens self-service sign-up; when false, accounts come only from `POST /api/users` (owner only) |
 | `NOTE_ENCRYPTION_KEY` | — | ✔ (32 bytes base64) | current AES-256 key |
 | `NOTE_ENCRYPTION_KEY_FILE` | — | alternative to `NOTE_ENCRYPTION_KEY` | key read from a mounted file by `crypto/keys.ts` (PR-06) at boot |

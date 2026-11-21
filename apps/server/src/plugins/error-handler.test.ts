@@ -209,10 +209,35 @@ describe('registerErrorHandlers through buildApp()', () => {
     app.get('/api/stub/serialization', () => {
       throw driverError('40001');
     });
+    app.get('/api/stub/rate-limited', () => {
+      throw new RateLimitedError('too many attempts, try again later', { retryAfterSeconds: 90 });
+    });
+    app.get('/api/stub/rate-limited-without-a-number', () => {
+      throw new RateLimitedError();
+    });
     app.post('/api/stub/echo', () => ({ received: true }));
     await app.ready();
     return app;
   }
+
+  it('sends Retry-After when the domain error carried a number of seconds (§10)', async () => {
+    const app = await makeApp();
+    const limited = await app.inject('/api/stub/rate-limited');
+
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers['retry-after']).toBe('90');
+    expect(errorResponseSchema.safeParse(limited.json()).success).toBe(true);
+    // The seconds are a header and not a body field: plan §9.1's envelope has nine codes and no retry shape, so
+    // inventing one here would be a change to the contract that only this endpoint obeyed.
+    expect(limited.body).not.toMatch(/retry/i);
+
+    // The other half: a 429 with no number of seconds to give writes no header, rather than a `Retry-After:
+    // undefined` that a client would parse as a wait of NaN seconds.
+    const unnumbered = await app.inject('/api/stub/rate-limited-without-a-number');
+    expect(unnumbered.statusCode).toBe(429);
+    expect(unnumbered.headers['retry-after']).toBeUndefined();
+    await app.close();
+  });
 
   it('answers a domain error with its code, its status and the same envelope', async () => {
     const app = await makeApp();

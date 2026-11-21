@@ -69,9 +69,10 @@ export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, { s
 
   /**
    * §9.2 #3 — the first-run bootstrap: 200; CSRF-exempt like `register` and `login`, because the caller has no
-   * cookie yet (see `CSRF_EXEMPT_ROUTES` in `plugins/csrf.ts`, which lists exactly those three). 200 rather than
-   * 201 because the resource being created is the install, and `POST /setup` against a server that is already
-   * set up is a `409`, not a second creation.
+   * cookie yet. `CSRF_EXEMPT_ROUTES` in `packages/contracts/src/routes.ts` is the list — the server and the SPA
+   * both read it from the contract, and `plugins/csrf.ts` only asks `isCsrfExempt` whether a path is on it. 200
+   * rather than 201 because the resource being created is the install, and `POST /setup` against a server that
+   * is already set up is a `409`, not a second creation.
    */
   app.post(ROUTES.auth.setup, async (request, reply) => {
     const input = setupSchema.parse(request.body);

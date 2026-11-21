@@ -171,7 +171,9 @@ export async function ownerExists(db: Db): Promise<boolean> {
  *
  * That column is the only evidence an operator has of when a credential last changed, and a reset that
  * leaves it at row-creation time makes "has anyone rotated since the incident?" unanswerable. `undefined`
- * means the id was not there (a deleted user), which the caller renders as `NOT_FOUND`.
+ * means the id was not there (a deleted user), and each caller refuses in its own terms rather than pretending
+ * to know HTTP: `auth.service.ts` answers `401 UNAUTHORIZED` with "this account no longer exists", and
+ * `reset-password.ts` writes `no account named <username>` to stderr and exits `1`.
  *
  * `DbOrTx`, because both of its callers have to be atomic: "the password changed and my other devices are
  * still signed in" is the failure this row is supposed to make impossible, so the write is one statement inside

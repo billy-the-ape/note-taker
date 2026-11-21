@@ -66,12 +66,42 @@ be the second argument, which is visible in \`ps\` and in shell history, so run 
 terminal when you have one. Nothing about this script is safe to put in a URL.`;
 
 /**
- * The hidden prompt: raw mode, one `*` per key, and the bytes collected but never written.
+ * Removes the last **character** of the buffer and returns how many bytes that was (`0` for an empty one).
+ *
+ * The prompt collects raw bytes and decodes once, at Enter, because raw-mode input is a byte stream; that is
+ * also what makes an edit wrong rather than merely ugly. `bytes.pop()` on `päss` leaves `0xC3` (the lead byte of
+ * `ä`) as the whole buffer, `Buffer.from([0xc3]).toString('utf8')` is `'\uFFFD'`, and the script would then
+ * enforce the length rules on, hash, and commit a password the operator never typed and cannot retype — through
+ * the only recovery path this product has, in the same transaction that signs the account out of every device.
+ *
+ * A UTF-8 character is one lead byte followed by continuation bytes (`10xxxxxx`), so those go first and the byte
+ * that starts them goes with them. A well-formed buffer has at most three continuation bytes to drain; a
+ * malformed one — unreachable from a terminal, cheap to survive — drains every trailing one it is holding
+ * instead of stopping at an assumed count, and never leaves half a character behind.
+ */
+export function popLastCharacter(bytes: number[]): number {
+  let removed = 0;
+  while (bytes.length > 0 && ((bytes[bytes.length - 1] as number) & 0xc0) === 0x80) {
+    bytes.pop();
+    removed += 1;
+  }
+  if (bytes.length > 0) {
+    bytes.pop();
+    removed += 1;
+  }
+  return removed;
+}
+
+/**
+ * The hidden prompt: raw mode, one `*` per character, and the bytes collected but never written.
  *
  * Not `readline`: `readline` in terminal mode *echoes* what it is given, which is the one thing a password
- * prompt may not do (a tmux capture, a screen recording, `script(1)`). Raw-mode input is read a byte at a time
- * and decoded once at the end, so a multi-byte character typed at the prompt survives instead of becoming a
- * different password than the one that was typed.
+ * prompt may not do (a tmux capture, a screen recording, `script(1)`). Raw-mode input arrives as bytes and is
+ * decoded once, at Enter, so a multi-byte character typed at the prompt is the character that gets hashed.
+ * That only holds if editing holds too, which is why backspace goes through {@link popLastCharacter} rather
+ * than `bytes.pop()` — and why `reset-password.test.ts` pins the buffer against `Array.from` code-point
+ * deletion, because a password silently missing half of one `ä` cannot be typed again, on the one recovery
+ * path there is, with every session already revoked by the time anyone notices.
  */
 async function readHiddenPassword(out: NodeJS.WritableStream): Promise<string> {
   const input = process.stdin;
@@ -109,8 +139,12 @@ async function readHiddenPassword(out: NodeJS.WritableStream): Promise<string> {
             return;
           }
           if (byte === 0x7f || byte === 0x08) {
-            if (bytes.length > 0) {
-              bytes.pop();
+            // One *character*, not one byte. `ä` reaches a raw-mode terminal as `0xC3 0xA4`, and popping one of
+            // them leaves the lead byte behind: `Buffer.from([0xC3]).toString('utf8')` is U+FFFD, so the script
+            // would hash, commit and report success for a password nobody can type again.
+            if (popLastCharacter(bytes) > 0) {
+              // Exactly one `*` was drawn for that character (see below), so one backspace-erase-backspace is
+              // what takes it off the screen, however many bytes it cost.
               out.write('\b \b');
             }
             continue;
@@ -119,7 +153,9 @@ async function readHiddenPassword(out: NodeJS.WritableStream): Promise<string> {
           // typed into a password on purpose, so it is dropped rather than appended.
           if (byte < 0x20) continue;
           bytes.push(byte);
-          out.write('*');
+          // A continuation byte (`10xxxxxx`) belongs to the character its lead byte started, so drawing a `*`
+          // only for the others keeps the one-glyph-per-keystroke promise for `ä`, `日` and `😀` alike.
+          if ((byte & 0xc0) !== 0x80) out.write('*');
         }
       };
       input.on('data', onData);

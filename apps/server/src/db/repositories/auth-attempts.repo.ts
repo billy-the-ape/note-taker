@@ -10,7 +10,8 @@
  * restart forgets; plan §10 asks for a sliding window *plus* audit rows, not one implemented as the other. And
  * no route reports it in the MVP. A `countRecentAttempts()` would be dead code with a plausible name, so it is
  * not here: the PR that builds a lockout report or a retention job adds its reader next to this one, when it
- * has a caller. Rows therefore have no retention rule yet (`docs/DATA-MODEL.md` §7 says so too).
+ * has a caller. Rows therefore have no retention rule yet (the `auth_attempts` note in `docs/DATA-MODEL.md` §2
+ * says so too, and names the index a future prune would use).
  *
  * Two facts the write keeps:
  *

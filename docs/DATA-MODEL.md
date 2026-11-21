@@ -153,10 +153,18 @@ a user row created by a fixture or a future import path.
 Append-only, never cascaded (it has no `user_id`). PR-07 writes a row for every credential outcome it is asked
 about — each login attempt, either answer, and each self-sign-up whose username was already taken — and none for
 a request a rate window refused, on either endpoint: a blocked client would otherwise grow this table for free.
-It reads them back through `auth_attempts_key_at_idx`; retention is not its job — plan §17 gives the prune job to
-PR-20's maintenance cron, which is also what that index exists for. A self-hosted note app has too few login
-attempts for a retention rule to be a real problem before then, and inventing one here would delete the audit
-trail the rows exist to be.
+
+**Nothing ever deletes these rows, and no retention or prune job is planned for the MVP.** That is the honest
+state: `MVP-FULL-PLAN.md` contains no such job (§16's configuration reference has no knob for it, and PR-20 is the
+documentation pass, not an operations one) — a grep of `docs/plans/mvp` for `prune`/`retention` finds only Docker's
+*pruned install*. An earlier sentence here promised a "maintenance cron in PR-20" that does not exist, which is the
+kind of pointer that makes a reader trust a table that was never written. As of PR-07 the table is written and never
+read; `auth_attempts_key_at_idx (user_key, at desc)` exists for the reader an operator query or a lockout report
+would need, and it is what a future prune would use to find its rows. Growth is one row per credential check on a
+single-instance box, so this is a deliberate non-feature rather than an emergency; whoever adds a rule should put the
+`DELETE` next to `recordAuthAttempt` in `apps/server/src/db/repositories/auth-attempts.repo.ts`, whose header says the
+same thing from the code side, and ship it with the reader that needs the space back rather than as a background job
+an operator has to remember to enable.
 
 ## 3. The root, and why the sibling indexes use `COALESCE`
 

@@ -258,6 +258,13 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
    * stops being the eleventh. And the failure path is a single `throw`: the unknown-user branch runs the dummy
    * verify first and then falls into the same statement, so "no such user" and "wrong password" cannot be told
    * apart by the message, the code, or the time it took.
+   *
+   * A username that Postgres cannot be asked about at all — one containing `U+0000`, which the driver refuses
+   * with SQLSTATE 22021 rather than treating as a value — reaches that same unknown-user branch, because
+   * `userByUsername` answers it as the miss it is (`couldBeAnAccountName`, `db/repositories/users.repo.ts`).
+   * That is worth stating here because the alternative was a `500` on the one endpoint whose job is refusing
+   * strangers: an unauthenticated caller would have gotten a different answer, a different status, an error log
+   * line, and no audit row, all from a character they did not have to guess.
    */
   async function login(input: LoginInput, facts: RequestFacts): Promise<SignedIn> {
     takeWhenRateLimited(loginRateLimitKey(input.username, facts.ip));

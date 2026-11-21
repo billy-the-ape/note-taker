@@ -33,9 +33,18 @@ export interface RecordAuthAttemptInput {
   readonly succeeded: boolean;
 }
 
-/** The `lower(username)` an attempt is keyed by; see this file's header for why it is not the raw username. */
+/**
+ * The `lower(username)` an attempt is keyed by; see this file's header for why it is not the raw username.
+ *
+ * A NUL (U+0000) is the one character this column cannot hold (SQLSTATE 22021), and it is reachable here
+ * because `loginSchema` is deliberately permissive (plan §9.2 #5): `userByUsername` answers a name containing
+ * one as the miss it is, and this row is written next to that uniform `401`. Writing U+FFFD instead keeps the
+ * row — "someone probed `owner\0` at 03:00" is precisely the fact this table exists to hold, and the `catch` in
+ * {@link recordAuthAttempt} would otherwise swallow the failed insert **silently, forever**. A real username is
+ * `[a-z0-9._-]` (`usernameSchema`), so the substitution cannot collide with an account that exists.
+ */
 export function attemptKey(username: string): string {
-  return username.toLowerCase();
+  return username.toLowerCase().replaceAll('\0', '\uFFFD');
 }
 
 /**

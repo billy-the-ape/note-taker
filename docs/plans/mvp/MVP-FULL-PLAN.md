@@ -571,8 +571,9 @@ home/LAN/VM network, possibly behind a reverse proxy.
 - argon2id via `@node-rs/argon2` with OWASP-ish parameters (`memoryCost 65536, timeCost 3, parallelism 1`),
   per-password random salt, encoded string stored in `password_hash`.
 - Password policy: ≥ 10 chars, no username equality, ≤ 512 bytes (argon2 pre-hash guard).
-- Login rate limit: in-process sliding window (10 failures / 15 min per `lower(username)`+IP) **plus** durable rows
-  in `auth_attempts` for audit; on trip → `429 RATE_LIMITED` with `Retry-After`.
+- Login rate limit: in-process sliding window (10 attempts / 15 min per `lower(username)`+IP) **plus** durable rows
+  in `auth_attempts` for audit; the slot is taken as the request arrives rather than when it fails, so the 11th
+  attempt is refused even with the right password. On trip → `429 RATE_LIMITED` with `Retry-After`.
 - Unknown user runs a dummy `argon2.verify` to keep timing uniform.
 
 **Tenancy / injection**
@@ -1155,7 +1156,8 @@ merge with the placeholder still in place — see "Jobs added later" below)
 - **Acceptance:** integration tests: first-run `needsSetup=true` → `setup` creates owner + session; `setup` after
   that ⇒ `CONFLICT`; login success/failure (uniform 401 `UNAUTHORIZED` message); cookie flags asserted in responses;
   logout invalidates (subsequent `GET /api/auth/session` → `user:null`); password change kills other sessions;
-  11th bad login in 15 min ⇒ 429; missing CSRF header on a mutation ⇒ 403; session expiry honored.
+  11th login *attempt* in 15 min ⇒ 429, including one carrying the right password; missing CSRF header on a
+  mutation ⇒ 403; session expiry honored.
   **First-run race:** two `POST /api/auth/setup` calls issued concurrently against an empty DB ⇒ exactly one `200` + one
   `CONFLICT`, and `SELECT count(*) FROM users WHERE role='owner'` is **1** (the loser is caught by
   `users_one_owner_uidx`, §8 — proving the guard is the index and not the `needsSetup` read).

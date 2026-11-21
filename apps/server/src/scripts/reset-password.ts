@@ -44,12 +44,17 @@
  */
 import process from 'node:process';
 
-import { PASSWORD_MAX_LENGTH, passwordMatchesUsername, passwordSchema } from '@note-taker/contracts';
+import {
+  PASSWORD_EQUALS_USERNAME_MESSAGE,
+  PASSWORD_MAX_LENGTH,
+  passwordMatchesUsername,
+  passwordSchema,
+} from '@note-taker/contracts';
 
 import { createArgon2Hasher, utf8ByteLength } from '../auth/passwords.js';
 import { closeDb, getDb } from '../db/client.js';
 import { deleteSessionsOfUser } from '../db/repositories/sessions.repo.js';
-import { setUserPassword, userByUsername } from '../db/repositories/users.repo.js';
+import { couldBeAnAccountName, setUserPassword, userByUsername } from '../db/repositories/users.repo.js';
 import { loadDevEnvFile, parseEnv } from '../env.js';
 
 const SCRIPT_NAME = 'reset-password';
@@ -93,15 +98,130 @@ export function popLastCharacter(bytes: number[]): number {
 }
 
 /**
+ * Where in an escape sequence a raw-mode terminal has left the prompt.
+ *
+ * `text` is the only interesting state: it means the next byte is either the operator's password or a key with
+ * a name (Enter, Ctrl-C, Backspace). `escaped` is a lone `ESC`, and `sequence` is everything an introducer
+ * opens — the body grammar below is the same for `ESC [` (CSI: arrows, Home, Delete, most function keys, and
+ * bracketed paste) and `ESC O` (SS3: F1–F4 and, on some terminals, the arrows), including their modified
+ * forms (`ESC [ 1 ; 5 A`, `ESC O 1 ; 5 P`).
+ */
+export type EscapePhase =
+  | { readonly kind: 'text' }
+  | { readonly kind: 'escaped' }
+  | { readonly kind: 'sequence' };
+
+/** `text`, named so a caller does not have to know which of the three variants that is. */
+export const TEXT_PHASE: EscapePhase = { kind: 'text' };
+
+export interface FeedRequest {
+  /** The buffer as the previous chunk left it. */
+  readonly bytes: readonly number[];
+  /** The phase as the previous chunk left it — escape sequences arrive split across reads. */
+  readonly phase: EscapePhase;
+  /** One raw-mode read. */
+  readonly chunk: readonly number[];
+}
+
+export interface FeedResult {
+  /** The buffer after the chunk. */
+  readonly bytes: number[];
+  readonly phase: EscapePhase;
+  /** How many `*` to draw (one per character, not one per byte). */
+  readonly draw: number;
+  /** How many characters to erase from the display. */
+  readonly erase: number;
+  /** Set when the chunk contained Enter or Ctrl-C; the rest of that chunk is dropped. */
+  readonly stop: 'submit' | 'cancel' | undefined;
+}
+
+/**
+ * Applies one raw-mode read to the prompt's buffer, as a pure function of `(bytes, phase, chunk)`.
+ *
+ * Two bugs of the same shape were found in this loop by review, and both are the same mistake: treating a
+ * terminal's bytes as if they were characters. The first was backspace popping one byte of a multi-byte
+ * character ({@link popLastCharacter}). The second was this: skipping bytes below `0x20` "drops the escape
+ * sequence", but an arrow key is `ESC [ A` = `1b 5b 41`, and only the `1b` is below `0x20` — so `↑` used to add
+ * `[A` to someone's password and draw two `*`, on the one recovery path there is, in the same transaction that
+ * signs the account out of every device. Home (`ESC [ H`), Delete (`ESC [ 3 ~`) and the function keys do the
+ * same, and a paste or a bracketed-paste marker can put the `ESC` in a different read from the rest of it,
+ * which is why the phase is carried in and out rather than the sequence being assumed to fit in one chunk.
+ *
+ * The machine fails closed: every byte of a sequence is consumed and none of it is typed, and `sequence` always
+ * exits on the following byte, so it can never swallow the next Enter. `ESC` followed by something that is not
+ * an introducer reprocesses that byte as text, because the operator's `b` is not part of a stray escape.
+ */
+export function feedPasswordInput(request: FeedRequest): FeedResult {
+  const bytes = [...request.bytes];
+  let phase = request.phase;
+  let draw = 0;
+  let erase = 0;
+
+  for (const byte of request.chunk) {
+    let typed: number | undefined = byte;
+    if (phase.kind !== 'text') {
+      const step = advanceEscape(phase, byte);
+      phase = step.phase;
+      if (step.consumed) typed = undefined;
+    }
+    if (typed === undefined) continue;
+
+    // `\r` is what a terminal sends on Enter; readline-style drivers send `\n`. Ctrl-C (0x03) is a real
+    // interrupt, and it is honoured rather than dropped, because "cancelled" must not look like a submission.
+    if (typed === 0x0d || typed === 0x0a) return { bytes, phase, draw, erase, stop: 'submit' };
+    if (typed === 0x03) return { bytes, phase, draw, erase, stop: 'cancel' };
+
+    if (typed === 0x7f || typed === 0x08) {
+      // One *character*, not one byte: popping `0xA4` and leaving `0xC3` behind would hash, commit and report
+      // success for U+FFFD. Exactly one `*` was drawn for that character, so one `\b \b` takes it away.
+      if (popLastCharacter(bytes) > 0) erase += 1;
+      continue;
+    }
+
+    if (typed === 0x1b) {
+      phase = { kind: 'escaped' };
+      continue;
+    }
+    // Any other control byte (Tab, Bell, Ctrl-D, Ctrl-W…) is not something a password on this prompt contains,
+    // and the alternative — putting it in the buffer — is the bug class this function exists to end.
+    if (typed < 0x20) continue;
+
+    bytes.push(typed);
+    // A continuation byte (`10xxxxxx`) belongs to the character its lead byte started, so drawing a `*` only
+    // for the others keeps the one-glyph-per-keystroke promise for `ä`, `日` and `😀` alike.
+    if ((typed & 0xc0) !== 0x80) draw += 1;
+  }
+
+  return { bytes, phase, draw, erase, stop: undefined };
+}
+
+/** Consumes one byte of an escape sequence; `consumed: false` means the byte is ordinary input after all. */
+function advanceEscape(
+  phase: EscapePhase,
+  byte: number,
+): { readonly phase: EscapePhase; readonly consumed: boolean } {
+  if (phase.kind === 'escaped') {
+    if (byte === 0x5b /* [ for CSI */ || byte === 0x4f /* O for SS3 */) {
+      return { phase: { kind: 'sequence' }, consumed: true };
+    }
+    // A lone `ESC`, or `ESC` in front of a second `ESC`: nothing was being introduced, so the byte counts.
+    return { phase: TEXT_PHASE, consumed: false };
+  }
+  // Parameter bytes `0x30–0x3f` (`0-9 : ; < = > ?`) and intermediate bytes `0x20–0x2f` extend the sequence;
+  // a final byte `0x40–0x7e` ends it. Anything else ends it too and is still not typed: the prompt has no
+  // business believing a terminal it does not understand, and every wrong guess here can only refuse to add a
+  // character, never invent one.
+  if ((byte >= 0x30 && byte <= 0x3f) || (byte >= 0x20 && byte <= 0x2f)) return { phase, consumed: true };
+  return { phase: TEXT_PHASE, consumed: true };
+}
+
+/**
  * The hidden prompt: raw mode, one `*` per character, and the bytes collected but never written.
  *
  * Not `readline`: `readline` in terminal mode *echoes* what it is given, which is the one thing a password
- * prompt may not do (a tmux capture, a screen recording, `script(1)`). Raw-mode input arrives as bytes and is
- * decoded once, at Enter, so a multi-byte character typed at the prompt is the character that gets hashed.
- * That only holds if editing holds too, which is why backspace goes through {@link popLastCharacter} rather
- * than `bytes.pop()` — and why `reset-password.test.ts` pins the buffer against `Array.from` code-point
- * deletion, because a password silently missing half of one `ä` cannot be typed again, on the one recovery
- * path there is, with every session already revoked by the time anyone notices.
+ * prompt may not do (a tmux capture, a screen recording, `script(1)`). Everything the bytes mean is decided by
+ * {@link feedPasswordInput}, which is pure and therefore tested: multi-byte characters survive editing, and
+ * keys with names never reach the buffer.
  */
 async function readHiddenPassword(out: NodeJS.WritableStream): Promise<string> {
   const input = process.stdin;
@@ -115,7 +235,8 @@ async function readHiddenPassword(out: NodeJS.WritableStream): Promise<string> {
   input.resume();
   try {
     return await new Promise<string>((resolve, reject) => {
-      const bytes: number[] = [];
+      let buffer: readonly number[] = [];
+      let phase: EscapePhase = TEXT_PHASE;
       const stop = (): void => {
         input.setRawMode(false);
         input.pause();
@@ -123,39 +244,19 @@ async function readHiddenPassword(out: NodeJS.WritableStream): Promise<string> {
         input.removeAllListeners('error');
       };
       const onData = (chunk: Buffer): void => {
-        for (const byte of chunk) {
-          // `\r` is what a terminal sends on Enter (readline-style drivers send `\n`); Ctrl-C (0x03) is a real
-          // interrupt, and backspace has to remove the `*` as well as the byte.
-          if (byte === 0x0d || byte === 0x0a) {
-            out.write('\n');
-            stop();
-            resolve(Buffer.from(bytes).toString('utf8'));
-            return;
-          }
-          if (byte === 0x03) {
-            stop();
-            out.write('\n');
-            reject(new UsageError('cancelled'));
-            return;
-          }
-          if (byte === 0x7f || byte === 0x08) {
-            // One *character*, not one byte. `ä` reaches a raw-mode terminal as `0xC3 0xA4`, and popping one of
-            // them leaves the lead byte behind: `Buffer.from([0xC3]).toString('utf8')` is U+FFFD, so the script
-            // would hash, commit and report success for a password nobody can type again.
-            if (popLastCharacter(bytes) > 0) {
-              // Exactly one `*` was drawn for that character (see below), so one backspace-erase-backspace is
-              // what takes it off the screen, however many bytes it cost.
-              out.write('\b \b');
-            }
-            continue;
-          }
-          // Everything else a terminal can send — arrows, Home, an escape sequence — is a control code nobody
-          // typed into a password on purpose, so it is dropped rather than appended.
-          if (byte < 0x20) continue;
-          bytes.push(byte);
-          // A continuation byte (`10xxxxxx`) belongs to the character its lead byte started, so drawing a `*`
-          // only for the others keeps the one-glyph-per-keystroke promise for `ä`, `日` and `😀` alike.
-          if ((byte & 0xc0) !== 0x80) out.write('*');
+        const fed = feedPasswordInput({ bytes: buffer, phase, chunk: [...chunk] });
+        buffer = fed.bytes;
+        phase = fed.phase;
+        if (fed.draw > 0) out.write('*'.repeat(fed.draw));
+        if (fed.erase > 0) out.write('\b \b'.repeat(fed.erase));
+        if (fed.stop === 'submit') {
+          out.write('\n');
+          stop();
+          resolve(Buffer.from(fed.bytes).toString('utf8'));
+        } else if (fed.stop === 'cancel') {
+          stop();
+          out.write('\n');
+          reject(new UsageError('cancelled'));
         }
       };
       input.on('data', onData);
@@ -192,7 +293,9 @@ function assertUsablePassword(username: string, password: string): void {
     throw new UsageError(`new password must be at most ${PASSWORD_MAX_LENGTH} bytes encoded as UTF-8`);
   }
   if (passwordMatchesUsername({ username, password })) {
-    throw new UsageError('new password must not be the same as the username');
+    // The contract's words for §10's second rule, prefixed the way every other refusal here is: the script and
+    // the API are the same policy spoken by two processes, and they must not drift into two policies.
+    throw new UsageError(`new password ${PASSWORD_EQUALS_USERNAME_MESSAGE}`);
   }
 }
 
@@ -226,6 +329,15 @@ export async function run(options: RunOptions): Promise<number> {
   // had not run, "nothing was changed" would have been a lie, and the honest sentence sent people to `UPDATE
   // users` by hand with every session of the account still valid. There is no such middle state any more.
   try {
+    // `userByUsername` refuses to ask the database about a name it cannot hold (the SQLSTATE 22021 note lives in
+    // `users.repo.ts`), so the lookup below would answer `undefined` and print "no account named …" — the right
+    // verdict reached by the wrong route, and one that echoes the operator's typo back at them, which a terminal
+    // renders by truncating the line a NUL lands on. Say it in the script's own voice, before the password is
+    // even asked for.
+    if (!couldBeAnAccountName(username)) {
+      throw new UsageError('the username contains a character that cannot be part of an account name');
+    }
+
     const password = await readNewPassword(passwordFromArgv, out);
     assertUsablePassword(username, password);
 

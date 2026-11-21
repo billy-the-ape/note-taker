@@ -146,8 +146,8 @@ a user row created by a fixture or a future import path.
 | Column      | Type                                    | Notes                                                     |
 | ----------- | --------------------------------------- | --------------------------------------------------------- |
 | `id`        | `uuid` PK                                |                                                            |
-| `user_key`  | `text NOT NULL`                          | `lower(username)`, or an IP for an unknown user — failures against a non-existent account are still recorded |
-| `succeeded` | `boolean NOT NULL`                       | only failures count against the lockout (PR-07)            |
+| `user_key`  | `text NOT NULL`                          | `lower(username)` — the key even when no such account exists, so a probe against a name nobody owns is still recorded. A username containing `U+0000` cannot be stored (`text` refuses it, SQLSTATE 22021), so `attemptKey` writes U+FFFD in its place; no real account can collide with that, because `usernameSchema` is `[a-z0-9._-]` (PR-07) |
+| `succeeded` | `boolean NOT NULL`                       | the outcome, for the audit trail. The rate window does not read this column: `http/rate-limit.ts` charges every login *attempt* as it arrives and clears the window on a success (PR-07) |
 | `at`        | `timestamptz NOT NULL DEFAULT now()`     | written by the caller; `between` filters are bound as timestamp parameters |
 
 Append-only, never cascaded (it has no `user_id`). PR-07 writes a row for every credential outcome it is asked

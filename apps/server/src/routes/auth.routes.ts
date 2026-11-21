@@ -27,7 +27,7 @@ import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { type CookiePolicy, clearSessionCookie, issueCsrfCookie, setSessionCookie } from '../http/cookies.js';
 import { type AuthGuard, requestMeta } from '../plugins/auth-guard.js';
 import { type AuthService, type SignedIn, toSessionUser } from '../services/auth.service.js';
-import { changePasswordBodySchema, setupSchema } from './auth.schemas.js';
+import { changePasswordBodySchemaFor, setupSchema } from './auth.schemas.js';
 
 export interface AuthRoutesOptions {
   readonly service: AuthService;
@@ -142,10 +142,14 @@ export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, { s
    * §9.2 #9 — rotates the password, deletes every other session, and rotates *this* one so the caller stays
    * signed in on the device they used. `204` plus a `Set-Cookie` for the new token: no body, and nothing for a
    * proxy to cache about someone's credential change.
+   *
+   * `400 VALIDATION` for a new secret the policy forbids, including one equal to the username (plan §10) —
+   * enforced by the body schema below, which is why the refusal happens before the argon2 verify rather than
+   * after it. The username it is checked against comes from the session, never from the body.
    */
   app.post(ROUTES.auth.password, { preHandler: guard.requireAuth }, async (request, reply) => {
     const context = guard.authenticated(request);
-    const input = changePasswordBodySchema.parse(request.body);
+    const input = changePasswordBodySchemaFor(context.user.username).parse(request.body);
     const session = await service.changePassword({
       user: context.user,
       actingTokenHash: context.tokenHash,

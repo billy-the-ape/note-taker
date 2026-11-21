@@ -78,11 +78,19 @@ export const passwordMatchesUsername = (value: {
   readonly password: string;
 }): boolean => value.password.toLowerCase() === value.username.toLowerCase();
 
+/**
+ * The words for that rule, exported because the body of `POST /api/auth/password` has to add the same issue
+ * itself: its username is not in the body (it is what the cookie says it is), so no schema over the body alone
+ * can state the rule — see `changePasswordBodySchemaFor` in `apps/server/src/routes/auth.schemas.ts`. One
+ * string, so the four endpoints that enforce plan §10's second rule cannot answer in four different voices.
+ */
+export const PASSWORD_EQUALS_USERNAME_MESSAGE = 'must not be the same as the username';
+
 /** The issue the credential schemas add for that rule, at the field a form highlights. */
 const PASSWORD_EQUALS_USERNAME = {
   code: 'custom' as const,
   path: ['password'],
-  message: 'must not be the same as the username',
+  message: PASSWORD_EQUALS_USERNAME_MESSAGE,
 };
 
 /** `POST /api/auth/setup` / `POST /api/auth/register` (§9.2 #3, #4). */

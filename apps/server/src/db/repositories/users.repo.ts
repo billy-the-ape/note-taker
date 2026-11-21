@@ -135,10 +135,31 @@ export function isUsernameTakenConflict(error: unknown): boolean {
 }
 
 /**
+ * True for a name the database can be asked about at all.
+ *
+ * `U+0000` is refused *inside* a Postgres text value (SQLSTATE 22021), so asking for `owner\0` does not return
+ * "no such user" — the statement raises. `plugins/error-handler.ts` maps a code, not a message, and 22021 is
+ * none of the three codes it knows, so that driver error would answer `500 INTERNAL` with an error-level log
+ * line where plan §9.2 #5 promises one uniform `401` — from an unauthenticated request, on an endpoint whose
+ * whole job is refusing guesses.
+ *
+ * Saying "not there" is not a workaround but the true answer: such a string cannot be an account
+ * (`usernameSchema` is `[a-z0-9._-]`), and `undefined` is the answer every caller already renders as an
+ * ordinary failed login. Enforcing it here, at the one username lookup, is also what makes
+ * `reset-password.ts`'s lookup safe by the same stroke, rather than teaching each caller the rule.
+ */
+export function couldBeAnAccountName(username: string): boolean {
+  return !username.includes('\0');
+}
+
+/**
  * The one username lookup in the codebase: case-insensitive, so `Bob` and `bob` are one account, and
  * parameterised so the `lower()` is a function over a bind value rather than a string anyone assembled.
+ *
+ * A name that {@link couldBeAnAccountName} refuses is answered as the miss it is, without a round trip.
  */
 export async function userByUsername(db: Db, username: string): Promise<User | undefined> {
+  if (!couldBeAnAccountName(username)) return undefined;
   const found = await db
     .select()
     .from(users)

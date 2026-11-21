@@ -19,6 +19,7 @@ import {
   authStatusResponseSchema,
   CSRF_COOKIE_NAME,
   CSRF_HEADER_NAME,
+  PASSWORD_EQUALS_USERNAME_MESSAGE,
   ROUTES,
   SESSION_COOKIE_NAME,
   sessionResponseSchema,
@@ -293,6 +294,46 @@ describe('POST /api/auth/login (§9.2 #5)', () => {
         // And neither answer says which half it was: the account name does not appear in the body at all.
         expect(wrongPassword.body).not.toMatch(/owner/i);
         expect(await scalarCount('sessions')).toBe(1);
+      },
+      { db: testDb() },
+    );
+  });
+
+  it('answers a NUL in the username with the same 401, not with a 500', async () => {
+    await withApp(
+      async (app) => {
+        await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.setup,
+          payload: { username: 'owner', password: PASSWORD },
+        });
+
+        // The finding, in one request: Postgres refuses `\0` *inside* a text value (SQLSTATE 22021), so
+        // `lower($1)` used to raise rather than miss, `mapError` recognises only 40001/40P01/23505, and an
+        // unauthenticated caller asking for `owner\0` collected `500 INTERNAL` plus an error-level log line —
+        // skipping the dummy verify and the audit row, after the limiter slot was already taken.
+        const nul = await loginAs(app, 'owner\0', PASSWORD);
+        const unknown = await loginAs(app, 'nobody-here', PASSWORD);
+
+        expect(nul.statusCode).toBe(401);
+        // The identical envelope to an unknown account, message and all: `userByUsername` answers such a name as
+        // the miss it is, so there is no third kind of answer for a probe to tell apart.
+        expect(envelopeOf(nul)).toEqual(envelopeOf(unknown));
+        expect(nul.body).not.toMatch(/owner/i);
+        expect(await scalarCount('sessions')).toBe(1);
+
+        // And the probe is still in the audit table. `lower('owner\0')` cannot be stored, so `attemptKey` writes
+        // U+FFFD where the byte was; the alternative was `recordAuthAttempt`'s `catch` eating the failed insert
+        // silently, which is the one failure mode that file's own header warns about.
+        const rows = await catalogRows(
+          sql`select user_key, succeeded, count(*)::int as n from auth_attempts group by 1, 2 order by 1, 2`,
+        );
+        expect(rows).toEqual([
+          { user_key: 'nobody-here', succeeded: false, n: 1 },
+          // The name as it arrived, lowercased, with the un-storable byte replaced by U+FFFD — a key no real
+          // account can have (`usernameSchema` is `[a-z0-9._-]`), so the substitution cannot hide a hit on one.
+          { user_key: `owner${String.fromCharCode(0xfffd)}`, succeeded: false, n: 1 },
+        ]);
       },
       { db: testDb() },
     );
@@ -611,6 +652,78 @@ describe('POST /api/auth/password (§9.2 #9)', () => {
         });
         expect(session.json()).toMatchObject({ user: { username: 'owner' } });
         expect(await scalarCount('sessions')).toBe(1);
+      },
+      { db: testDb() },
+    );
+  });
+
+  it('refuses a new password that is the username, and refuses it before any argon2 is spent', async () => {
+    await withApp(
+      async (app) => {
+        // Twelve characters, because §10 also requires ten: with the five-character `owner` every other test in
+        // this file creates, this same request is refused for being *short*, which is how the hole stayed
+        // invisible to the suite that otherwise covers this endpoint from four directions.
+        const setup = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.setup,
+          payload: { username: 'ada.lovelace', password: PASSWORD },
+        });
+        expect(setup.statusCode).toBe(200);
+        const acting = jarAfter(setup);
+
+        const refused = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.password,
+          headers: jarHeaders(acting),
+          payload: { currentPassword: PASSWORD, newPassword: 'ada.lovelace' },
+        });
+
+        expect(refused.statusCode).toBe(400);
+        expect(envelopeOf(refused)).toMatchObject({
+          code: 'VALIDATION',
+          details: [{ path: 'newPassword', message: PASSWORD_EQUALS_USERNAME_MESSAGE }],
+        });
+
+        // The refusal is about the *new* secret, so a wrong current password still answers `400` and not `401`:
+        // the body was rejected while it was parsed, before anything was verified or hashed, which is the whole
+        // reason the rule lives in the body schema rather than in `AuthService.changePassword`.
+        const wrongCurrent = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.password,
+          headers: jarHeaders(acting),
+          payload: { currentPassword: 'not-the-current-one', newPassword: 'ADA.LOVELACE' },
+        });
+        expect(wrongCurrent.statusCode).toBe(400);
+        // …and case is not a way round it, because `users_username_lower_uidx` already decided those two
+        // spellings name one account — the same reason `lower(username)` keys the audit table.
+
+        // Nothing rotated: this device is still signed in, it holds the only session, and the old password is
+        // still the one that logs in. A `204` here would have ended all three.
+        const stillHere = await app.inject({
+          method: 'GET',
+          url: ROUTES.auth.session,
+          headers: jarHeaders(acting),
+        });
+        expect(stillHere.json()).toMatchObject({ user: { username: 'ada.lovelace' } });
+        expect(await scalarCount('sessions')).toBe(1);
+
+        const oldPassword = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.login,
+          payload: { username: 'ada.lovelace', password: PASSWORD },
+          remoteAddress: '198.51.100.9',
+        });
+        expect(oldPassword.statusCode).toBe(200);
+
+        // A password that merely *contains* the username is still allowed: §10's rule is equality ignoring case,
+        // and making this endpoint the strictest of the four that take a password would be its own bug.
+        const allowed = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.password,
+          headers: jarHeaders(acting),
+          payload: { currentPassword: PASSWORD, newPassword: 'ada.lovelace-2026' },
+        });
+        expect(allowed.statusCode).toBe(204);
       },
       { db: testDb() },
     );

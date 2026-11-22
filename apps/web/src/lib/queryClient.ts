@@ -22,6 +22,14 @@ import { ApiError } from './api.js';
 
 /** Every cache key the SPA uses. Add a resource here, never inline at the call site. */
 export const queryKeys = {
+  /** `GET /api/auth/status` (§9.2 #2) — `{needsSetup, registrationOpen}`, what every guard reads. */
+  authStatus: ['auth', 'status'] as const,
+  /**
+   * `GET /api/auth/session` (§9.2 #8) — `{user|null}`. Keyed by nothing, because it *is* the cookie:
+   * a second user behind the same browser has a different cookie, and a cache entry that outlived the
+   * session would be the one bug that shows somebody else's name on `/welcome`.
+   */
+  authSession: ['auth', 'session'] as const,
   /** The folder/note tree of one user (§9.2 #12). */
   tree: (userId: string): readonly ['tree', string] => ['tree', userId],
   /** One note, with its decrypted content and version (§9.2 #17). */

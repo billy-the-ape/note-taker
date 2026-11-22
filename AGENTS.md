@@ -92,3 +92,18 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 - **Biome formats code, not prose or markup**: Markdown and YAML are excluded from `pnpm lint`/`pnpm format` on purpose
   (plan §6.4 keeps prose reformatting out of every later PR's diff), so `AGENTS.md`, `docs/plans/**` and any
   `*.yml` stay byte-for-byte as written.
+- **Route guards live in the root route, once** (PR-08): `apps/web/src/routes/__root.tsx`'s `beforeLoad` awaits
+  `guardNavigation(pathname)` in `src/features/auth/session.tsx`, which reads the auth snapshot out of the
+  **`queryClient` singleton** under `authKeys.status` / `authKeys.session` and applies the §4 table
+  (`decideNavigation` is that table as a pure function — add a row there, never a per-page check). A page
+  component never redirects: `routes/welcome.tsx` is §4's placeholder home and **PR-12 deletes it**. The
+  guard failing is not an error — a dead API reads "signed out, nothing installed", which lands on `/login`,
+  the one page that can then explain the dead network by trying.
+- **Web tests boot the whole app against a stubbed `fetch`** (PR-08): `src/test/{setup.ts,fakeApi.ts,authHarness.tsx,renderApp.tsx}`
+  — `renderApp(path)` is `main.tsx` with a memory history, `bootAuth(path, install)` adds the auth routes with a
+  *mutable* session (so a sign-out really ends it, and a successful `setup` clears `needsSetup`), and
+  `noReply: ['login']` is how a test says "nobody answers that". Default env is `node`, so every DOM file needs
+  `// @vitest-environment jsdom` on line 1; `@testing-library/jest-dom` is deliberately **not** a dependency —
+  assert on `textContent`/`getAttribute`/`.value`. Server state is TanStack Query, routing is the router, and
+  `src/lib/uiStore.ts` is the tiny persisted-UI box (`nt.`-prefixed `localStorage`); there is no global client
+  store, and PR-12/13 add their keys to that store rather than inventing a fifth.

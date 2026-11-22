@@ -79,7 +79,11 @@ same PR (add an auth section to `docs/API.md` if PR-05's draft drifted; note `re
 | 11 | `GET /api/users` | owner | `{users:[{id,username,role,createdAt}]}` | Minimal admin surface |
 
 CSRF: every mutation needs `X-CSRF-Token` **except** `login`/`setup`/`register` — those have no session and, on a first
-visit, no `note_csrf` cookie, so they are guarded by an `Origin`/`Sec-Fetch-Site` check instead.
+visit, no `note_csrf` cookie, so they are guarded by an `Origin`/`Sec-Fetch-Site` check instead. As built, the origin
+that check compares against is the API's own `protocol` + `Host`, or — under `TRUST_PROXY=true` — the
+`X-Forwarded-Host`/`X-Forwarded-Proto` pair, which is why `apps/web/vite.config.ts` keeps `changeOrigin: false`: a proxy
+that rewrites `Host` makes every same-origin browser mutation look cross-origin (PR-07's review found exactly that;
+`docs/API.md` §CSRF carries the operator rule).
 
 ## 5. Security rules (implement exactly)
 
@@ -102,9 +106,11 @@ visit, no `note_csrf` cookie, so they are guarded by an `Origin`/`Sec-Fetch-Site
 - argon2id via `@node-rs/argon2`, OWASP-ish parameters: `memoryCost 65536, timeCost 3, parallelism 1`; per-password
   random salt; the encoded string goes into `password_hash`.
 - Password policy: ≥ 10 chars, not equal to the username, ≤ 512 bytes (argon2 pre-hash guard).
-- Login rate limit: in-process sliding window — **10 failures / 15 min per `lower(username)`+IP**
-  (`LOGIN_RATE_LIMIT_MAX`) — **plus** durable `auth_attempts` rows for audit. On trip ⇒ `429 RATE_LIMITED` with
-  `Retry-After`.
+- Login rate limit: in-process sliding window — **10 attempts / 15 min per `lower(username)`+IP**
+  (`LOGIN_RATE_LIMIT_MAX`) — **plus** durable `auth_attempts` rows for audit. The slot is taken as the request
+  arrives, not when it fails, so the 11th attempt is refused even when it carries the right password (a limiter
+  that counted only failures would let a burst of simultaneous guesses each read an empty window). On trip ⇒
+  `429 RATE_LIMITED` with `Retry-After`.
 - Unknown user ⇒ run a dummy `argon2.verify` so timing stays uniform; the 401 message is uniform for unknown user and
   wrong password.
 
@@ -149,8 +155,8 @@ recovery.
       `SECURE_COOKIES=true`).
 - [ ] Logout invalidates: a subsequent `GET /api/auth/session` ⇒ `user:null`.
 - [ ] Password change kills the **other** sessions (and rotates/keeps the acting one, per §4 #9).
-- [ ] The **11th** bad login within 15 min ⇒ `429` (with `Retry-After`); `auth_attempts` rows written for both success
-      and failure.
+- [ ] The **11th** login *attempt* within 15 min ⇒ `429` (with `Retry-After`), including an 11th that carries the
+      right password; `auth_attempts` rows written for both success and failure.
 - [ ] Missing CSRF header on a mutation ⇒ `403`.
 - [ ] Session expiry honored (`expires_at`).
 - [ ] **First-run race:** two concurrent `POST /api/auth/setup` against an empty DB ⇒ exactly one `200` + one `CONFLICT`,

@@ -20,6 +20,19 @@ import { schema } from './schema.js';
 /** Every table this application owns, typed. Repositories take this as their first parameter. */
 export type Db = PostgresJsDatabase<typeof schema>;
 
+/**
+ * A pool, or the transaction a pool is running.
+ *
+ * Repositories that need to be embeddable in a caller's transaction — `insertUserWithSettings` in
+ * `repositories/users.repo.ts`, so that "the user row and its settings row are one unit of work" can be
+ * tested by aborting between the two inserts (docs/plans/mvp/MVP-04.md §5) — take this instead of {@link Db}.
+ * It is the union of the two shapes drizzle hands a query builder, so no statement has to be written twice.
+ */
+export type DbOrTx = Db | Transaction;
+
+/** The transaction object `db.transaction(async (tx) => …)` passes to its callback. */
+type Transaction = Parameters<Parameters<Db['transaction']>[0]>[0];
+
 export interface CreateDbOptions {
   /** Overrides the DSN; defaults to `databaseUrl()`, the single resolver (plan §16). */
   readonly url?: string;

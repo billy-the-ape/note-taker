@@ -32,7 +32,15 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: API_TARGET,
-        changeOrigin: true,
+        // **`changeOrigin` stays `false`, and PR-07's CSRF guard is the reason it is written at all.** The guard
+        // compares the browser's `Origin` with the `Host` the API actually saw, and `changeOrigin: true` rewrites
+        // `Host` to `127.0.0.1:3000` while `Origin` stays `http://localhost:5173` — every mutation the dev SPA
+        // makes, `/api/auth/login` and `/api/auth/setup` included, would then be answered `403`, and the
+        // client's one-shot re-issue could not fix a header the proxy rewrote. Fastify does not route on `Host`,
+        // so there was never anything for the rewrite to buy here; a deployment behind a proxy that *does*
+        // rewrite it sets `TRUST_PROXY=true` and forwards `X-Forwarded-Host`/`X-Forwarded-Proto`
+        // (`ownOriginOf` in `apps/server/src/plugins/csrf.ts`).
+        changeOrigin: false,
       },
     },
   },

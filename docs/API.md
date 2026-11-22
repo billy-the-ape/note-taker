@@ -23,7 +23,7 @@ describes.
 | Base path | `/api` (`API_BASE_PATH`). In development Vite proxies `/api` to the API process, so the SPA calls the same paths with no configuration. |
 | Content type | `application/json; charset=utf-8` both ways. Requests use `UTF-8` explicitly so the 1 MiB body cap is measured in bytes on the way in, not in characters. |
 | Auth | The `HttpOnly` `note_session` cookie (plan §10). "Auth: yes" below means a valid session is required; `GET /api/auth/session` answers with `{ user: null }` instead of failing. |
-| CSRF | Every mutation (`POST`/`PUT`/`PATCH`/`DELETE`) carries `X-CSRF-Token`, echoing the non-`HttpOnly` `note_csrf` cookie, which `GET /api/auth/status` issues. `login`/`setup`/`register` are exempt (`CSRF_EXEMPT_ROUTES`) and guarded by `Origin`/`Sec-Fetch-Site` instead (**PR-07**). |
+| CSRF | Every mutation (`POST`/`PUT`/`PATCH`/`DELETE`) carries `X-CSRF-Token`, echoing the non-`HttpOnly` `note_csrf` cookie (`Max-Age` 1 day, shorter than the session). `GET /api/auth/status` issues it, and every `setup`/`login`/`register`/`logout` response re-issues a fresh one, so it is never older than the browser session carrying it. `login`/`setup`/`register` are exempt (`CSRF_EXEMPT_ROUTES`) and guarded by `Origin`/`Sec-Fetch-Site` instead (**PR-07**). The pair is deliberately **not** bound to a `sessions` row: double-submit equality plus the origin check is what does the binding in a single-instance MVP. The origin a request is measured against is the API's own `protocol` + `Host`; with `TRUST_PROXY=true` the `X-Forwarded-Host`/`X-Forwarded-Proto` pair wins (its **last** value), because a proxy that rewrites `Host` — nginx's default `proxy_set_header Host $proxy_host`, and this repo's own dev proxy until PR-07's review — would otherwise answer every same-origin browser mutation with `403`. `apps/web/vite.config.ts` therefore pins `changeOrigin: false`, and a proxy in front of a deployed instance has to pass `Host` through or send both forwarded headers. Trusting the forwarded host is not a blanket pass: an `Origin` that differs from it is still refused. |
 | Payload cap | 1 MiB request body (Fastify `bodyLimit`) → `PAYLOAD_TOO_LARGE` (413). The UI warns at 900 KiB. |
 | Timestamps | ISO-8601 UTC strings (`isoDateTimeSchema`), i.e. what `JSON.stringify(new Date())` produces. |
 | Ids | UUIDv7 strings. |
@@ -58,7 +58,7 @@ status.
 | `NOT_FOUND`         | 404  | No such route, or no such row **for this user** (never a 403: no id probing)                |
 | `CONFLICT`          | 409  | State clash: sibling name, non-empty folder, duplicate create; retryable by the client      |
 | `VERSION_CONFLICT`  | 409  | The versioned-write guard failed; `data` carries the current server `content` + `version`   |
-| `RATE_LIMITED`      | 429  | Login rate limit or `auth_attempts` lockout                                                 |
+| `RATE_LIMITED`      | 429  | Login rate limit or `auth_attempts` lockout; carries `Retry-After` (**PR-07**)              |
 | `PAYLOAD_TOO_LARGE` | 413  | Over the 1 MiB cap                                                                          |
 | `INTERNAL`          | 500  | A bug. `message` is `internal error`; the real failure is in the log against `requestId`    |
 
@@ -66,6 +66,15 @@ Status is **not** the discriminator: `CONFLICT` and `VERSION_CONFLICT` share 409
 `code`. Postgres `40001` (serialization failure), `40P01` (deadlock) and `23505` (unique violation) map
 to `CONFLICT`/409 rather than an unexplained 500 — all three are retryable, and a client that saw 500
 would not retry.
+
+One number a client may act on is not in the body: a `429` from a rate limit carries `Retry-After` in whole
+seconds — the time the sliding window itself reports — and nothing else writes that header. The envelope above
+has nine codes and no retry shape, so the seconds stay a header instead of becoming a field only one endpoint
+had (**PR-07**). Two properties of the window are worth stating where a client reads about it: it counts
+**attempts**, and a slot is taken synchronously when the request arrives rather than when its outcome is known,
+so `N` simultaneous guesses cannot all pass the gate and then all be verified; and it counts **failed** logins
+as failures only in the sense that a successful login gives the whole window back, so one mistyping person at a
+shared address cannot lock the household out of the account next door.
 
 The two `data` shapes plan §9.1 pins:
 
@@ -85,16 +94,16 @@ conflict (plan §11.4).
 | # | Method + path | Auth | Request | Success | Lands in |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `GET /api/health`, `GET /api/healthz` | none | — | `200 {status:'ok', db:'ok', version}`, or `503 {status:'error', db:'error', version}` when the pool does not answer | **PR-05** (the DTO) + **PR-04** (a real `SELECT 1`; the probe is not a placeholder any more) |
-| 2 | `GET /api/auth/status` | none | — | `{needsSetup, registrationOpen}` | PR-07 |
-| 3 | `POST /api/auth/setup` | none, only while `needsSetup` | `registerSchema` | `200 {user}` + cookie | PR-07 |
-| 4 | `POST /api/auth/register` | none, only when registration is open **and** an owner exists | `registerSchema` | `201 {user}` + cookie | PR-07 |
-| 5 | `POST /api/auth/login` | none | `loginSchema` | `200 {user}` + `note_session` | PR-07 |
-| 6 | `POST /api/auth/logout` | yes | — | `204` | PR-07 |
-| 7 | `POST /api/auth/logout-all` | yes | — | `204` | PR-07 (used by PR-16) |
-| 8 | `GET /api/auth/session` | optional | — | `{user\|null, expiresAt?}` | PR-07 |
-| 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | PR-07 |
-| 10 | `POST /api/users` | owner | `createUserSchema` | `201 {user}` | PR-07 |
-| 11 | `GET /api/users` | owner | — | `usersResponseSchema` (`{users: SessionUser[]}`) | PR-07 |
+| 2 | `GET /api/auth/status` | none | — | `{needsSetup, registrationOpen}` | **PR-07** (issues `note_csrf`; `registrationOpen` mirrors the operator's flag and is not conditioned on `needsSetup`) |
+| 3 | `POST /api/auth/setup` | none, only while `needsSetup` | `registerSchema` | `200 {user}` + cookie | **PR-07** (`409 CONFLICT` once an owner exists — including a different username, where `users_one_owner_uidx` is the guard rather than the `needsSetup` read) |
+| 4 | `POST /api/auth/register` | none, only when registration is open **and** an owner exists | `registerSchema` | `201 {user}` + cookie | **PR-07** (`403 FORBIDDEN` when `ALLOW_REGISTRATION=false` **or** when no owner exists yet: an install with zero owners would lock `/setup` out; `429` + `Retry-After` after `LOGIN_RATE_LIMIT_MAX` attempts per **address** — a username-keyed window would be evaded by renaming every request — and a taken username is `409` plus a failed `auth_attempts` row) |
+| 5 | `POST /api/auth/login` | none | `loginSchema` | `200 {user}` + `note_session` | **PR-07** (`401 UNAUTHORIZED` for an unknown username and a wrong password alike, one message; `429` + `Retry-After` after `LOGIN_RATE_LIMIT_MAX` **attempts** per `lower(username)`+IP — the slot is taken as the request arrives, not when it fails, so a burst cannot slip through) |
+| 6 | `POST /api/auth/logout` | yes | — | `204` | **PR-07** (deletes the row; the cleared cookie alone would be replayable from a request that never sends cookies) |
+| 7 | `POST /api/auth/logout-all` | yes | — | `204` | **PR-07** (used by PR-16; deletes every session of the caller) |
+| 8 | `GET /api/auth/session` | optional | — | `{user\|null, expiresAt?}` | **PR-07** (`expiresAt` only with a user; an expired row is deleted on the request that proves it is dead) |
+| 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | **PR-07** (`401 UNAUTHORIZED` when `currentPassword` is wrong or the acting session vanished; `400 VALIDATION` when the new secret breaks §10 — too short, over 512 bytes, or **equal to the account's own username** ignoring case, which the body schema refuses before argon2 runs, since the username it is checked against comes from the session and not from the body). The acting session is rotated and kept, every other session of that user is deleted, and the old password stops working — one transaction, so a failure at any of the three statements leaves the old password and every session exactly as they were) |
+| 10 | `POST /api/users` | owner | `createUserSchema` | `201 {user}` | **PR-07** (no `role` in the body, so this route can never mint a second owner; creates no session for the new account) |
+| 11 | `GET /api/users` | owner | — | `usersResponseSchema` (`{users: SessionUser[]}`) | **PR-07** (the whole list, oldest first, unpaginated) |
 | 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | PR-09 |
 | 13 | `POST /api/folders` | yes | `createFolderSchema` | `201 FolderNode` | PR-09 |
 | 14 | `PATCH /api/folders/:id` | yes | `patchFolderSchema` | `200 FolderNode` | PR-09 |

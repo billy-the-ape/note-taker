@@ -20,6 +20,9 @@
     "coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/helmet": "^13.2.0",
+    "@node-rs/argon2": "^2.2.2",
     "@note-taker/contracts": "workspace:*",
     "drizzle-orm": "0.45.4",
     "fastify": "^5.12.8",

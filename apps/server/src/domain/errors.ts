@@ -31,6 +31,13 @@ export interface DomainErrorOptions {
   readonly data?: ErrorData;
   /** Field errors for the envelope's `details`. */
   readonly details?: readonly ErrorDetail[];
+  /**
+   * Whole seconds the caller should wait before retrying, rendered as the `Retry-After` header
+   * (plan §10's `429 RATE_LIMITED` from PR-07's login window). Optional on the base rather than a field of
+   * `RateLimitedError` alone, because "when may I ask again" is a property of the answer, not of one class:
+   * a later PR that throttles search or writes gets the header by passing the same option.
+   */
+  readonly retryAfterSeconds?: number;
   /** Wrapped failure, for `Error#cause` and the server log only. */
   readonly cause?: unknown;
 }
@@ -47,6 +54,8 @@ export abstract class DomainError extends Error {
    */
   readonly data?: ErrorData;
   readonly details?: readonly ErrorDetail[];
+  /** The `Retry-After` value this error asks for, when it asks for one. See {@link DomainErrorOptions}. */
+  readonly retryAfterSeconds?: number;
 
   protected constructor(message: string, options: DomainErrorOptions = {}) {
     super(message, { cause: options.cause });
@@ -56,6 +65,7 @@ export abstract class DomainError extends Error {
     // type, which is what lets the envelope leave the keys out instead of sending nulls.
     if (options.data !== undefined) this.data = options.data;
     if (options.details !== undefined) this.details = options.details;
+    if (options.retryAfterSeconds !== undefined) this.retryAfterSeconds = options.retryAfterSeconds;
   }
 
   /** The status this error answers with, straight from the shared table. */

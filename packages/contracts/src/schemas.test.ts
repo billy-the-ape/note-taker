@@ -11,6 +11,7 @@ import {
   createUserSchema,
   displayNameSchema,
   loginSchema,
+  PASSWORD_EQUALS_USERNAME_MESSAGE,
   passwordMatchesUsername,
   passwordSchema,
   registerSchema,
@@ -116,6 +117,10 @@ describe('passwordSchema', () => {
     if (!parsed.success) {
       expect(parsed.error.issues).toHaveLength(1);
       expect(parsed.error.issues[0]?.path).toEqual(['password']);
+      // The words are exported, because `POST /api/auth/password` has to add this same issue around a username
+      // that is not in its body (`changePasswordBodySchemaFor`, `apps/server/src/routes/auth.schemas.ts`) and the
+      // four endpoints that enforce §10's second rule must not be free to phrase it four different ways.
+      expect(parsed.error.issues[0]?.message).toBe(PASSWORD_EQUALS_USERNAME_MESSAGE);
     }
   });
 

@@ -20,16 +20,29 @@ export default defineConfig({
       // The bootstrap is exercised by the acceptance checks (a real `listen()`), not by unit tests,
       // and generated/typed route files arrive in later PRs.
       //
-      // `src/test/**` and `*.int.test.ts` are excluded because the integration suite (PR-04) is the only
-      // place they load: reporting them here as 0% would describe a scope this config never runs.
-      exclude: ['src/index.ts', 'src/**/*.test.ts', 'src/**/*.int.test.ts', 'src/test/**'],
+      // `src/test/**`, `src/scripts/**` and `*.int.test.ts` are excluded because the integration suite (PR-04)
+      // is the only place they load — the rotation script cannot run without a database — so reporting them
+      // here as 0% would describe a scope this config never runs. The integration config leaves
+      // `src/scripts/**` out of *its* report too: that script is exercised as a subprocess (its own process,
+      // where this collector cannot see it), so a 0% row there would read as "untested" next to a test file
+      // that runs it eight times.
+      exclude: ['src/index.ts', 'src/**/*.test.ts', 'src/**/*.int.test.ts', 'src/test/**', 'src/scripts/**'],
       /**
-       * No `thresholds` yet, deliberately: §14's server rows are `src/{crypto,domain}` (armed by
-       * PR-06, which creates those directories) and `src/{services,db,routes}` (armed by PR-04 in
-       * `vitest.integration.config.ts`, the only config with a Postgres service). A threshold over
-       * a scope with nothing in it is a guaranteed red, and thresholds only ever ratchet upward —
-       * so the first PR that can pass a row is the PR that sets it.
+       * §14's `apps/server/src/{crypto,domain}` row, armed by PR-06 — the first PR with files in those
+       * directories that a Postgres-free suite can reach (`src/{services,db,routes}` is PR-04's row in
+       * `vitest.integration.config.ts`). A threshold over a scope with nothing in it is a guaranteed red, and
+       * thresholds only ever ratchet upward, so the first PR that can pass a row is the PR that sets it.
+       *
+       * Written as glob keys because that is how §14 states the row: encryption and the error taxonomy are each
+       * measured over themselves, rather than one aggregate number that a well-tested directory could carry for
+       * an untested one. Values are §14's 80/80/75/80 — and the glob keys are read, not ignored: raising one to
+       * an unreachable value fails the job with `does not meet "src/crypto/**" threshold (99.5%)`, which is the
+       * only way to tell a threshold apart from a decorative object literal.
        */
+      thresholds: {
+        'src/crypto/**': { lines: 80, functions: 80, branches: 75, statements: 80 },
+        'src/domain/**': { lines: 80, functions: 80, branches: 75, statements: 80 },
+      },
     },
   },
 });

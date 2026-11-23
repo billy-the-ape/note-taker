@@ -52,7 +52,7 @@ const ToastContext = createContext<ToastApi | null>(null);
 export function useToast(): ToastApi {
   const context = useContext(ToastContext);
   if (context === null) {
-    throw new Error('useToast() must be used inside <ToastProvider> (see apps/web/src/main.tsx)');
+    throw new Error('useToast() must be used inside <ToastProvider> (see apps/web/src/routes/__root.tsx)');
   }
   return context;
 }

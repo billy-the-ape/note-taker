@@ -67,7 +67,11 @@ export const UNKNOWN_STATUS: AuthStatusResponse = { needsSetup: false, registrat
 /** The same idea for the session half of the boot. */
 export const NO_SESSION: SessionResponse = { user: null };
 
-/** Assembled from the two boot queries; see {@link UNKNOWN_STATUS} for the fallback halves. */
+/**
+ * The snapshot a failed boot is read as: nobody signed in, nothing known about the install. Built from the
+ * two fallbacks above rather than from the queries themselves — {@link UNKNOWN_STATUS} says why "nothing
+ * known" reads as `needsSetup: false` and not `true`.
+ */
 export const SIGNED_OUT_SNAPSHOT: AuthSnapshot = authSnapshot({
   user: null,
   needsSetup: false,

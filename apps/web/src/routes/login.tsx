@@ -8,7 +8,7 @@ import { useSession } from '../features/auth/useSession';
  * `/login` — the only page an unauthenticated visitor is allowed to stay on
  * (docs/plans/mvp/MVP-08.md §4, §6).
  *
- * The route file is five lines because there is nothing here to design: the guard already decided who
+ * The route file is thin because there is nothing here to design: the guard already decided who
  * may see it (`features/auth/session.tsx`), and the form is the shared one. What is *not* shared is the
  * footer link below.
  *
@@ -22,11 +22,13 @@ export const Route = createFileRoute('/login')({
 function LoginPage() {
   const { snapshot, bootFailed } = useSession();
 
-  // The visible half of PR-07's `403 SELF_SIGNUP_CLOSED`/`SETUP_FIRST` pair (§4): the link is offered
-  // only when the route behind it would answer. `!needsSetup` is what stops a fresh install — where
-  // `ALLOW_REGISTRATION=true` makes `registrationOpen` true all by itself — from advertising a form
-  // whose only possible answer is "the owner account does not exist yet".
-  const signUpOpen = snapshot.registrationOpen && !snapshot.needsSetup;
+  // The visible half of PR-07's `403 SELF_SIGNUP_CLOSED`/`SETUP_FIRST` pair (§4): the link is offered only
+  // when the route behind it would answer, and it is offered on the strength of `signupVisible` — the same
+  // flag `decideNavigation` consults for `/signup`, which is the point of it existing. `!needsSetup` appears
+  // here in a comment rather than in the expression because it is what stops a fresh install — where
+  // `ALLOW_REGISTRATION=true` makes `registrationOpen` true all by itself — from advertising a form whose
+  // only possible answer is "the owner account does not exist yet".
+  const signUpOpen = snapshot.signupVisible;
 
   return (
     <>

@@ -94,7 +94,7 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `*.yml` stay byte-for-byte as written.
 - **Route guards live in the root route, once** (PR-08): `apps/web/src/routes/__root.tsx`'s `beforeLoad` awaits
   `guardNavigation(pathname)` in `src/features/auth/session.tsx`, which reads the auth snapshot out of the
-  **`queryClient` singleton** under `authKeys.status` / `authKeys.session` and applies the §4 table
+  **`queryClient` singleton** under `queryKeys.authStatus` / `queryKeys.authSession` and applies the §4 table
   (`decideNavigation` is that table as a pure function — add a row there, never a per-page check). A page
   component never redirects: `routes/welcome.tsx` is §4's placeholder home and **PR-12 deletes it**. The
   guard failing is not an error — a dead API reads "signed out, nothing installed", which lands on `/login`,

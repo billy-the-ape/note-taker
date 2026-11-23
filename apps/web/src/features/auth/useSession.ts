@@ -12,12 +12,15 @@ export type { SessionContextValue };
  * three of them and no owner.
  *
  * The throw is a programming-error message, not a runtime state: every route of this app renders under
- * the provider (see `main.tsx`), so reaching it means somebody mounted a page outside it.
+ * the provider, which `routes/__root.tsx` mounts, so reaching it means somebody added a page outside the
+ * root route or rendered one without a router at all.
  */
 export function useSession(): SessionContextValue {
   const context = useContext(SessionContext);
   if (context === null) {
-    throw new Error('useSession() must be used inside <SessionProvider> (see apps/web/src/main.tsx)');
+    throw new Error(
+      'useSession() must be used inside <SessionProvider> (see apps/web/src/routes/__root.tsx)',
+    );
   }
   return context;
 }

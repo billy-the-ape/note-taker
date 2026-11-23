@@ -137,7 +137,11 @@ export function decideNavigation(pathname: string, snapshot: AuthSnapshot): Navi
       if (snapshot.user !== null) return { kind: 'redirect', to: AUTH_PATHS.welcome };
       // …then the derived flag, so the link and this guard cannot disagree about what "open" means.
       if (snapshot.signupVisible) return ALLOW;
-      return { kind: 'redirect', to: snapshot.needsSetup ? AUTH_PATHS.setup : AUTH_PATHS.login };
+      // Not open, so this is someone who wants a `/signup` that cannot exist: they get home, and `user` is
+      // already known to be null two lines up, which makes home `/setup` on a fresh install and `/login`
+      // otherwise. Calling the helper rather than re-writing its ternary is the difference between one
+      // definition of "home" and two, and this row inventing a third answer is not a risk worth taking.
+      return { kind: 'redirect', to: homePathFor(snapshot) };
 
     case AUTH_PATHS.welcome:
       return snapshot.user === null ? { kind: 'redirect', to: homePathFor(snapshot) } : ALLOW;

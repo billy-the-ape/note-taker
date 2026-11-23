@@ -75,7 +75,7 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 - **The web unit env stays `node`; a DOM test opts in per file** (PR-16): `apps/web/vitest.config.ts` keeps
   `environment: 'node'` and every component test opens with `// @vitest-environment jsdom`, so PR-05's `lib/api.ts`
   suite keeps proving it needs no `document` — and keeps failing the moment one appears. The instruments a DOM test
-  needs live in `apps/web/src/test/**` (excluded from coverage, unlike the server's `src/test/**`): a
+  needs live in `apps/web/src/test/**` (excluded from coverage, like the server's `src/test/**`): a
   session-accurate fake API (a cookie jar per tab, its own `Set-Cookie` obeyed, and `holdNextPatch()` to keep a
   request in flight, which is the only honest way to assert "effective immediately"), a drivable `matchMedia`, and a
   `window.location` that records instead of navigating — `/login` is PR-08's route, so "lands on `/login`" is

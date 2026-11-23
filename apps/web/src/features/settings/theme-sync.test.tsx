@@ -131,6 +131,11 @@ describe('/app/settings — theme', () => {
     await waitFor(() => {
       expect(dark()).toBe(true);
     });
+    // The note beside the select names the *resolved* value while the control itself still says
+    // `system` (ThemeSelect renders the stored value on purpose), and this is the only place that
+    // sentence is checked — PR-19 will click these options, so "says what it is following" is a
+    // claim worth a test rather than a comment.
+    expect(view.getByTestId('settings-theme-resolved').textContent).toBe('Following the system: dark');
     // The point of storing the preference rather than the answer: an OS flip is not a write, and the
     // stored value is still `system` so the next flip follows too.
     expect(patchCalls(server)).toBe(patchesBefore);
@@ -140,6 +145,7 @@ describe('/app/settings — theme', () => {
     await waitFor(() => {
       expect(dark()).toBe(false);
     });
+    expect(view.getByTestId('settings-theme-resolved').textContent).toBe('Following the system: light');
   });
 
   it('takes an explicit `light` over an operating system that went dark', async () => {

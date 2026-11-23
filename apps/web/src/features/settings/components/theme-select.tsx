@@ -64,7 +64,7 @@ export function ThemeSelect({
       {pending ? <PendingNote label="Saving…" /> : null}
       {theme === 'system' ? (
         <span data-testid="settings-theme-resolved" className="text-sm text-ink-muted">
-          {resolved === 'dark' ? 'Following the system: dark' : 'Following the system: light'}
+          {`Following the system: ${resolved}`}
         </span>
       ) : null}
       {errorMessage === undefined ? null : (

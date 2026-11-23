@@ -91,7 +91,11 @@ export interface SettingsStatus {
   /** `false` only before the first response has ever landed, or after a failure that cleared the row. */
   readonly hasData: boolean;
   readonly error: unknown;
-  /** Drops the cached row so the next render refetches it — the "try again" button's whole job. */
+  /**
+   * Invalidates the settings row so it refetches — the "try again" button's whole job. It marks the
+   * entry stale rather than evicting it, so the row stays readable (and `hasData` stays `true`) while
+   * the retry is in flight: a retry that blanks the screen it is standing on would be a worse one.
+   */
   readonly retry: () => void;
 }
 

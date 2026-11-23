@@ -98,7 +98,7 @@ export function CredentialsForm({ mode, heading, description, submitLabel, foote
   const [retryNotice, setRetryNotice] = useState<string | undefined>(undefined);
   const [submitting, setSubmitting] = useState(false);
 
-  const { setUser } = useSession();
+  const { setUser, refreshStatus } = useSession();
   const navigate = useNavigate();
   const { toast } = useToast();
   const isLogin = mode === 'login';
@@ -126,6 +126,20 @@ export function CredentialsForm({ mode, heading, description, submitLabel, foote
       // signed in. The guard that runs on the navigation below then reads this cache entry rather than a
       // stale `{user: null}`, and a refresh still re-reads the row from §9.2 #8.
       setUser(user);
+      if (mode === 'setup') {
+        // The install stopped being new the moment that call returned, and the cache has not heard:
+        // `needsSetup` is 30 s fresh (`staleTime` in `lib/queryClient.ts`) and `guardNavigation` reads the
+        // entry through `ensureQueryData`, which answers a fresh entry rather than re-asking. Left alone,
+        // the owner this form just created could stay on `/setup` — §4's row is `needsSetup ? ALLOW :
+        // home`, and every submit there is now `409 SETUP_ALREADY_DONE` — and a later `401` would be
+        // routed to that same page by `SessionProvider`. Re-reading costs one `GET` and learns
+        // `registrationOpen` from the server instead of guessing what the other boolean did.
+        //
+        // A failed re-read is not a failed setup. The owner exists whatever the API answers next, so the
+        // error is swallowed here rather than announced above a form that worked; the next navigation
+        // asks again.
+        await refreshStatus().catch(() => undefined);
+      }
       await navigate({ to: '/welcome', replace: true });
     } catch (error) {
       const serverFields = error instanceof ApiError ? fieldErrorsFromDetails(error.details) : {};

@@ -62,6 +62,12 @@ describe('/setup — the first-run bootstrap', () => {
     // forgive. A stray `confirmPassword` here would be a `400` the moment it is rejected strictly.
     expect(request?.body).toEqual({ username: TEST_USERNAME, password: TEST_PASSWORD });
     expect(screen.queryByTestId('welcome')).not.toBeNull();
+
+    // The install moved, and only asking again learns that: `needsSetup` is held for `staleTime` and
+    // `guardNavigation` reads it through `ensureQueryData`, which answers a fresh entry rather than
+    // re-asking. The boot pair made the first read; a form that never made the second one would keep
+    // sending its own owner back to `/setup`.
+    expect(callsTo(fake, ROUTES.auth.status).length).toBeGreaterThanOrEqual(2);
   });
 
   it('trims the username on the way out without touching the box', async () => {
@@ -76,6 +82,47 @@ describe('/setup — the first-run bootstrap', () => {
 
     const body = callsTo(fake, ROUTES.auth.setup)[0]?.body as { username: string };
     expect(body.username).toBe(TEST_USERNAME);
+  });
+
+  it('closes /setup behind itself, rather than staying open for 30 seconds', async () => {
+    // The install moved, and this is the consequence: §4's `/setup` row is `needsSetup ? ALLOW : home`, so
+    // an app still holding the pre-setup answer lets its own owner sit on a form whose every submit is now
+    // `409 SETUP_ALREADY_DONE`. The fake keeps answering `needsSetup: true` until the client asks again, so
+    // this navigation is only honest if the form re-read the status on the way out.
+    const { app, user } = await bootAuth('/setup', { needsSetup: true });
+
+    await submitForm(user, 'setup', {
+      username: TEST_USERNAME,
+      password: TEST_PASSWORD,
+      confirmPassword: TEST_PASSWORD,
+    });
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+
+    await app.router.navigate({ to: '/setup', replace: true });
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'), { timeout: 3000 });
+    expect(screen.queryByTestId('setup-form')).toBeNull();
+  });
+
+  it('does not send an expired session to /setup once the owner exists', async () => {
+    // The other half of the same stale flag: `SessionProvider`'s 401 handler routes by
+    // `status?.needsSetup`, so a cache that still says "nothing installed here" answers a session that
+    // went away with the one page that cannot help — and it does so for 30 seconds, without a reload.
+    const { app, user } = await bootAuth('/setup', {
+      needsSetup: true,
+      // The session is gone by the time the sign-out arrives, which is how a `401` happens for real.
+      logoutReply: () => failure(401, 'UNAUTHORIZED', 'the session row is gone'),
+    });
+
+    await submitForm(user, 'setup', {
+      username: TEST_USERNAME,
+      password: TEST_PASSWORD,
+      confirmPassword: TEST_PASSWORD,
+    });
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+
+    await user.click(screen.getByTestId('sign-out'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/login'), { timeout: 3000 });
+    expect(screen.queryByTestId('setup-form')).toBeNull();
   });
 
   it('asks for a confirmation the server never sees, and refuses a mismatch before sending', async () => {

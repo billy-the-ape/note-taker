@@ -56,15 +56,20 @@ export interface BootedApp {
 export async function bootAuth(path: string, install: Installation = {}): Promise<BootedApp> {
   let user: ReturnType<typeof sessionUser> | null = install.user ?? null;
   let needsSetup = install.needsSetup ?? false;
+  // An honest answer is not the same as an *available* answer: `setup` changes the install, and the
+  // client only finds out by asking `GET /api/auth/status` again. The latch is consumed on the read, not
+  // on the POST, so a client that keeps its 30-second cached answer (`staleTime`, and `ensureQueryData`
+  // does not re-ask a fresh entry) keeps seeing `needsSetup: true` here exactly as it would in a browser.
+  // Flipping the flag inside the credential reply instead — which the first version of this harness did
+  // — is how that bug passed review once already.
+  let mustReaskStatus = false;
 
-  const credential = (): Reply => {
+  const credential: Stub = ({ path }) => {
     if (install.credentialReply !== undefined) return install.credentialReply();
     user = sessionUser({ username: TEST_USERNAME, role: needsSetup ? 'owner' : 'member' });
-    // An account now exists. `GET /api/auth/status` has to say so on the next call, or the guard would
-    // send the visitor it just signed in straight back to `/setup` — which is what the first version of
-    // this harness did, and the test that looked like "the redirect never happened" was the harness
-    // lying about the install rather than the app ignoring a successful call.
-    needsSetup = false;
+    // Only `setup` moves a status boolean: `login` cannot run before an owner exists, and `register`
+    // requires one. The other two leave the install exactly as it was.
+    if (path === ROUTES.auth.setup) mustReaskStatus = true;
     return { status: 200, body: { user } };
   };
 
@@ -72,7 +77,14 @@ export async function bootAuth(path: string, install: Installation = {}): Promis
     !(install.noReply ?? []).includes(name);
 
   const routes: Record<string, Stub> = {
-    [`GET ${ROUTES.auth.status}`]: () => statusReply(needsSetup, install.registrationOpen ?? false),
+    [`GET ${ROUTES.auth.status}`]: () => {
+      // The read is what earns the new answer, and only the first read after the install moved.
+      if (mustReaskStatus) {
+        needsSetup = false;
+        mustReaskStatus = false;
+      }
+      return statusReply(needsSetup, install.registrationOpen ?? false);
+    },
     [`GET ${ROUTES.auth.session}`]: () => sessionReply(user),
   };
   if (answered('setup')) routes[`POST ${ROUTES.auth.setup}`] = credential;

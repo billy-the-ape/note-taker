@@ -101,8 +101,11 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   the one page that can then explain the dead network by trying.
 - **Web tests boot the whole app against a stubbed `fetch`** (PR-08): `src/test/{setup.ts,fakeApi.ts,authHarness.tsx,renderApp.tsx}`
   — `renderApp(path)` is `main.tsx` with a memory history, `bootAuth(path, install)` adds the auth routes with a
-  *mutable* session (so a sign-out really ends it, and a successful `setup` clears `needsSetup`), and
-  `noReply: ['login']` is how a test says "nobody answers that". Default env is `node`, so every DOM file needs
+  *mutable* session (so a sign-out really ends it), and `noReply: ['login']` is how a test says "nobody answers
+  that". The install stubs answer the way a server does, not the way the client hopes: a successful `setup` makes
+  `GET /api/auth/status` report `needsSetup: false` **only on the next read**, so a form that keeps its cached
+  answer for `staleTime` fails a test instead of shipping. Assert on `callsTo(fake, path)` when the *request* is
+  the point. Default env is `node`, so every DOM file needs
   `// @vitest-environment jsdom` on line 1; `@testing-library/jest-dom` is deliberately **not** a dependency —
   assert on `textContent`/`getAttribute`/`.value`. Server state is TanStack Query, routing is the router, and
   `src/lib/uiStore.ts` is the tiny persisted-UI box (`nt.`-prefixed `localStorage`); there is no global client

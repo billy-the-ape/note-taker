@@ -210,7 +210,11 @@ export interface SessionContextValue {
   readonly bootFailed: boolean;
   /** Records a `setup`/`register`/`login` answer into the same cache entry the guards read. */
   readonly setUser: (user: SessionUser | null) => void;
-  /** Re-reads `GET /api/auth/status` — for a form whose `403` said the install moved since the look. */
+  /**
+   * Re-reads `GET /api/auth/status`, and waits for the answer. Called by `/setup` once its owner exists:
+   * `needsSetup` is a fact about the install rather than about this tab, and the cache holds it for
+   * `staleTime`, so the page that changed it is the one page that has to say so.
+   */
   readonly refreshStatus: () => Promise<void>;
   /** `POST /api/auth/logout`, then forgets every cached query, then routes to `/login`. Rejects on failure. */
   readonly signOut: () => Promise<void>;

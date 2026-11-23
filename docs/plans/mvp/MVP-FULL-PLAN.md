@@ -1712,10 +1712,13 @@ Rules:
 - The `docker build` **step** inside the `build` job never pushes an image (no registry configured in the MVP).
 - Flaky policy: `retries: 1` for e2e only; a test that fails on re-run gets an immediate follow-up issue/PR.
 - The two `apps/web` rows are armed when the web scope first has tests to measure: **PR-05** turns on
-  `apps/web/src/lib` (mocked-`fetch` tests for `lib/api.ts`) and drops PR-01's `passWithNoTests: true`; **PR-08** turns
-  on the overall `apps/web/src` row with its component tests. Before PR-05 the web config passes with zero files and
-  declares no thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by the PR named in
-  its `enforced by` cell.
+  `apps/web/src/lib` (mocked-`fetch` tests for `lib/api.ts`) and drops PR-01's `passWithNoTests: true`;
+  the overall `apps/web/src` row was **PR-08**'s to turn on with its component tests, and **PR-16**
+  armed it instead — PR-08 had not merged when PR-16 landed the first screen whose components a
+  Postgres-free web suite can render (`/app/settings`), and a row naming a scope nothing measures is
+  not a gate. Before PR-05 the web config passes with zero files and
+  declares no thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by
+  the PR named in its `enforced by` cell.
 
 ---
 

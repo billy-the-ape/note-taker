@@ -99,3 +99,44 @@ system), change-password form (session rotation semantics), sign-out-everywhere 
 - vitest run: autosave toggle effective in the open editor (pill + no debounce writes), change-password keeps the current
   session and kills others, logout-all redirect, theme persistence + system resolution
 ```
+
+## 9. What landed (record, written by the PR that did the work)
+
+Only **PR-07** of the three dependencies named in the header is in this tree: **PR-09's settings endpoints are not
+registered** (`app.ts` mounts health, auth and users only — the `settings` *table* is PR-04's, with the defaults PR-09
+documents), **PR-14 has not merged**, and PR-08 — whose `components/ui/*` and session context §2 assumes — is not
+merged either. One acceptance mechanism therefore had to be chosen rather than assumed. All of it is recorded here
+because the next PR reads this file, not the commit messages.
+
+| §6 criterion | Where it is asserted |
+| --- | --- |
+| Autosave off takes effect immediately in the **open** editor; back on resumes debouncing | `features/settings/autosave-roundtrip.test.tsx` (the flag reaches the editor through one `QueryClient`, with the `PATCH` still in flight; zero debounce writes while off; `Ctrl/Cmd+S` and the Save button still write) |
+| Wrong current password ⇒ inline error, nothing changes | `features/settings/change-password.test.tsx` (the server's `401` text is rendered under the form; password, sessions, route and cache all unchanged) |
+| The acting session survives; every other session answers `401` | same file, third test (`GET /api/auth/session` still returns a user on the **rotated** cookie; the second tab's next guarded request is a `401`) |
+| Sign out everywhere ⇒ `logout-all`, `/login`, other tabs dead | `features/settings/sign-out-everywhere.test.tsx` |
+| Theme persists across reload and respects `system` (stored value **and** applied class) | `features/settings/theme.test.ts` + `features/settings/theme-sync.test.tsx` |
+| A user with no settings row still gets defaults | `theme-sync.test.tsx` (last test) and `settings-page.test.tsx`, both against a fake whose first read creates the server's defaults |
+| `apps/web/src` ≥ 55/55/50/55 | armed in `apps/web/vitest.config.ts` (at 89.6% lines when this landed) |
+
+- **PR-09's endpoints are not registered**, so the two settings calls are exercised against `src/test/fake-api.ts`,
+  whose semantics are taken from `docs/API.md` #22 and `db/schema.ts` (`autosave` default `true`, `theme` default
+  `'system'`, `settings_theme_check`) rather than invented here. The credential calls are the opposite case: they *are*
+  served, and PR-07's own `apps/server/src/routes/auth.routes.int.test.ts` ("kills the old password, keeps this session
+  alive, and deletes every other one") proves the same semantics server-side — which is what makes pinning the rotation
+  criterion from the client half safe. Whoever lands PR-09 should keep the fake and its docblock in step, exactly as
+  `fake-api.ts` already says.
+- **PR-08 is absent**, so the screen is self-contained Tailwind rather than `components/ui/*`, `ApiClientProvider` is
+  `lib/api-client-context.tsx` (PR-16's own, to be replaced or re-exported by PR-08), and the **overall `apps/web/src`
+  coverage row — nominally PR-08's — was armed here** (§14 of the plan is updated to say so).
+- **PR-14 is absent.** The flag's consumer is `apps/web/src/test/editor-harness.tsx`, a ~50-line stand-in that
+  implements exactly PR-14 §6's `settings.autosave === false` rule and is documented as a harness rather than a
+  component. `useAutosaveEnabled()` is the injection surface PR-14 briefs; when it lands it must absorb these
+  assertions, not delete them.
+- **"Navigating away with a dirty buffer prompts Save / Discard / Stay" (§5) is not implemented here.** That prompt is
+  a router blocker, and PR-13 owns `routes/app/route.tsx` and the `useBlocker` kit it hangs off; neither is in this
+  tree, and a settings PR inventing its own blocker would be the second, weaker copy MVP-08 §4 rules out. The harness
+  leaves the blocker out and says why, so the prompt lands once — with PR-13 — rather than twice.
+- **The settings reads validate their body.** `GET /api/settings` needs no `?includeDeleted` (the contract has no
+  `SettingsIncludeDeleted`, §9.2 #22), and `SettingsUpdatedAt = z.iso.datetime()` rejects the millisecond-less strings
+  a `::text` cast produces — which is a trap on another route, not a reason to skip parsing here. `lib/api.ts` offers
+  an unvalidated `text()` escape hatch; `settings.api.ts` deliberately does not take it.

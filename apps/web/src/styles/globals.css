@@ -11,6 +11,19 @@
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
 }
 
+/* PR-16: `/app/settings` stores a theme (`system | light | dark`) and
+   `features/settings/theme.ts` writes the resolved value as `class="dark"` on `<html>`. Tailwind v4's
+   `dark:` variant follows `prefers-color-scheme` by default and would ignore that class entirely, so
+   the variant is redefined here as the class-based one — the two-token dark palette below is the
+   minimum that makes the class visible, and PR-08's full light/dark token set grows from it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-paper-dark: #0b1120;
+  --color-ink-dark: #e2e8f0;
+  --color-ink-muted-dark: #94a3b8;
+}
+
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;
@@ -23,5 +36,16 @@
     color: var(--color-ink);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
+  }
+
+  /* `color-scheme` is what makes the *browser* draw form controls, scrollbars and the date picker for
+     the theme the user chose, which a background color on `<body>` does not cover. */
+  html.dark {
+    color-scheme: dark;
+  }
+
+  html.dark body {
+    background-color: var(--color-paper-dark);
+    color: var(--color-ink-dark);
   }
 }

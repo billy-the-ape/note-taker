@@ -21,7 +21,11 @@
    tokens on `html.dark` (see the base layer) repaints **every** utility that names them, including
    inside `<select>` and `<input>`, where preflight inherits `color` from `<body>`. That is one flip
    for the whole screen instead of a `dark:` class on each of the three controls `/app/settings`
-   happens to own today.
+   happens to own today. (Checked in the build output, not assumed: `.bg-paper` really is
+   `background-color:var(--color-paper)`, and `html.dark` is emitted after the theme block, so it
+   outranks `:root`. The one thing that does not follow is Tailwind's `@supports`-less fallback for
+   `border-ink/20`, which is a static `#0f172a33`; every browser this app targets takes the
+   `color-mix` branch above.)
 
    The first draft of this file instead added `--color-paper-dark` & co. and used them on `<body>`
    alone, which shipped a near-white (`#f8fafc`) select and password inputs with light-grey

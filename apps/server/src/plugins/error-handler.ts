@@ -41,7 +41,7 @@ export interface MappedError {
   readonly message: string;
   readonly details?: readonly ErrorDetail[];
   readonly data?: ErrorData;
-  /** Whole seconds to put in `Retry-After`; only a domain error can ask for it (PR-07's login window). */
+  /** Whole seconds to put in `Retry-After`; only a domain error can ask for it (PR-07's two auth windows). */
   readonly retryAfterSeconds?: number;
 }
 

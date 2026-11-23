@@ -163,7 +163,7 @@ export function CredentialsForm({ mode, heading, description, submitLabel, foote
           label="Username"
           htmlFor={ids.username}
           error={fieldErrors.username}
-          hint={isLogin ? undefined : '3–32 characters: lowercase letters, numbers, and `.` `-` `_`.'}
+          hint={isLogin ? undefined : '3–32 characters: letters, numbers, and `.` `-` `_`.'}
         >
           <Input
             id={ids.username}

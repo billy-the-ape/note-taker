@@ -33,8 +33,8 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   readonly variant?: ButtonVariant;
   readonly size?: ButtonSize;
   /**
-   * Spins in place of the label and disables the button. The label stays in the accessible name, so
-   * a submitting form never announces itself as an empty control.
+   * Spins beside the label and disables the button. Both texts join the accessible name — "Working Save" —
+   * so a submitting form never announces itself as an empty control, and still says what it was for.
    */
   readonly loading?: boolean;
   readonly children?: ReactNode;

@@ -170,7 +170,7 @@ function isJsonContent(contentType: string | null): boolean {
 }
 
 /**
- * `Retry-After` in whole seconds, from the only response that sends it (PR-07's login window).
+ * `Retry-After` in whole seconds, from the only responses that send it (PR-07's login and sign-up windows).
  *
  * Parsed rather than trusted: the contract says seconds, but a proxy could put an HTTP-date there,
  * and a `NaN` reaching a form would render "try again in NaN s". The shape checked is RFC 9110's

@@ -4,7 +4,7 @@
  * PR-01's `createTestLogger` is mandatory here. Fastify's default logger writes every request to stdout, and
  * PR-01's acceptance criterion is that a test run stays quiet enough to read.
  */
-import type { FastifyInstance } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 
 import { buildApp } from '../../app.js';
 import type { Db } from '../../db/client.js';
@@ -25,6 +25,13 @@ export interface WithAppOptions {
    * an integration test's configuration is named in the test.
    */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * A logger that is not the silent default (PR-09), for the one class of assertion the envelope makes
+   * untestable from the response alone: a 500 whose useful half — which row failed — exists **only** in the log.
+   * `captureLogs()` in `./log-capture.ts` builds one that records JSON lines; everything else stays silent, and
+   * passing this must never be how a test decides a request *worked*.
+   */
+  readonly logger?: FastifyBaseLogger;
 }
 
 /**

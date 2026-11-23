@@ -4,7 +4,9 @@
  * Three rules every function here keeps:
  *
  * * **`db` is a parameter.** The pool is injected, so a test can pass its own and the app keeps its own;
- *   nothing in `src/db` reaches for module state (see `db/client.ts`).
+ *   nothing in `src/db` reaches for module state (see `db/client.ts`). PR-09 widened the mutating and
+ *   lookup functions to {@link DbOrTx}: a folder create/move/delete runs inside one transaction and has to be
+ *   able to join it, and `Db` still satisfies the wider type, so PR-04's call sites did not move.
  * * **Every statement is scoped by `user_id`.** The schema's foreign keys do not carry `user_id`, so scoping
  *   is the repository's job; a row that belongs to someone else reads as "not found", which the API renders
  *   as a 404 rather than leaking existence as a 403.
@@ -12,16 +14,29 @@
  *   `COALESCE(parent_id, '00000000-…'::uuid)`, so two root folders with the same name collide while a root
  *   folder and a same-named child of some folder do not.
  *
- * Deliberately **not** here: the cycle check for `moveFolder` (PR-09 owns it, because it needs the per-user
- * `pg_advisory_xact_lock('folder_move', user_id)` that makes the ancestor walk meaningful), and any parent
- * ownership check — a service must scope-load the target folder before passing it in, which is also what
- * turns "move my folder into yours" into a 404.
+ * PR-09 added the statements the cycle and depth rules of docs/plans/mvp/MVP-09.md §5 need, and the one lock
+ * that makes them mean something (the cycle check is *here* now, in the service that calls these functions
+ * inside the lock — a repository that checked without the lock would be a race that looks like a guard):
+ *
+ * * {@link takeFolderMoveLock} — `pg_advisory_xact_lock`, **one per user**, taken first inside the transaction.
+ *   Row locks on the two affected folders are not enough: two moves can lock disjoint pairs, each ancestor walk
+ *   passes against committed state, and a four-node cycle commits. With exactly one advisory lock per user the
+ *   opposite-order acquisition that makes Postgres abort one side of an `A↔B` pair (`40P01`) cannot occur, and
+ *   the loser of the race waits and then reads the committed state.
+ * * {@link folderDepth} — the **upward** walk: how deep is the destination.
+ * * {@link folderSubtreeHeight} — the **downward** walk: how much does a move carry. The upward walk alone
+ *   would pass a whole deep subtree re-parented under a shallow root and drop its tail below the guard.
+ * * {@link listFolderTree} — `GET /api/tree` as one recursive CTE that also walks the breadcrumb path.
+ *
+ * Every recursive statement here carries the same bound, {@link TREE_WALK_GUARD}: a runaway belt against
+ * corrupted `parent_id` data and never a silent truncation, because the service refuses any write that would
+ * put a folder below depth 99 (§5.1–§5.2).
  */
-import { and, asc, eq, isNull } from 'drizzle-orm';
+import { and, asc, eq, isNull, sql } from 'drizzle-orm';
 
-import type { Db } from '../client.js';
+import type { Db, DbOrTx } from '../client.js';
 import { newId } from '../ids.js';
-import { expectOne, firstOrNone } from '../rows.js';
+import { expectOne, firstOrNone, rawRows } from '../rows.js';
 import { type Folder, folders } from '../schema.js';
 
 export interface CreateFolderInput {
@@ -36,8 +51,44 @@ export interface FolderKey {
   readonly id: string;
 }
 
+/**
+ * The runaway guard of every recursive statement in this file: 100 levels, one more than the deepest legal
+ * folder (the root is depth 0 and legal depths are 0…99), so a walk can only reach it on data the API refused
+ * to create. `folder.service.ts` enforces the cap as an error before a write ever needs this bound.
+ */
+export const TREE_WALK_GUARD = 100;
+
+/**
+ * The namespace half of the folder-tree advisory lock. `hashtext` returns `integer`, which is what the
+ * two-argument form of `pg_advisory_xact_lock` takes, and naming the operation keeps this application's tree
+ * locks apart from any other hash-keyed lock in the same database.
+ */
+const FOLDER_MOVE_LOCK_NAMESPACE = sql`hashtext('folder_move')`;
+
+/** One user's whole tree: the row, plus the two facts the recursive walk computed beside it. */
+export interface FolderTreeRow extends Folder {
+  /** Distance from the root: 0 for a root folder, at most 99 for the deepest legal one. */
+  readonly depth: number;
+  /** Its name and every ancestor's, root first — the breadcrumb PR-12's client renders. */
+  readonly path: readonly string[];
+}
+
+/**
+ * Takes the per-user folder lock (docs/plans/mvp/MVP-09.md §5.3).
+ *
+ * Call it **first** inside the transaction, before any walk or write, and only inside a transaction: it is an
+ * *xact* lock, so it releases at commit/rollback, and called outside one it would release immediately and guard
+ * nothing. The key is the **user id** — the one fact two moves in the same tree can never disagree about, which
+ * is what makes the pair of disjoint row-lock pairs of §5.3 impossible.
+ */
+export async function takeFolderMoveLock(db: DbOrTx, userId: string): Promise<void> {
+  await db.execute(
+    sql`select pg_advisory_xact_lock(${FOLDER_MOVE_LOCK_NAMESPACE}, hashtext(${userId}::text))`,
+  );
+}
+
 /** Creates a folder. A sibling already holding `name` raises `folders_unique_sib` (SQLSTATE 23505). */
-export async function createFolder(db: Db, input: CreateFolderInput): Promise<Folder> {
+export async function createFolder(db: DbOrTx, input: CreateFolderInput): Promise<Folder> {
   const inserted = await db
     .insert(folders)
     .values({
@@ -51,7 +102,7 @@ export async function createFolder(db: Db, input: CreateFolderInput): Promise<Fo
 }
 
 /** The row, or `undefined` — which covers "does not exist" and "exists but belongs to someone else". */
-export async function folderById(db: Db, key: FolderKey): Promise<Folder | undefined> {
+export async function folderById(db: DbOrTx, key: FolderKey): Promise<Folder | undefined> {
   const found = await db
     .select()
     .from(folders)
@@ -66,7 +117,7 @@ export async function folderById(db: Db, key: FolderKey): Promise<Folder | undef
  * sentinel rather than `NULL`.
  */
 export async function folderByParentAndName(
-  db: Db,
+  db: DbOrTx,
   input: { readonly userId: string; readonly parentId: string | null; readonly name: string },
 ): Promise<Folder | undefined> {
   const found = await db
@@ -107,7 +158,7 @@ export async function listAllFolders(db: Db, input: { readonly userId: string })
 
 /** Renames a folder; `undefined` means the row was not the caller's to rename. */
 export async function renameFolder(
-  db: Db,
+  db: DbOrTx,
   input: FolderKey & { readonly name: string },
 ): Promise<Folder | undefined> {
   const updated = await db
@@ -126,7 +177,7 @@ export async function renameFolder(
  * produces two siblings with one name.
  */
 export async function moveFolder(
-  db: Db,
+  db: DbOrTx,
   input: FolderKey & { readonly parentId: string | null },
 ): Promise<Folder | undefined> {
   const updated = await db
@@ -143,7 +194,7 @@ export async function moveFolder(
  * The API gates that behaviour behind `?cascade=true` (PR-09): this function is the honest version of what
  * the schema does, which is why there is no "delete anyway" flag here.
  */
-export async function deleteFolder(db: Db, key: FolderKey): Promise<boolean> {
+export async function deleteFolder(db: DbOrTx, key: FolderKey): Promise<boolean> {
   const deleted = await db
     .delete(folders)
     .where(and(eq(folders.id, key.id), eq(folders.userId, key.userId)))
@@ -151,9 +202,16 @@ export async function deleteFolder(db: Db, key: FolderKey): Promise<boolean> {
   return deleted.length > 0;
 }
 
-/** The direct children of one folder (root when `parentId` is `null`), for PR-09's delete confirmation count. */
+/**
+ * The direct child **folders** of one folder (root when `parentId` is `null`), for PR-09's delete confirmation
+ * count. Paired with `notes.repo.ts`'s `countNotesInFolder`, because a folder that holds only notes is not
+ * empty either.
+ *
+ * Direct children are the whole question: a descendant two levels down implies a child one level down, so "no
+ * child folders and no notes here" and "nothing below it" are the same test at this size.
+ */
 export async function countChildren(
-  db: Db,
+  db: DbOrTx,
   input: { readonly userId: string; readonly parentId: string | null },
 ): Promise<number> {
   const children = await db
@@ -181,7 +239,7 @@ export async function countChildren(
  * looping forever.
  */
 export async function isDescendantOrSelf(
-  db: Db,
+  db: DbOrTx,
   input: { readonly userId: string; readonly id: string; readonly targetId: string },
 ): Promise<boolean> {
   if (input.id === input.targetId) return true;
@@ -196,4 +254,124 @@ export async function isDescendantOrSelf(
     current = await folderById(db, { userId: input.userId, id: current.parentId });
   }
   return false;
+}
+/**
+ * One user's whole folder tree in **one** recursive CTE, each row carrying its depth and its breadcrumb path.
+ *
+ * The anchor is the set of the user's **root** folders, so `depth` and `path` fall out of the walk instead of a
+ * second pass over the rows, and `parent.depth < ${TREE_WALK_GUARD}` is the bound §5.1 promises. `path` is
+ * extended by array concatenation, which is the recursive spelling of the same aggregation a one-level
+ * `array_agg` would compute: a recursive step only has the parent's path to hand down, and the result is the
+ * root-first name trail the client renders as a breadcrumb (PR-12) without walking back up per row.
+ *
+ * Ordered by `name collate "C"` — byte order — so the answer is the same on a `C` and an `en_US.utf8` cluster
+ * and no client has to sort twice to get what the server promised (§4 #12). The result is deliberately *flat*:
+ * `folderNodeSchema` is a flat object with a `parentId`, so assembling `children` arrays here would be a
+ * contract change PR-09 is not allowed to make.
+ */
+export async function listFolderTree(db: Db, input: { readonly userId: string }): Promise<FolderTreeRow[]> {
+  const result = await db.execute(sql`
+    with recursive tree as (
+        select f.id,
+               f.user_id,
+               f.parent_id,
+               f.name,
+               f.created_at,
+               f.updated_at,
+               0                      as depth,
+               array [f.name]::text[] as path
+          from folders f
+         where f.user_id = ${input.userId}
+           and f.parent_id is null
+        union all
+        select child.id,
+               child.user_id,
+               child.parent_id,
+               child.name,
+               child.created_at,
+               child.updated_at,
+               parent.depth + 1,
+               parent.path || child.name
+          from folders child
+          join tree parent on child.parent_id = parent.id
+         where parent.depth < ${TREE_WALK_GUARD}
+      )
+    select id, user_id, parent_id, name, created_at, updated_at, depth, path
+      from tree
+     order by name collate "C", id`);
+
+  return rawRows<Record<string, unknown>>(result).map((row) => ({
+    id: String(row.id),
+    userId: String(row.user_id),
+    parentId: row.parent_id === null || row.parent_id === undefined ? null : String(row.parent_id),
+    name: String(row.name),
+    createdAt: row.created_at as Date,
+    updatedAt: row.updated_at as Date,
+    depth: Number(row.depth),
+    path: Array.isArray(row.path) ? row.path.map(String) : [],
+  }));
+}
+
+/**
+ * How deep `id` sits in the tree: **0 for a root folder**, one more per ancestor (§5.2, the upward walk).
+ *
+ * `undefined` means the row is not the caller's — the service answers 404 rather than treating a missing depth
+ * as `0` and quietly writing at the root. The walk is bounded by {@link TREE_WALK_GUARD}.
+ *
+ * There is no stored depth column to read: `folders` has four, and a materialised depth would be a second
+ * truth for a move to get wrong.
+ */
+export async function folderDepth(
+  db: DbOrTx,
+  input: { readonly userId: string; readonly id: string },
+): Promise<number | undefined> {
+  const result = await db.execute(sql`
+    with recursive ancestors as (
+        select self.id, self.parent_id, 0 as depth
+          from folders self
+         where self.user_id = ${input.userId}
+           and self.id = ${input.id}
+        union all
+        select parent.id, parent.parent_id, below.depth + 1
+          from folders parent
+          join ancestors below on parent.id = below.parent_id
+         where below.depth < ${TREE_WALK_GUARD}
+      )
+    select max(depth) as depth from ancestors`);
+
+  const [row] = rawRows<{ readonly depth: unknown }>(result);
+  if (row === undefined || row.depth === null || row.depth === undefined) return undefined;
+  return Number(row.depth);
+}
+
+/**
+ * How far `id`'s subtree reaches **below** it: 0 for a leaf, 1 for one level of children (§5.2, the downward
+ * walk, and the move cap's second half).
+ *
+ * `depth(newParent) + 1 + height(moved subtree) <= 99` is the whole rule for a move. Without the height,
+ * re-parenting a subtree that already reaches depth 99 under a fresh root would pass the destination check and
+ * strand its tail below the bound every walk here obeys — the tree would still *contain* every row, but
+ * `listFolderTree` would stop returning them, which is the failure mode §4 #14 names.
+ */
+export async function folderSubtreeHeight(
+  db: DbOrTx,
+  input: { readonly userId: string; readonly id: string },
+): Promise<number> {
+  const result = await db.execute(sql`
+    with recursive subtree as (
+        select self.id, 0 as height
+          from folders self
+         where self.user_id = ${input.userId}
+           and self.id = ${input.id}
+        union all
+        select child.id, above.height + 1
+          from folders child
+          join subtree above on child.parent_id = above.id
+         where above.height < ${TREE_WALK_GUARD}
+      )
+    select max(height) as height from subtree`);
+
+  const [row] = rawRows<{ readonly height: unknown }>(result);
+  if (row === undefined || row.height === null || row.height === undefined) return 0;
+  return Number(row.height);
 }

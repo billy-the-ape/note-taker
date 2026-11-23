@@ -67,6 +67,25 @@ Status is **not** the discriminator: `CONFLICT` and `VERSION_CONFLICT` share 409
 to `CONFLICT`/409 rather than an unexplained 500 — all three are retryable, and a client that saw 500
 would not retry.
 
+Three more mappings arrived with the tree endpoints, and each exists because the alternative would be a status
+code a client could act on wrongly (**PR-09**):
+
+* **`23503` (foreign-key violation) → `NOT_FOUND`/404.** Every id that arrives in a *body* — `folderId` on a note,
+  `parentId` on a folder — is looked up scoped to the caller before anything is written, so the constraint is
+  already unreachable through an ordinary request; what is left is the parent being deleted in the instant between
+  that check and the insert, which is exactly the state the same request would have described a moment later. A
+  `500` there would report the database's internals as the caller's emergency, and — worse — a `500` for someone
+  else's id next to a `404` for a made-up one is an existence oracle for other people's uuids.
+* **An `EnvelopeError` → `INTERNAL`/500 with the note id in the log line and the generic message on the wire.**
+  The stored ciphertext failed to authenticate, so the plaintext is unrecoverable; the failure text names key
+  versions and fingerprints (which a client cannot act on), and the one body a client might misread as success is
+  `content: ""` — an empty note it would then feel safe overwriting. The operator needs to know *which* row, so
+  the id is attached to the log, next to the `requestId` the envelope already carries.
+* **A move or create that would exceed 100 levels → `VALIDATION`/400**, with `details[].path` of `parentId` (or
+  `folderId` for a note) and a message that states the cap and the depth it would have produced. Nothing is
+  silently truncated: a tree that cannot be built is refused, because a folder quietly dropped at level 101 is
+  data the user can neither see nor delete.
+
 One number a client may act on is not in the body: a `429` from a rate limit carries `Retry-After` in whole
 seconds — the time the sliding window itself reports — and nothing else writes that header. The envelope above
 has nine codes and no retry shape, so the seconds stay a header instead of becoming a field only one endpoint
@@ -104,17 +123,17 @@ conflict (plan §11.4).
 | 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | **PR-07** (`401 UNAUTHORIZED` when `currentPassword` is wrong or the acting session vanished; `400 VALIDATION` when the new secret breaks §10 — too short, over 512 bytes, or **equal to the account's own username** ignoring case, which the body schema refuses before argon2 runs, since the username it is checked against comes from the session and not from the body). The acting session is rotated and kept, every other session of that user is deleted, and the old password stops working — one transaction, so a failure at any of the three statements leaves the old password and every session exactly as they were) |
 | 10 | `POST /api/users` | owner | `createUserSchema` | `201 {user}` | **PR-07** (no `role` in the body, so this route can never mint a second owner; creates no session for the new account) |
 | 11 | `GET /api/users` | owner | — | `usersResponseSchema` (`{users: SessionUser[]}`) | **PR-07** (the whole list, oldest first, unpaginated) |
-| 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | PR-09 |
-| 13 | `POST /api/folders` | yes | `createFolderSchema` | `201 FolderNode` | PR-09 |
-| 14 | `PATCH /api/folders/:id` | yes | `patchFolderSchema` | `200 FolderNode` | PR-09 |
-| 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` (`folderDeletePath()`) | `204` | PR-09 |
-| 16 | `POST /api/notes` | yes | `createNoteSchema` | `201 NoteWithContent` | PR-09 |
-| 17 | `GET /api/notes/:id` | yes | — | `NoteWithContent` + `ETag: W/"v<version>"` | PR-09 |
+| 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | **PR-09** (two flat lists, folders then notes, each ordered by `name collate "C"` then `id` so a `C` and an `en_US.utf8` cluster answer the same way; one recursive CTE for the folders and one flat select for the notes, so the payload is never an N+1; a note body never crosses this wire, and a 99-deep chain renders complete) |
+| 13 | `POST /api/folders` | yes | `createFolderSchema` | `201 FolderNode` | **PR-09** (the root is an explicit `parentId: null`, never `""`; a sibling already holding the name is `409 CONFLICT` with `data.id` of the winner; the 101st level is `400 VALIDATION` naming the 100-level cap rather than a silent truncation; takes the per-user advisory lock, as do 14 and 15) |
+| 14 | `PATCH /api/folders/:id` | yes | `patchFolderSchema` | `200 FolderNode` | **PR-09** (rename and/or move in one request; a no-op rename, and a move to the parent it is already in, are success rather than a conflict; moving a folder under its own descendant is `409`, and so is a move whose subtree would land below the cap — which a destination-depth check alone cannot see; two concurrent moves of one user serialize, one commits and one answers `409`) |
+| 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` (`folderDeletePath()`) | `204` | **PR-09** (without `cascade`, a folder with child folders or notes answers `409 CONFLICT`; with it, one `DELETE` and `ON DELETE CASCADE` take the subtree and every note in it; the row is the caller's or the answer is `404`, and the same sentence answers a row that never existed) |
+| 16 | `POST /api/notes` | yes | `createNoteSchema` | `201 NoteWithContent` | **PR-09** (every field optional: no body is a valid note, so the server generates `new-file-<msepoch>` — stored extension-free — and seals the empty string, which is a real envelope and never empty cipher/iv columns; `folderId` is looked up scoped to the caller first, so another user's folder is `404`, not a `500` about a foreign key) |
+| 17 | `GET /api/notes/:id` | yes | — | `NoteWithContent` + `ETag: W/"v<version>"` | **PR-09** (the tag is weak on purpose — the validator is a version counter, not a hash of bytes a server that cannot read the plaintext could compute. A stored body whose GCM tag does not verify answers `500 INTERNAL` with the note id in the log, **never** `content: ""`, which a client would happily overwrite) |
 | 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) | PR-10 (the read side, #17, is PR-09) |
-| 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | PR-09 |
-| 20 | `DELETE /api/notes/:id` | yes | — | `204` | PR-09 |
+| 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | **PR-09** (rename and/or re-file in one request; `folderId: null` moves to the root and a name that still ends in `.md` is stripped once on the way in; `version` is untouched, so renaming never invalidates an open editor) |
+| 20 | `DELETE /api/notes/:id` | yes | — | `204` | **PR-09** (hard delete of the row and its envelope; a second delete answers `404`) |
 | 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | — | `searchResponseSchema` | PR-11 |
-| 22 | `GET /api/settings`, `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | PR-09 |
+| 22 | `GET /api/settings`, `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | **PR-09** (get-or-create: a caller with no row reads the column defaults with `200` and leaves exactly one row behind, which the next `GET` reads back, so PR-16 has no "settings missing" state to render; `PATCH` ensures the same row, so it can never be a zero-row write reported as success, and it is partial but never empty) |
 
 ## Examples
 

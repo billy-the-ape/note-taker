@@ -26,3 +26,21 @@ export function expectOne<T>(rows: readonly T[], what: string): T {
 export function firstOrNone<T>(rows: readonly T[]): T | undefined {
   return rows[0];
 }
+
+/**
+ * The rows out of a raw `db.execute(sql`…`)`.
+ *
+ * drizzle hands back whatever the driver produced, and depending on the version that is the array of rows
+ * itself or an object carrying them under `rows` — the same two shapes `src/test/helpers/db.ts`'s `catalogRows`
+ * has to accept for the schema tests. PR-09's recursive walks (`folders.repo.ts`'s depth, height and tree
+ * statements) are the first **application** code to read a raw statement, so the tolerance lives here once
+ * rather than in every repository that grows one.
+ *
+ * Type parameters are unchecked here by necessity: a raw statement's result is only typed by the caller's
+ * assertion, which is the trade for writing SQL drizzle cannot express. Never widen this into a parser.
+ */
+export function rawRows<T>(result: unknown): T[] {
+  if (Array.isArray(result)) return result as T[];
+  const rows = (result as { readonly rows?: unknown } | null)?.rows;
+  return Array.isArray(rows) ? (rows as T[]) : [];
+}

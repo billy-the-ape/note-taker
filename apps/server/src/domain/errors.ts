@@ -74,6 +74,25 @@ export abstract class DomainError extends Error {
   }
 }
 
+/**
+ * `VALIDATION` (400) for a request the server cannot honour even though its body parsed.
+ *
+ * `ZodError` covers "this field is not a string/uuid/too long", and that is most of what `VALIDATION` means.
+ * This is the rest: a rule the *server* has to check against the current state of the database, where a field
+ * error is still the true report. The 100-level folder cap of §9.2 #13/#14 is the case that needed it —
+ * `parentId: "<the deepest folder>"` is a perfectly well-formed uuid, and answering `CONFLICT` would tell the
+ * caller to retry something that will never succeed, while `NOT_FOUND`/`FORBIDDEN` would describe a folder the
+ * request never asked about. `details` carries the field the caller has to change, exactly like a schema
+ * failure, so the SPA renders it with the same form code.
+ */
+export class ValidationError extends DomainError {
+  readonly code = 'VALIDATION' as const;
+
+  constructor(message: string, options: DomainErrorOptions = {}) {
+    super(message, options);
+  }
+}
+
 /** `NOT_FOUND` (404). Also the answer to "that row exists, but is not yours" (§9.1). */
 export class NotFoundError extends DomainError {
   readonly code = 'NOT_FOUND' as const;

@@ -12,8 +12,9 @@ Postgres to enforce.
 | Migrations     | `apps/server/migrations/` — committed SQL + `meta/_journal.json`              |
 | Client / pool  | `apps/server/src/db/client.ts` (postgres.js + `drizzle-orm/postgres-js`)      |
 | Migration API  | `apps/server/src/db/migrate.ts` (`migrateDatabase()`, run at boot)            |
-| Repositories   | `apps/server/src/db/repositories/{folders,notes}.repo.ts`                     |
-| Proof          | `apps/server/src/db/**/*.int.test.ts` — 54 tests, run only by `pnpm test:integration` |
+| Repositories   | `apps/server/src/db/repositories/{folders,notes,settings,users}.repo.ts`      |
+| Services       | `apps/server/src/services/{tree,folder,note,settings,auth}.service.ts` — the only layer that decides a status code |
+| Proof          | `apps/server/src/**/*.int.test.ts`, run only by `pnpm test:integration` (PR-04 `db/`, PR-07 auth, PR-09 `services/`, `routes/` and `scripts/`) |
 
 Nothing here is enforced by the application alone. If a rule matters, it is a constraint or an index in the
 database, and an integration test that would fail if it were dropped.
@@ -149,8 +150,13 @@ accepted trade and PR-18's backup drill, not a bug this schema can fix.
 | `theme`     | `text NOT NULL DEFAULT 'system'` + `settings_theme_check` (`theme IN ('system','light','dark')`) | |
 | `updated_at`| `timestamptz NOT NULL DEFAULT now()` |                                               |
 
-PR-07 inserts the row with the user; PR-09's `settings.service.get()` get-or-creates so the invariant survives
-a user row created by a fixture or a future import path.
+PR-07 inserts the row with the user; PR-09 makes that survive a user created by any other path. Both
+`settings.service.get()` and `settings.service.patch()` start with `ensureSettingsRow()` — `INSERT … ON CONFLICT
+(user_id) DO NOTHING`, so two first calls race and one of them is *the success case* — and then read or update the
+row. A user whose row was never written therefore has exactly one row after either call, never a `404`, and never
+the zero-row write that a bare `UPDATE` would report as success; `services/settings.service.int.test.ts` and
+`routes/settings.routes.int.test.ts` assert both halves against a row deleted on purpose. `updated_at` is read
+back from the database rather than assumed, so the timestamp a client is told about is the one the row carries.
 
 ### `auth_attempts`
 
@@ -192,12 +198,39 @@ so the root is one more level and collides like anything else. `src/db/schema.in
 definitions and the violation itself, in the root and inside a folder; `folders_unique_sib` is deferred while
 drizzle-kit builds an index, which is also why the migration is ordered the way it is.
 
-Cycle prevention is **not** a database constraint (Postgres has no recursive CHECK) and is **not** a
-read-then-write in PR-04. PR-09 owns it: `move`/`rename` run in a transaction that FIRST takes
-`pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — one lock per user, serializing
-that user's create/move/delete — and then walks ancestors. Locking only the two affected rows is not enough:
-two moves can lock disjoint pairs (X→Y and Z→W), each pass its own ancestor walk, and commit a cycle.
-`isDescendantOrSelf()` in `folders.repo.ts` is the ancestor walk that check will use.
+Cycle prevention is **not** a database constraint (Postgres has no recursive CHECK), and it is not a
+read-then-write either. PR-09 owns it, as-built: `create`, `move` and `delete` in `services/folder.service.ts`
+each run in one transaction that FIRST takes
+`pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — `takeFolderMoveLock()` in
+`folders.repo.ts`, one lock **per user**, which serializes every folder mutation of that user and nothing else —
+and only then walks ancestors.
+
+Locking only the two affected rows is not enough: two moves can lock disjoint pairs (`X→Y` and `Z→W`), each pass
+its own ancestor walk, and commit a four-node cycle. `isDescendantOrSelf()` (the upward walk from a proposed
+parent) is the check, and it is only correct because the lock guarantees nobody is re-parenting underneath it
+while it runs. `services/folder.service.int.test.ts` asserts both interleavings — the adjacent pair that a
+row-lock design also survives, and the disjoint pair that it does not.
+
+Two more things the same transaction decides, both because the tree is data and not a cache:
+
+* **The 100-level cap is arithmetic on the database's depths, not on a client's breadcrumb.** A create compares
+  `folderDepth(parent)` against the cap; a move compares `folderDepth(destination) + 1 + folderSubtreeHeight(moving)`,
+  where the height is the longest path *below* the folder being moved. The second term is what makes a move of a
+  deep subtree under a root refuse with `VALIDATION` naming the cap, when a destination-depth check alone would
+  have waved it through. Nothing is truncated, ever.
+* **The cascade is the schema's, and the refusal is the service's.** `deleteFolder()` is one `DELETE` over
+  `(id, user_id)`; the descendant folders and the notes inside them go because `parent_id`/`folder_id` are
+  `ON DELETE CASCADE` (§2) — there is no delete-then-recurse in JavaScript, and therefore no state where a folder
+  is gone and its children are not. What the API adds is the *gate*: without `?cascade=true` the service first
+  counts direct children (`countChildren()`) and the notes in this folder (`countNotesInFolder()`) and refuses a
+  non-empty one with `409 CONFLICT`, because a recursive delete the user did not ask for is data destruction.
+* **One read serves the whole tree.** `listFolderTree()` is a single recursive CTE over the caller's rows that
+  returns folders flat with their `depth` and root-first `path`, ordered by `name collate "C", id` so the answer
+  is the same on a `C` and an `en_US.utf8` cluster, and `listNotesForTree()` supplies the notes beside them. The walk's
+  guard is `depth < ${TREE_WALK_GUARD}` (100) — one more than the deepest folder the cap allows, so a legal tree
+  is never truncated — and `tree.service.int.test.ts` renders a 99-deep chain to prove the difference between a
+  guard and a fence. There is no stored depth column: a materialised depth would be a second truth for a move to
+  get wrong.
 
 ## 4. The optimistic-locking contract (PR-10's 409)
 
@@ -246,7 +279,7 @@ tests, which cannot import it because that file imports `expect` from Vitest.
 | SQLSTATE | Means                                                              | Rendered as (PR-07/09/10) |
 | -------- | ------------------------------------------------------------------ | ------------------------- |
 | `23505`  | unique violation — `users_username_lower_uidx`, `users_one_owner_uidx`, `folders_unique_sib`, `notes_unique_sib` | `409 CONFLICT` for all four, as of PR-07: plan §9.1's code list has no `422`, and "that username is taken" and "this install already has an owner" are the same statement to a client — the constraint name that tells them apart goes in the log, not in a new status code |
-| `23503`  | foreign key failed — a `folder_id`/`user_id` that is not there       | `400` (a UI that cannot send this is fine) |
+| `23503`  | foreign key failed — a `folder_id`/`parent_id` that is not there     | `404 NOT_FOUND` (PR-09). Every id that arrives in a **body** is looked up scoped to the caller before anything is written, so this only fires when the parent is deleted between that check and the insert — which is exactly the answer the same request would have given a moment earlier. A `500` here would be a lie about who broke, and a `400` would be a new code for a state a client can only reach by racing itself |
 | `23514`  | CHECK violated — empty name, a role outside `(owner, member)`, a theme outside the three | `400` |
 | `22P02`  | invalid input syntax for a `uuid` (a malformed id in the route)      | `400` |
 | `22001`  | value too long                                                       | `413` for note content, `400` otherwise |
@@ -276,6 +309,13 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | One `settings` row per user, in the user's own transaction | `user_id` is the PK, and `insertUserWithSettings()` is the only writer that pairs them | `schema.int.test.ts` (the fixture's two users get one row each); `users.repo.int.test.ts` (a transaction aborted between the two inserts leaves neither row) |
 | A password change changes the password and revokes the other devices together | one transaction in `auth.service.ts` — `setUserPassword`, `deleteSessionsOfUser` and `rotateSessionToken` all run on the caller's `tx` | `services/auth.service.int.test.ts` (a change whose last statement fails leaves the old hash and both sessions exactly as they were, and still refuses with the service's own `401`) |
 | An install has an owner before anyone joins | `users_one_owner_uidx` here + `auth.service.ts`'s two guards | `routes/registration.int.test.ts` (`POST /api/auth/register` answers `403` on an empty database even with `ALLOW_REGISTRATION=true`, and `needsSetup` stays `true`) |
+| A folder move never creates a cycle | per-user `pg_advisory_xact_lock` + the ancestor walk inside it (§3) | `services/folder.service.int.test.ts` — the adjacent pair started as siblings (one commits, one `409`) and the four-node disjoint-pair race that a row-lock design commits a cycle through; afterwards the tree walk terminates and both folders stay reachable |
+| The tree is at most 100 levels, and a tree that legal is never truncated | the service's cap on create (`folderDepth`) and on move (`destination depth + 1 + subtree height`); no DB constraint can express it | `services/folder.service.int.test.ts` (the 101st level refuses, naming the cap; a deep subtree under a root refuses too) and `services/tree.service.int.test.ts` (a 99-deep chain renders complete, with a note at the bottom) |
+| An id in a **body** is the caller's or the answer is `404` | `folderById`/`noteById` scoped to `userId` before any insert or update, so the FK never fires (§5's `23503` row) | `routes/cross-user.int.test.ts` — the four-call matrix (note create, folder create, folder move, note move) against another user's folder, all four envelopes byte-identical to a nonexistent id, and both trees byte-identical afterwards |
+| A note body never crosses the tree wire | `treeResponseSchema` has no `content`, and `tree.service.ts` maps every row through `toNoteNode()`, which is the one place the cipher/iv/key-version columns are dropped | `services/tree.service.int.test.ts` + `routes/tree.routes.int.test.ts` (the payload is parsed, then searched for a `content` key) |
+| A stored body that will not authenticate is an error, never an empty note | `crypto/envelope.ts` throws; `mapError` renders `INTERNAL` and logs the note id (§5) | `routes/notes.routes.int.test.ts` (the blob is rewritten directly, then `GET /api/notes/:id` answers 500 with no `content` field), `plugins/error-handler.test.ts` (nothing about key versions on the wire) |
+| One `settings` row survives a user whose row was never written | `ensureSettingsRow()` before every read and patch (§2) | `services/settings.service.int.test.ts`, `routes/settings.routes.int.test.ts` (defaults with `200`, one row left behind, read back by a second `GET`, and a `PATCH` on the zero-row user updates exactly one) |
+| The demo seed is safe to run twice | lookup-by-`(user, parent, name)` then insert, never truncate-and-reseed; `main()` refuses `NODE_ENV=production` before it opens a pool | `scripts/seed-demo.int.test.ts` (second run creates 0 and reports the same counts, an edited body and an added folder are left alone, every seeded body opens with the app keyring) |
 
 ## 7. How the schema is built and checked
 
@@ -307,7 +347,8 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
   the latest migration, and it reports `{ total, applied }`.
 - CI: the `integration` job in `.github/workflows/CI.yml` runs a `postgres:16` service, exports
   `DATABASE_URL`, runs `pnpm test:integration` then `pnpm coverage:integration`, and uploads
-  `coverage-integration/`. The `apps/server/src/db` ≥ 80% lines threshold lives in
+  `coverage-integration/`. The `apps/server/src/{db,services,routes}` ≥ 80% thresholds — `db` armed by PR-04 and
+  widened to the services and routes by PR-09 — live in
   `vitest.integration.config.ts` — never in a CI flag.
 - `make db-up` / `db-down` / `db-reset` are the Postgres lifecycle (dev Postgres 16 in Docker);
   `make bootstrap-env` only creates `.env` from `.env.example`, which ships dev defaults and deliberately **no

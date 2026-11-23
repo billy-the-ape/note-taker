@@ -5,6 +5,7 @@ import helmet from '@fastify/helmet';
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 
 import { createArgon2Hasher } from './auth/passwords.js';
+import { getKeyring, type Keyring } from './crypto/keys.js';
 import type { Db } from './db/client.js';
 import type { Env } from './env.js';
 import type { CookiePolicy } from './http/cookies.js';
@@ -14,9 +15,17 @@ import { type AuthGuard, createAuthGuard, registerAuthGuard } from './plugins/au
 import { registerCsrfGuard } from './plugins/csrf.js';
 import { registerErrorHandlers } from './plugins/error-handler.js';
 import { authRoutes } from './routes/auth.routes.js';
+import { folderRoutes } from './routes/folders.routes.js';
 import { healthRoutes } from './routes/health.routes.js';
+import { noteRoutes } from './routes/notes.routes.js';
+import { settingsRoutes } from './routes/settings.routes.js';
+import { treeRoutes } from './routes/tree.routes.js';
 import { usersRoutes } from './routes/users.routes.js';
 import { createAuthService } from './services/auth.service.js';
+import { createFolderService } from './services/folder.service.js';
+import { createNoteService } from './services/note.service.js';
+import { createSettingsService } from './services/settings.service.js';
+import { createTreeService } from './services/tree.service.js';
 
 export interface BuildAppOptions {
   readonly env: Env;
@@ -36,6 +45,16 @@ export interface BuildAppOptions {
   readonly logger?: FastifyBaseLogger;
   /** Reported by `/api/health`. Defaults to the version in `apps/server/package.json`. */
   readonly version?: string;
+  /**
+   * The keyring the note routes seal and open content with (PR-09). Defaults to {@link getKeyring} — the one
+   * process-wide ring built from `NOTE_ENCRYPTION_KEY`/`_FILE`/`_PREVIOUS`/`_VERSION`, or, in development and
+   * test with nothing configured, the persisted key under `.dev/`.
+   *
+   * Injectable because a route test that wants a note it *cannot* read (the tampered-ciphertext case of
+   * `notes.routes.int.test.ts`) is far cheaper to write with two rings than with a database write and a
+   * re-decrypt.
+   */
+  readonly keyring?: Keyring;
   /**
    * The `/api/health` database probe (`probeDb(getDb().db)` in `index.ts`). Absent means the probe reports
    * the static `'ok'` it shipped with in PR-01, which is what every unit test and any pool-less boot uses.
@@ -104,7 +123,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   if (options.db !== undefined) {
-    await registerAuth(app, env, options.db);
+    // `exactOptionalPropertyTypes` again: an absent `keyring` must reach the default parameter of
+    // {@link registerAuth} as `undefined`, which is what `getKeyring()` below then resolves.
+    await registerAuth(app, env, options.db, options.keyring);
   }
 
   return app;
@@ -124,7 +145,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
  * process's memory (see `http/rate-limit.ts`), so two instances would mean two lockouts, and a test that builds
  * its own app gets a clean window rather than inheriting one from whatever ran before it in the same process.
  */
-async function registerAuth(app: FastifyInstance, env: Env, db: Db): Promise<void> {
+async function registerAuth(
+  app: FastifyInstance,
+  env: Env,
+  db: Db,
+  keyring: Keyring = getKeyring(),
+): Promise<void> {
   await app.register(cookie);
   await app.register(helmet, helmetOptions());
 
@@ -143,6 +169,43 @@ async function registerAuth(app: FastifyInstance, env: Env, db: Db): Promise<voi
 
   await app.register(authRoutes, { service, guard, cookies });
   await app.register(usersRoutes, { service, guard });
+
+  // PR-09's domain surface, registered from here rather than from `buildApp()` so it shares the two guards
+  // above: a second `registerAuthGuard` would resolve the same session cookie twice per request for no benefit,
+  // and the CSRF guard has to be in place before a browser may issue a folder `PATCH` at all.
+  await registerDomain(app, db, guard, keyring);
+}
+
+/**
+ * The domain half of the API (docs/plans/mvp/MVP-09.md): `tree.routes.ts` (1) + `folders.routes.ts` (3) +
+ * `notes.routes.ts` (4) + `settings.routes.ts` (2).
+ *
+ * One service object per process, each built over the same injected pool, which is what makes the folder
+ * transaction and the note's envelope share a connection with the rest of the request. Two things are
+ * deliberately *not* constructed here:
+ *
+ * * **The keyring is passed in**, defaulting to {@link getKeyring} at the call site. Only
+ *   `services/note.service.ts` ever holds one, and `GET /api/tree` proves it: the tree is served without a key.
+ * * **No per-request state of any kind.** `createFolderService` closes over the pool and nothing else, so the
+ *   advisory lock in a folder mutation is held by the *transaction*, not by a service instance — which is the
+ *   only way two concurrent requests from one user can be serialised by Postgres rather than by whoever happened
+ *   to build the object.
+ */
+async function registerDomain(
+  app: FastifyInstance,
+  db: Db,
+  guard: AuthGuard,
+  keyring: Keyring,
+): Promise<void> {
+  const folderService = createFolderService({ db });
+  const noteService = createNoteService({ db, keyring });
+  const treeService = createTreeService({ db });
+  const settingsService = createSettingsService({ db });
+
+  await app.register(treeRoutes, { service: treeService, guard });
+  await app.register(folderRoutes, { service: folderService, guard });
+  await app.register(noteRoutes, { service: noteService, guard });
+  await app.register(settingsRoutes, { service: settingsService, guard });
 }
 
 /**

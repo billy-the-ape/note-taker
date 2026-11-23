@@ -41,6 +41,13 @@ export interface CreateNoteInput {
   /** WITHOUT the `.md` suffix (`stripMd()` in `contracts/names.ts`, PR-05, applied by PR-09). */
   readonly name: string;
   readonly content: SealedContent;
+  /**
+   * The row's id. PR-09 passes one it generated **before** it sealed the body, because the envelope's AAD is
+   * `note:<uuid>` (plan §10): the id has to exist before the ciphertext does, and `sealNoteContent()` cannot be
+   * handed an id a later insert would invent. Omitted, `newId()` still mints one — which is what PR-04's
+   * fixture-path tests do, and the only thing they assert about the blob is that the exact bytes round-trip.
+   */
+  readonly id?: string;
 }
 
 export interface NoteKey {
@@ -61,12 +68,15 @@ function contentColumns(content: SealedContent) {
   };
 }
 
-/** Creates a note with its first sealed version. A sibling already holding `name` raises 23505. */
+/**
+ * Creates a note with its first sealed version. A sibling already holding `name` raises `notes_unique_sib`
+ * (SQLSTATE 23505), which is the answer to a name clash the caller checked and lost.
+ */
 export async function createNote(db: Db, input: CreateNoteInput): Promise<Note> {
   const inserted = await db
     .insert(notes)
     .values({
-      id: newId(),
+      id: input.id ?? newId(),
       userId: input.userId,
       folderId: input.folderId ?? null,
       name: input.name,
@@ -225,4 +235,64 @@ export async function deleteNote(db: Db, key: NoteKey): Promise<boolean> {
     .where(and(eq(notes.id, key.id), eq(notes.userId, key.userId)))
     .returning({ id: notes.id });
   return deleted.length > 0;
+}
+
+/**
+ * The names one folder already holds (`folderId: null` for the root).
+ *
+ * PR-09's service asks this **only for a generated name**, so `uniquify()` can pick `plan-2` instead of losing
+ * the insert: a client-sent name must clash rather than be renamed behind the caller's back, so this list is
+ * never consulted for one. Names only, deliberately — a folder listing for the same question would drag every
+ * note body in the folder through the driver as ciphertext nobody reads.
+ */
+export async function noteNamesInFolder(
+  db: Db,
+  input: { readonly userId: string; readonly folderId: string | null },
+): Promise<string[]> {
+  const found = await db
+    .select({ name: notes.name })
+    .from(notes)
+    .where(
+      and(
+        eq(notes.userId, input.userId),
+        input.folderId === null ? isNull(notes.folderId) : eq(notes.folderId, input.folderId),
+      ),
+    );
+  return found.map((row) => row.name);
+}
+
+/**
+ * How many notes sit **directly** in one folder (`folderId: null` for the root), the second half of PR-09's
+ * "is this folder empty?" test — a folder holding only notes is not empty just because it has no child folders.
+ */
+export async function countNotesInFolder(
+  db: Db,
+  input: { readonly userId: string; readonly folderId: string | null },
+): Promise<number> {
+  const found = await db
+    .select({ id: notes.id })
+    .from(notes)
+    .where(
+      and(
+        eq(notes.userId, input.userId),
+        input.folderId === null ? isNull(notes.folderId) : eq(notes.folderId, input.folderId),
+      ),
+    );
+  return found.length;
+}
+
+/**
+ * Every note the user has, for `GET /api/tree`, in the byte order the endpoint promises.
+ *
+ * Notes need no recursion — a note has one `folder_id` and no children — so the tree is this one flat select
+ * beside `folders.repo.ts`'s one recursive CTE, and neither is per-folder: no listing in this file is an N+1.
+ * `collate "C"` matches the folder half so the two lists the client joins are ordered the same way on every
+ * cluster (§4 #12).
+ */
+export async function listNotesForTree(db: Db, input: { readonly userId: string }): Promise<Note[]> {
+  return db
+    .select()
+    .from(notes)
+    .where(eq(notes.userId, input.userId))
+    .orderBy(sql`${notes.name} collate "C"`, asc(notes.id));
 }

@@ -10,8 +10,15 @@
  *
  * The page renders the controls against {@link DEFAULT_SETTINGS} while the first read is in flight:
  * `GET /api/settings` is get-or-create (PR-09), so the row a fresh account gets back *is* what is
- * already on screen, and a skeleton that flashes the same four defaults is a worse version of the
+ * already on screen, and a skeleton that flashes the same two defaults is a worse version of the
  * same wait.
+ *
+ * The error screen is gated on `isError && !hasData`, not `isError` alone, because the two failures
+ * are different events. React Query v5 flags a failed **background refetch** while keeping the row,
+ * and this screen refetches after every patch — so `isError` with data usually means "the values on
+ * screen are the last good ones", not "nothing loaded". Replacing four working controls (and a
+ * half-typed password) with a full-page error for that would be the worse bug; the note under the
+ * header says the refresh failed instead.
  */
 
 import { ApiError } from '../../lib/api.js';
@@ -36,12 +43,14 @@ export function SettingsPage(): React.JSX.Element {
   const status = useSettingsStatus();
   const patch = usePatchSettings();
 
-  // Only a read that has nothing to show and cannot recover gets the page. A fresh account is not
-  // that: PR-09's get-or-create means the first response is the default row, so this branch is a
-  // `5xx` or a session that ended between the click and the request.
-  if (status.isError) {
+  // Only a read that has nothing to show gets the page — hence `&& !hasData`, which is what keeps a
+  // failed *background* refetch from replacing a working screen (see the file header). A fresh
+  // account is not this branch either: PR-09's get-or-create means the first response is the default
+  // row, so reaching here means a `5xx` or a session that ended before anything loaded. There is no
+  // `aria-busy` here: `isLoading` is `isPending`, which cannot be true when `isError` is.
+  if (status.isError && !status.hasData) {
     return (
-      <section data-testid="settings-page" className="flex flex-col gap-4" aria-busy={status.isLoading}>
+      <section data-testid="settings-page" className="flex flex-col gap-4">
         <h1 className="text-2xl font-semibold">Settings</h1>
         <p
           aria-live="assertive"
@@ -63,6 +72,10 @@ export function SettingsPage(): React.JSX.Element {
   }
 
   const patchError = patch.error === null ? undefined : errorMessage(patch.error);
+  // `isError` *with* a row: the values still shown are the last ones that loaded, and saying nothing
+  // about that is how a switch quietly disagrees with the server. Loud enough to notice, quiet
+  // enough not to bury the form: a note above the controls with its own retry.
+  const refreshError = status.isError && status.hasData ? errorMessage(status.error) : undefined;
 
   return (
     <section data-testid="settings-page" className="flex flex-col gap-8" aria-busy={status.isLoading}>
@@ -72,6 +85,24 @@ export function SettingsPage(): React.JSX.Element {
           Preferences are saved as you change them and apply the moment the change lands.
         </p>
       </header>
+
+      {refreshError === undefined ? null : (
+        <div
+          aria-live="polite"
+          data-testid="settings-refresh-error"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-amber-600/30 bg-amber-50 px-4 py-2 text-sm text-amber-900"
+        >
+          <span>{refreshError} — showing the settings that loaded last, which may be out of date.</span>
+          <button
+            type="button"
+            data-testid="settings-refresh-retry"
+            onClick={status.retry}
+            className="font-medium underline"
+          >
+            Try again
+          </button>
+        </div>
+      )}
 
       <FormSection
         title="Editing"

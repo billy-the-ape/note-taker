@@ -11,18 +11,24 @@
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
 }
 
-/* PR-16: `/app/settings` stores a theme (`system | light | dark`) and
-   `features/settings/theme.ts` writes the resolved value as `class="dark"` on `<html>`. Tailwind v4's
-   `dark:` variant follows `prefers-color-scheme` by default and would ignore that class entirely, so
-   the variant is redefined here as the class-based one — the two-token dark palette below is the
-   minimum that makes the class visible, and PR-08's full light/dark token set grows from it. */
-@custom-variant dark (&:where(.dark, .dark *));
+/* PR-16: `/app/settings` stores a theme (`system | light | dark`) and `features/settings/theme.ts`
+   writes the resolved value as `class="dark"` on `<html>`. Tailwind v4's `dark:` variant follows
+   `prefers-color-scheme` by default and would ignore that class entirely, so the variant is
+   redefined here as the class-based one — but the class is not what paints the page.
 
-@theme {
-  --color-paper-dark: #0b1120;
-  --color-ink-dark: #e2e8f0;
-  --color-ink-muted-dark: #94a3b8;
-}
+   v4 compiles `bg-paper` to `background-color: var(--color-paper)`, and an opacity modifier such as
+   `border-ink/20` to `color-mix(... var(--color-ink) 20% ...)`, so redefining the three semantic
+   tokens on `html.dark` (see the base layer) repaints **every** utility that names them, including
+   inside `<select>` and `<input>`, where preflight inherits `color` from `<body>`. That is one flip
+   for the whole screen instead of a `dark:` class on each of the three controls `/app/settings`
+   happens to own today.
+
+   The first draft of this file instead added `--color-paper-dark` & co. and used them on `<body>`
+   alone, which shipped a near-white (`#f8fafc`) select and password inputs with light-grey
+   (`#e2e8f0`) text under Dark — about 1.1:1, i.e. invisible. Dark values now *replace* the light
+   ones rather than sitting next to them under names nothing reads; PR-08's fuller token set should
+   keep that shape (names that mean paper/ink, values that depend on the theme). */
+@custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
   html {
@@ -39,13 +45,16 @@
   }
 
   /* `color-scheme` is what makes the *browser* draw form controls, scrollbars and the date picker for
-     the theme the user chose, which a background color on `<body>` does not cover. */
+     the theme the user chose, which a background color on `<body>` does not cover.
+
+     The three tokens are redefined on the element that carries the class, so they beat `:root`'s
+     `@theme` values on specificity and are inherited by everything the utilities paint — `<body>`
+     needs no `.dark` rule of its own, because it already reads `var(--color-paper)` and
+     `var(--color-ink)`, which now resolve to the dark pair. */
   html.dark {
     color-scheme: dark;
-  }
-
-  html.dark body {
-    background-color: var(--color-paper-dark);
-    color: var(--color-ink-dark);
+    --color-paper: #0b1120;
+    --color-ink: #e2e8f0;
+    --color-ink-muted: #94a3b8;
   }
 }

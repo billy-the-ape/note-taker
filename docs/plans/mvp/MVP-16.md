@@ -136,6 +136,19 @@ because the next PR reads this file, not the commit messages.
   a router blocker, and PR-13 owns `routes/app/route.tsx` and the `useBlocker` kit it hangs off; neither is in this
   tree, and a settings PR inventing its own blocker would be the second, weaker copy MVP-08 §4 rules out. The harness
   leaves the blocker out and says why, so the prompt lands once — with PR-13 — rather than twice.
+- **Review round 1 fixed two UI defects this PR shipped** (see the PR discussion, not a §6 criterion):
+  - The first draft defined `--color-paper-dark`/`--color-ink-dark` and used them on `<body>` only, so under
+    `class="dark"` the `<select>` and both password `<input>`s kept `bg-paper` (`#f8fafc`) and inherited the light
+    body text — about 1.1:1. `styles/globals.css` now **redefines the three semantic tokens on `html.dark`**, because
+    v4 compiles `bg-paper` to `var(--color-paper)` and `/20` modifiers to `color-mix(… var(--color-ink) …)`: one flip
+    repaints every utility that names them, including inside form controls. PR-08's token set should keep that shape
+    (names that mean paper/ink, values that depend on the theme) rather than pairing each token with a `-dark` twin
+    nothing reads.
+  - The error screen is gated on `isError && !hasData`. React Query v5 raises `isError` for a failed **background
+    refetch** while keeping `data`, and this screen refetches after every patch, so `isError` alone meant "a `PATCH`
+    failed *and* the refetch behind it failed" wiped four working controls, hid the patch error, and discarded
+    half-typed passwords. A failed refresh with a row on screen is a note (`settings-refresh-error`) with its own
+    retry; only a screen with nothing to show gets replaced.
 - **The settings reads validate their body.** `GET /api/settings` needs no `?includeDeleted` (the contract has no
   `SettingsIncludeDeleted`, §9.2 #22), and `SettingsUpdatedAt = z.iso.datetime()` rejects the millisecond-less strings
   a `::text` cast produces — which is a trap on another route, not a reason to skip parsing here. `lib/api.ts` offers

@@ -71,13 +71,25 @@ export function useSettingsTheme(): SettingsTheme {
 }
 
 /**
- * What the page needs beyond the value: whether the row is still loading, and whether the failure is
- * the kind a person can act on. PR-09's get-or-create means a fresh account never lands here; a
- * `401` (signed out in another tab) and a `5xx` do, and both get the same "try again" affordance.
+ * What the page needs beyond the value: whether the row is still loading, whether the failure is
+ * the kind a person can act on, and — the one that is easy to leave out — **whether there is a row
+ * at all to keep showing**.
+ *
+ * React Query v5 sets `isError` for a failed *background refetch* while keeping `data`, and this
+ * screen refetches after every `PATCH` (`use-patch-settings` invalidates in `onSettled`), so
+ * `isError` alone cannot be read as "nothing to show". The page's rule is therefore
+ * `isError && !hasData`: a row that exists stays on screen (see `settings-page.tsx`, where the
+ * failed refresh gets its own note instead of replacing four working controls and throwing away
+ * half-typed passwords).
+ *
+ * PR-09's get-or-create means a fresh account never lands on the failure path; a `401` (signed out
+ * in another tab) and a `5xx` do, and both get the same "try again" affordance.
  */
 export interface SettingsStatus {
   readonly isLoading: boolean;
   readonly isError: boolean;
+  /** `false` only before the first response has ever landed, or after a failure that cleared the row. */
+  readonly hasData: boolean;
   readonly error: unknown;
   /** Drops the cached row so the next render refetches it — the "try again" button's whole job. */
   readonly retry: () => void;
@@ -89,6 +101,7 @@ export function useSettingsStatus(): SettingsStatus {
   return {
     isLoading: query.isPending,
     isError: query.isError,
+    hasData: query.data !== undefined,
     error: query.error,
     retry: () => void queryClient.invalidateQueries({ queryKey: queryKeys.settings }),
   };

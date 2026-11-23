@@ -20,7 +20,7 @@ export const THEME_OPTIONS: readonly ThemeOption[] = [
   { value: 'system', label: 'System', testId: 'settings-theme-system' },
   { value: 'light', label: 'Light', testId: 'settings-theme-light' },
   { value: 'dark', label: 'Dark', testId: 'settings-theme-dark' },
-] as const;
+];
 
 export interface ThemeSelectProps {
   readonly theme: SettingsTheme;

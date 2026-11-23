@@ -10,7 +10,7 @@
  * the page, not the transport.
  *
  * Which endpoints exist in this tree is worth stating, because it explains the test layout:
- * `ROUTES.auth.password` and `ROUTES.auth/logout-all` are served (PR-07), while `ROUTES.settings`
+ * `ROUTES.auth.password` and `ROUTES.auth.logoutAll` are served (PR-07), while `ROUTES.settings`
  * is **PR-09's and is not registered yet** — `app.ts` mounts health, auth and users only. So the two
  * settings calls are covered by the fake in `src/test/fake-api.ts`, whose semantics are taken from
  * `docs/API.md` #22 and `db/schema.ts`'s `settings` defaults (PR-04), not invented here; PR-09's own

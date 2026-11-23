@@ -213,8 +213,8 @@ describe('ApiError', () => {
   });
 
   it('carries Retry-After only when it is whole seconds, because a form has to say a number', async () => {
-    // One helper per header value, because the interesting half of this contract is what a *proxy*
-    // answers rather than what this app sends.
+    // One helper, called once per header value, because the interesting half of this contract is what a
+    // *proxy* answers rather than what this app sends.
     const retryAfter = async (header: string): Promise<number | undefined> => {
       const fetch = mockFetch([new Response('', { status: 429, headers: { 'retry-after': header } })]);
       const client = createApiClient({ fetch: fetch.fetch, readCsrfToken: () => undefined });
@@ -232,8 +232,13 @@ describe('ApiError', () => {
     // The contract is whole seconds (docs/API.md), and a fraction or a time already passed is not that.
     expect(await retryAfter('1.5')).toBeUndefined();
     expect(await retryAfter('-1')).toBeUndefined();
-    // The case `Number()` gets wrong on its own: an empty value converts to `0`, i.e. an invitation to
-    // retry immediately on a response whose whole point is "not yet".
+    // The divergence that would actually cost someone: `Number('1e3')` is a fine `1000`, so reading the
+    // header arithmetically would report seventeen minutes from a value that is not `delay-seconds` at all.
+    // The same is true of `+45`, `0x21`, `45.` and `-0`; one of them is enough to pin the shape.
+    expect(await retryAfter('1e3')).toBeUndefined();
+    // And the case `Number()` gets wrong on its own: an empty value survives `Headers.get()` (which trims,
+    // but does not remove) and converts to `0`, i.e. an invitation to retry immediately on a response whose
+    // whole point is "not yet".
     expect(await retryAfter('')).toBeUndefined();
   });
 });

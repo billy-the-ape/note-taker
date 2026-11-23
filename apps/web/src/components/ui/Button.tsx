@@ -63,7 +63,7 @@ export function Button({
         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-paper
         disabled:cursor-not-allowed disabled:opacity-60 ${VARIANTS[variant]} ${SIZES[size]} ${className}`}
     >
-      {loading ? <Spinner label="Working" size="sm" showLabel={false} /> : null}
+      {loading ? <Spinner label="Working" size="sm" /> : null}
       {children}
     </button>
   );

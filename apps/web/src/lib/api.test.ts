@@ -211,6 +211,31 @@ describe('ApiError', () => {
       requestId: 'req-9',
     });
   });
+
+  it('carries Retry-After only when it is whole seconds, because a form has to say a number', async () => {
+    // One helper per header value, because the interesting half of this contract is what a *proxy*
+    // answers rather than what this app sends.
+    const retryAfter = async (header: string): Promise<number | undefined> => {
+      const fetch = mockFetch([new Response('', { status: 429, headers: { 'retry-after': header } })]);
+      const client = createApiClient({ fetch: fetch.fetch, readCsrfToken: () => undefined });
+
+      const error = await client.request(ROUTES.tree).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      return (error as ApiError).retryAfterSeconds;
+    };
+
+    expect(await retryAfter('45')).toBe(45);
+    // `Number('Wed, 21 Oct …')` is `NaN`, and a `NaN` reaching the login form reads "try again in NaN s".
+    expect(await retryAfter('Wed, 21 Oct 2015 07:28:00 GMT')).toBeUndefined();
+    // The contract is whole seconds (docs/API.md), and a fraction or a time already passed is not that.
+    expect(await retryAfter('1.5')).toBeUndefined();
+    expect(await retryAfter('-1')).toBeUndefined();
+    // The case `Number()` gets wrong on its own: an empty value converts to `0`, i.e. an invitation to
+    // retry immediately on a response whose whole point is "not yet".
+    expect(await retryAfter('')).toBeUndefined();
+  });
 });
 
 describe('the one-shot CSRF refresh-and-replay (§9)', () => {

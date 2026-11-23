@@ -111,7 +111,7 @@ export async function bootAuth(path: string, install: Installation = {}): Promis
   // helper that gets misused, and the assertion says which half of "booted" has to be true.
   await waitFor(() => expect(app.router.state.isLoading).toBe(false), { timeout: 3000 });
 
-  return { fake, app, user: await userEvent.setup() };
+  return { fake, app, user: userEvent.setup() };
 }
 
 /** Fills the shared credential form's boxes and presses its button. */

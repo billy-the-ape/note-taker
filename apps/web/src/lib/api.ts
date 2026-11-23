@@ -173,14 +173,14 @@ function isJsonContent(contentType: string | null): boolean {
  * `Retry-After` in whole seconds, from the only response that sends it (PR-07's login window).
  *
  * Parsed rather than trusted: the contract says seconds, but a proxy could put an HTTP-date there,
- * and a `NaN` reaching a form would render "try again in NaN s". Anything that is not a
- * non-negative integer is simply no information.
+ * and a `NaN` reaching a form would render "try again in NaN s". The shape checked is RFC 9110's
+ * `delay-seconds = 1*DIGIT`, so anything else — a date, a fraction, a negative, or the empty header
+ * that `Number('')` would quietly read as "retry now" — is simply no information.
  */
 function retryAfterOf(headers: Headers): number | undefined {
   const raw = headers.get('retry-after');
-  if (raw === null) return undefined;
-  const seconds = Number(raw);
-  return Number.isFinite(seconds) && seconds >= 0 && Number.isInteger(seconds) ? seconds : undefined;
+  if (raw === null || !/^\d+$/.test(raw)) return undefined;
+  return Number(raw);
 }
 
 /**

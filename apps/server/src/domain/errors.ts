@@ -33,9 +33,10 @@ export interface DomainErrorOptions {
   readonly details?: readonly ErrorDetail[];
   /**
    * Whole seconds the caller should wait before retrying, rendered as the `Retry-After` header
-   * (plan §10's `429 RATE_LIMITED` from PR-07's login window). Optional on the base rather than a field of
-   * `RateLimitedError` alone, because "when may I ask again" is a property of the answer, not of one class:
-   * a later PR that throttles search or writes gets the header by passing the same option.
+   * (plan §10's `429 RATE_LIMITED` from PR-07's login and sign-up windows). Optional on the base rather
+   * than a field of `RateLimitedError` alone, because "when may I ask again" is a property of the answer,
+   * not of one class: a later PR that throttles search or writes gets the header by passing the same
+   * option.
    */
   readonly retryAfterSeconds?: number;
   /** Wrapped failure, for `Error#cause` and the server log only. */

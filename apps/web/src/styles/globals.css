@@ -2,16 +2,90 @@
    pair, and design tokens live in CSS — utilities such as `bg-brand` are generated from @theme. */
 @import "tailwindcss";
 
+/*
+ * The whole design system (docs/plans/mvp/MVP-08.md §5). It is deliberately a list of *names* rather
+ * than a palette: `bg-paper`, `bg-surface`, `text-ink`, `text-ink-muted`, `border-line`, `bg-brand`,
+ * `text-danger` and `focus-visible:ring-brand` are the utilities every component in this app is
+ * written against, and switching light to dark is this file changing what those words mean.
+ *
+ * Why variables rather than Tailwind's `dark:` variant: this app has three theme states — light, dark,
+ * and "follow the operating system" — and the third is the default (PR-16 later persists the choice to
+ * `GET`/`PATCH /api/settings`). A `dark:bg-…` utility cannot say "unless the person picked light",
+ * while one variable re-pointed inside a media query can, and it keeps every component free of theme
+ * conditionals of its own.
+ *
+ * The three ways a theme gets stated, in the order they beat each other:
+ *
+ *   1. `@media (prefers-color-scheme: dark)` — the default, for a page with no stated preference.
+ *   2. `html[data-theme='dark'|'light']` — what `components/layout/ThemeToggle.tsx` writes for the
+ *      session: the interim knob until PR-16 moves the choice into settings.
+ *   3. `html.dark` / `html.light` — the class PR-16 owns for the persisted setting.
+ *
+ * `@theme` holds the light values and they are *not* repeated below: the dark rules override the same
+ * custom properties, and a utility reading `var(--color-paper)` cannot tell the difference.
+ */
 @theme {
-  --color-brand: #0f766e;
-  --color-brand-soft: #ccfbf1;
-  --color-paper: #f8fafc;
-  --color-ink: #0f172a;
-  --color-ink-muted: #475569;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial,
+    "Apple Color Emoji", "Segoe UI Emoji";
+
+  --color-paper: #f7f8fa;
+  --color-paper-2: #eceef2;
+  --color-surface: #ffffff;
+  --color-line: #dfe2e8;
+  --color-ink: #171c26;
+  --color-ink-muted: #5d6673;
+  --color-brand: #2f6fed;
+  --color-danger: #c62b2b;
+  --color-danger-soft: #fbeaea;
+  --color-ok: #14804a;
 }
 
+/*
+ * The dark values, twice: once under the media query and once for an explicit choice. Copying the
+ * block is the lesser evil — a `--color-*` list is data, and any indirection that lets the two
+ * diverge (a `lighten()` per token, a shared custom property someone has to remember) is more
+ * machinery than the eleven lines it saves.
+ */
 @layer base {
+  /* Which way round the browser should paint form controls, scrollbars and `Canvas` backgrounds. */
+  :root {
+    color-scheme: light;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]):not(.light) {
+      color-scheme: dark;
+      --color-paper: #10151d;
+      --color-paper-2: #1a212c;
+      --color-surface: #151b24;
+      --color-line: #2a3341;
+      --color-ink: #e7eaef;
+      --color-ink-muted: #9aa5b4;
+      --color-brand: #6ea8fe;
+      --color-danger: #ff7b72;
+      --color-danger-soft: #3a1c1d;
+      --color-ok: #4ac58a;
+    }
+  }
+
+  /* An explicit choice wins over the media query in either direction; `light` needs no rules of its
+     own because it is simply excluded above, which is why the selector there is a `:not()`. */
+  :root[data-theme="dark"],
+  :root.dark {
+    color-scheme: dark;
+    --color-paper: #10151d;
+    --color-paper-2: #1a212c;
+    --color-surface: #151b24;
+    --color-line: #2a3341;
+    --color-ink: #e7eaef;
+    --color-ink-muted: #9aa5b4;
+    --color-brand: #6ea8fe;
+    --color-danger: #ff7b72;
+    --color-danger-soft: #3a1c1d;
+    --color-ok: #4ac58a;
+  }
+
   html {
     -webkit-text-size-adjust: 100%;
   }

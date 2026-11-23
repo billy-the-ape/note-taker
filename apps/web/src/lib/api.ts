@@ -14,9 +14,14 @@
  *    caller sees is the second one — the real one.
  * 3. **`ApiError`.** Every failure is one, carrying the whole envelope: `code`, `message`, `details`,
  *    `data` and `requestId`. `data` is why PR-14's autosave engine can read a `VERSION_CONFLICT`
- *    payload without re-fetching the note it just failed to save.
+ *    payload without re-fetching the note it just failed to save. A `429`'s `Retry-After` header is
+ *    carried too (`retryAfterSeconds`), because it is the one number in the error contract that is
+ *    not in the body (PR-07) and a login form that cannot say *how long* to wait is a form that
+ *    invites an eleventh attempt.
  * 4. **The 401 hook.** Session expiry is a single app-wide decision (route to the sign-in screen), so
  *    it is a callback the composition root sets rather than something each caller re-implements.
+ *    `setUnauthorizedHandler` is how PR-08's session provider sets it: the client is created here,
+ *    once, and the handler can only be chosen by whoever owns routing, which happens later.
  *
  * Nothing here touches `document` at import time: the cookie reader is injected, which is also what
  * lets the suite below run in the plain Node environment Vitest uses.
@@ -45,6 +50,12 @@ export class ApiError extends Error {
   readonly data?: ErrorData;
   /** The server's request id, worth pasting into a support note when the message is not enough. */
   readonly requestId?: string;
+  /**
+   * Whole seconds from `Retry-After`, present on the `429` answers of PR-07's login and sign-up
+   * windows and on nothing else (docs/API.md). A header rather than a body field in the contract, so
+   * this is the only place it is read.
+   */
+  readonly retryAfterSeconds?: number;
 
   constructor(input: {
     readonly status: number;
@@ -53,6 +64,7 @@ export class ApiError extends Error {
     readonly details?: readonly ErrorDetail[];
     readonly data?: ErrorData;
     readonly requestId?: string;
+    readonly retryAfterSeconds?: number;
   }) {
     super(input.message);
     this.name = 'ApiError';
@@ -61,6 +73,7 @@ export class ApiError extends Error {
     if (input.details !== undefined) this.details = input.details;
     if (input.data !== undefined) this.data = input.data;
     if (input.requestId !== undefined) this.requestId = input.requestId;
+    if (input.retryAfterSeconds !== undefined) this.retryAfterSeconds = input.retryAfterSeconds;
   }
 }
 
@@ -157,6 +170,20 @@ function isJsonContent(contentType: string | null): boolean {
 }
 
 /**
+ * `Retry-After` in whole seconds, from the only responses that send it (PR-07's login and sign-up windows).
+ *
+ * Parsed rather than trusted: the contract says seconds, but a proxy could put an HTTP-date there,
+ * and a `NaN` reaching a form would render "try again in NaN s". The shape checked is RFC 9110's
+ * `delay-seconds = 1*DIGIT`, so anything else — a date, a fraction, a negative, or the empty header
+ * that `Number('')` would quietly read as "retry now" — is simply no information.
+ */
+function retryAfterOf(headers: Headers): number | undefined {
+  const raw = headers.get('retry-after');
+  if (raw === null || !/^\d+$/.test(raw)) return undefined;
+  return Number(raw);
+}
+
+/**
  * Turns a failed `Response` into an `ApiError`.
  *
  * The body is read once and only once. A body that is not an envelope is not a crash: a proxy page,
@@ -165,6 +192,8 @@ function isJsonContent(contentType: string | null): boolean {
  */
 async function apiErrorFrom(response: Response): Promise<ApiError> {
   const raw = await response.text().catch(() => '');
+  // Read off the response, not the body: the envelope has nine codes and no retry shape (docs/API.md).
+  const retryAfterSeconds = retryAfterOf(response.headers);
 
   const parsed: unknown = isJsonContent(response.headers.get('content-type'))
     ? safeJsonParse(raw)
@@ -179,6 +208,7 @@ async function apiErrorFrom(response: Response): Promise<ApiError> {
       ...(error.details === undefined ? {} : { details: error.details }),
       ...(error.data === undefined ? {} : { data: error.data }),
       ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
     });
   }
 
@@ -189,6 +219,7 @@ async function apiErrorFrom(response: Response): Promise<ApiError> {
     code: fallback.code,
     message: fallback.message,
     ...(requestId === null ? {} : { requestId }),
+    ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
   });
 }
 
@@ -316,7 +347,22 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
 }
 
 /**
- * The client the components use. `onUnauthorized` is set here (not per call) by whoever owns routing,
- * so PR-08 can wire it once in the composition root.
+ * The 401 handler the composition root installs (PR-08's session provider), and the reason the
+ * singleton below forwards to a variable rather than holding a function of its own: this module owns
+ * the client, but only the app — which is created after it and imports it — knows what "the session
+ * went away" should *do*. Setting it twice is allowed (a test replaces it, the provider replaces it
+ * back), passing `undefined` takes it away again.
  */
-export const api = createApiClient();
+let unauthorizedHandler: ((error: ApiError) => void) | undefined;
+
+export function setUnauthorizedHandler(handler: ((error: ApiError) => void) | undefined): void {
+  unauthorizedHandler = handler;
+}
+
+/**
+ * The client the components use. `onUnauthorized` is set here (not per call) by whoever owns routing,
+ * so PR-08 can wire it once in the composition root — see {@link setUnauthorizedHandler}.
+ */
+export const api = createApiClient({
+  onUnauthorized: (error) => unauthorizedHandler?.(error),
+});

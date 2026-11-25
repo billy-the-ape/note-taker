@@ -1722,8 +1722,8 @@ Rules:
   scope nothing measures is not a gate. **This bullet is the authority on that row:** `MVP-08.md` §7 now tells PR-08 to
   keep the existing row and raise it, never to add a second one, and the `MVP-01` / `MVP-03` / `MVP-05` / `MVP-12`
   passages that dated the arming to PR-08 say PR-16. Before PR-05 the web config passes with zero files and declares no
-  thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by the PR named in its
-  `enforced by` cell.
+  thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by the first PR that puts a
+  test in its scope; the table's `enforced by` column names the **job and config** that measure it, not the arming PR.
 
 ---
 

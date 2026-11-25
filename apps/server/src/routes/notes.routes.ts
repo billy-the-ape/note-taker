@@ -68,14 +68,26 @@ const ANY_ENTITY_TAG = '*';
  */
 const ENTITY_TAG = /^(?:W\/)?"v(\d+)"$/;
 
-/** The version one entity-tag names, or `undefined` when it names none (a digest, a typo, a version of zero). */
+/**
+ * The ceiling of `notes.version`: the column is an `integer` (`int4`), so no state of a note was ever tagged
+ * above this — the same bound `crypto/keys.ts` puts on `notes.key_version` for the same reason.
+ */
+const MAX_NOTE_VERSION = 2_147_483_647;
+
+/**
+ * The version one entity-tag names, or `undefined` when it names none: a digest, a typo, a version of zero (no
+ * note has ever been version 0), or a number past what the column can hold.
+ *
+ * The upper bound is what makes "names nothing" the honest description rather than "names something absurd": an
+ * out-of-range tag reports as naming no state at all, so it cannot agree with a body even when the body asks for
+ * that same unreachable number — a write against either would have matched no row, and would have been answered
+ * from the scoped re-read anyway.
+ */
 function entityTagVersion(tag: string): number | undefined {
   const match = ENTITY_TAG.exec(tag);
   if (match?.[1] === undefined) return undefined;
   const version = Number(match[1]);
-  // `notes.version` starts at 1 and lives in an `int4`; a tag outside that range cannot name this row's state, so
-  // it is reported as naming nothing rather than as a version nobody can send back.
-  return Number.isSafeInteger(version) && version >= 1 ? version : undefined;
+  return version >= 1 && version <= MAX_NOTE_VERSION ? version : undefined;
 }
 
 /**

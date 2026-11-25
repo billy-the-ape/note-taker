@@ -131,8 +131,21 @@ describe('If-Match (§9.2 #18) — the header the route reads', () => {
     for (const header of ['', 'not-an-etag', 'W/"7"', 'W/"abc"', 'W/v4', 'W/"v0"', 'W/"v-1"']) {
       expect(ifMatchAdmits(header, 4), header).toBe(false);
     }
-    // A tag above `int4` cannot name this row's version either, however well-formed it looks.
-    expect(ifMatchAdmits('W/"v99999999999"', 4)).toBe(false);
+    // The upper bound is `notes.version`'s own, not a convenient rounding: a tag above `int4` names a state no row
+    // can ever hold, so it names nothing. It stays a refusal even against a body asking for the same unreachable
+    // number (`noteVersionSchema` has no maximum, so a hand-written request can send one), which is the difference
+    // between "this tag matches nothing" and "this tag matches a version that does not exist". The top of the range
+    // is a version a note can actually reach, so it is a tag like any other.
+    expect(ifMatchAdmits('W/"v2147483647"', 2_147_483_647)).toBe(true);
+    const outOfRange: readonly (readonly [string, number])[] = [
+      ['W/"v2147483648"', 2_147_483_648],
+      ['W/"v99999999999"', 99_999_999_999],
+      ['W/"v99999999999999999999999"', 1e22],
+    ];
+    for (const [header, version] of outOfRange) {
+      expect(ifMatchAdmits(header, 4), header).toBe(false);
+      expect(ifMatchAdmits(header, version), header).toBe(false);
+    }
   });
 });
 

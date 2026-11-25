@@ -422,6 +422,14 @@ describe('concurrent moves, the per-user advisory lock and the folder row lock (
       });
       await tx.execute(sql`select pg_sleep(0.5)`);
     });
+    // A handler the moment the transaction is started, not at the `await` below: this promise spends half a second
+    // in flight while other statements run, and a promise that rejects with nobody listening is Vitest's unhandled
+    // rejection rather than this test's failure (`settle()` in `note.service.int.test.ts` exists for the same
+    // reason). Settling it also means the assertion below can name the insert's own error instead of losing it.
+    const insertSettled = inserting.then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
     // Long enough that the insert above is in flight, short enough that its sleep still has most of itself left to
     // hold the delete waiting. The sleep is in the database, so this is not a race against a slow machine.
     await new Promise((resolve) => setTimeout(resolve, 80));
@@ -430,7 +438,9 @@ describe('concurrent moves, the per-user advisory lock and the folder row lock (
       () => undefined,
       (thrown: unknown) => thrown as ConflictError,
     );
-    await inserting;
+    // If the racing insert itself did not land, nothing below means anything: the folder it was born into is the
+    // whole subject. Fail here, with its reason, rather than three statements later over a missing row.
+    expect(await insertSettled, 'the racing note insert should have committed').toBeUndefined();
 
     // Delete the folder row without the `FOR UPDATE` and this is the moment the bug shows: the count ran before
     // any lock, answered "empty", and the `DELETE` then waited on that same `KEY SHARE` only after the gate had

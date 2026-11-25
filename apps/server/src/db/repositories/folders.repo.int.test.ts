@@ -347,13 +347,19 @@ describe('folders.repo', () => {
       await lockFolderRow(tx, { userId: owner.id, id: created.id });
       await tx.execute(sql`select pg_sleep(0.4)`);
     });
+    // Listened to from the moment it starts, so a failure inside it is this test's own assertion rather than an
+    // unhandled rejection arriving half a second later (the reason `note.service.int.test.ts` has `settle()`).
+    const holdingSettled = holding.then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
     await new Promise((resolve) => setTimeout(resolve, 60));
     const startedAt = Date.now();
     await db.transaction(async (tx) => {
       await expect(lockFolderRow(tx, { userId: owner.id, id: created.id })).resolves.toBe(true);
     });
     const waitedMs = Date.now() - startedAt;
-    await holding;
+    expect(await holdingSettled, 'the holding transaction should have committed').toBeUndefined();
 
     expect(
       waitedMs,

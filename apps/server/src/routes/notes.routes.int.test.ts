@@ -30,7 +30,7 @@ import { withApp } from '../test/helpers/app.js';
 import { jarHeaders } from '../test/helpers/cookies.js';
 import { catalogRows, resetDb, testDb } from '../test/helpers/db.js';
 import { captureLogs } from '../test/helpers/log-capture.js';
-import { bootstrapOwner, createMember, envelopeOf } from '../test/helpers/session.js';
+import { bootstrapOwner, createMember, envelopeOf, signedOutCsrfHeaders } from '../test/helpers/session.js';
 
 const db = testDb();
 
@@ -345,20 +345,35 @@ describe('PATCH and DELETE /api/notes/:id (§9.2 #19, #20)', () => {
   it('refuses every note route without a session', async () => {
     await withApp(
       async (app: FastifyInstance) => {
+        // The mutations carry a live CSRF pair (which `GET /api/auth/status` hands to anybody) so that the answer
+        // under test is the session guard's `401` and not the CSRF hook's `403`, which it would answer first —
+        // the ordering is PR-07's and the last request below pins it. The `GET` needs no pair: only mutations
+        // are checked.
+        const anonymous = await signedOutCsrfHeaders(app);
+        const missing = '00000000-0000-4000-8000-000000000000';
         const attempts = await Promise.all([
-          app.inject({ method: 'POST', url: ROUTES.notes, payload: {} }),
-          app.inject({ method: 'GET', url: ROUTES.note('00000000-0000-4000-8000-000000000000') }),
+          app.inject({ method: 'POST', url: ROUTES.notes, headers: anonymous, payload: {} }),
+          app.inject({ method: 'GET', url: ROUTES.note(missing) }),
           app.inject({
             method: 'PATCH',
-            url: ROUTES.note('00000000-0000-4000-8000-000000000000'),
+            url: ROUTES.note(missing),
+            headers: anonymous,
             payload: { name: 'whoever' },
           }),
-          app.inject({ method: 'DELETE', url: ROUTES.note('00000000-0000-4000-8000-000000000000') }),
+          app.inject({ method: 'DELETE', url: ROUTES.note(missing), headers: anonymous }),
         ]);
         for (const response of attempts) {
           expect(response.statusCode).toBe(401);
           expect(envelopeOf(response).code).toBe('UNAUTHORIZED');
         }
+
+        // …and without the token half, the same anonymous `POST` is refused earlier and differently: `403`, never
+        // `401`, because a missing `X-CSRF-Token` says nothing about whether the caller is signed in. A client
+        // that has been signed out therefore sees `403` on its first mutation and refreshes its pair — which is
+        // what `apps/web/src/lib/api.ts`'s one-shot recovery is for.
+        const noToken = await app.inject({ method: 'POST', url: ROUTES.notes, payload: {} });
+        expect(noToken.statusCode).toBe(403);
+        expect(envelopeOf(noToken).code).toBe('FORBIDDEN');
       },
       { db },
     );

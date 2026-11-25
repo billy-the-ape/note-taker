@@ -82,8 +82,11 @@ describe('the cross-user body-id matrix (§5.4)', () => {
     await withApp(
       async (app: FastifyInstance) => {
         // `a` is the install's owner and `b` a member; neither role is relevant to the answer, which is the point.
+        // The names are as long as they are because `POST /api/users` is part of this setup and `usernameSchema`
+        // refuses fewer than three characters — a one-letter username here is a 400 about the fixture, not about
+        // another user's folder.
         const a = await bootstrapOwner(app);
-        const b = await createMember(app, a, { username: 'b' });
+        const b = await createMember(app, a, { username: 'bram' });
 
         // A's subtree is three rows deep, so "A's subtree is byte-identical" has folders, notes and a nesting to lose.
         const aHome = await createFolder(app, a, 'a-home', null);

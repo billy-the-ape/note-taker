@@ -30,7 +30,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { withApp } from '../test/helpers/app.js';
 import { cookieHeader, type Jar, jarHeaders } from '../test/helpers/cookies.js';
 import { catalogRows, resetDb, testDb } from '../test/helpers/db.js';
-import { bootstrapOwner, createMember, envelopeOf, whoAmI } from '../test/helpers/session.js';
+import {
+  bootstrapOwner,
+  createMember,
+  envelopeOf,
+  signedOutCsrfHeaders,
+  whoAmI,
+} from '../test/helpers/session.js';
 
 const db = testDb();
 
@@ -204,12 +210,17 @@ describe('POST /api/folders (§9.2 #13)', () => {
         expect(noCsrf.statusCode).toBe(403);
         expect(apiErrorCodeForStatus(noCsrf.statusCode)).toBe('FORBIDDEN');
 
+        // With the token half present, the same anonymous mutation reaches `requireAuth` and answers `401`: the two
+        // refusals above and below are different guards, and a test that only ever sent bare anonymous requests
+        // would measure the CSRF hook and call the session guard tested.
         const anonymous = await app.inject({
           method: 'POST',
           url: ROUTES.folders,
+          headers: await signedOutCsrfHeaders(app),
           payload: { name: 'nobody' },
         });
         expect(anonymous.statusCode).toBe(401);
+        expect(envelopeOf(anonymous).code).toBe('UNAUTHORIZED');
 
         // None of the three wrote anything for the member, and the owner's folder is where it was.
         expect(await ownedBy(app, member)).toEqual({ folders: 0, notes: 0 });

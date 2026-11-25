@@ -225,12 +225,25 @@ Two more things the same transaction decides, both because the tree is data and 
   counts direct children (`countChildren()`) and the notes in this folder (`countNotesInFolder()`) and refuses a
   non-empty one with `409 CONFLICT`, because a recursive delete the user did not ask for is data destruction.
 * **One read serves the whole tree.** `listFolderTree()` is a single recursive CTE over the caller's rows that
-  returns folders flat with their `depth` and root-first `path`, ordered by `name collate "C", id` so the answer
-  is the same on a `C` and an `en_US.utf8` cluster, and `listNotesForTree()` supplies the notes beside them. The walk's
-  guard is `depth < ${TREE_WALK_GUARD}` (100) — one more than the deepest folder the cap allows, so a legal tree
-  is never truncated — and `tree.service.int.test.ts` renders a 99-deep chain to prove the difference between a
-  guard and a fence. There is no stored depth column: a materialised depth would be a second truth for a move to
-  get wrong.
+  returns folders flat with their `depth` and a root-first `path` breadcrumb (walk metadata: `folderNodeSchema`
+  has no path field, and PR-12 rebuilds the nesting from `parentId`), ordered by `name collate "C", id` so the
+  answer is the same on a `C` and an `en_US.utf8` cluster, and `listNotesForTree()` supplies the notes beside
+  them. The walk's guard is `depth < ${TREE_WALK_GUARD}` (100) — one more than the deepest folder the cap allows,
+  so a legal tree is never truncated — and `tree.service.int.test.ts` renders a 99-deep chain to prove the
+  difference between a guard and a fence. There is no stored depth column: a materialised depth would be a second
+  truth for a move to get wrong.
+* **A raw statement's columns are read, never asserted.** This CTE is the only application code that reads SQL
+  drizzle cannot express, and a raw result carries **no column metadata**: the first CI run answered every
+  `GET /api/tree` with `500`, because the mapping wrote `row.created_at as Date` and the driver — which had no way
+  to know the column was ever a `timestamptz` — handed back text for `.toISOString()` to choke on. The statement
+  therefore asks for one unambiguous JS reading of the two timestamps
+  (`floor(extract(epoch from …) * 1000)::bigint` — `floor`, because `numeric::bigint` rounds and a JavaScript date
+  parse truncates, and the two must agree to the millisecond),
+  and the values pass through `rawTimestamp()` / `rawTextArray()` in `db/rows.ts`, which tolerate the shapes a
+  driver may actually deliver — a `Date`, an integer, the integer as text, ISO or Postgres text; a JS array or the
+  array literal Postgres writes (`{"Top","Mid"}`, escapes and all) — and throw rather than invent `1970-01-01`.
+  `db/rows.test.ts` pins the parser and `folders.repo.int.test.ts` pins the row, so the next raw statement (PR-11's
+  search is the likely candidate) has two things to copy and one mistake not to repeat.
 
 ## 4. The optimistic-locking contract (PR-10's 409)
 
@@ -311,6 +324,7 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | An install has an owner before anyone joins | `users_one_owner_uidx` here + `auth.service.ts`'s two guards | `routes/registration.int.test.ts` (`POST /api/auth/register` answers `403` on an empty database even with `ALLOW_REGISTRATION=true`, and `needsSetup` stays `true`) |
 | A folder move never creates a cycle | per-user `pg_advisory_xact_lock` + the ancestor walk inside it (§3) | `services/folder.service.int.test.ts` — the adjacent pair started as siblings (one commits, one `409`) and the four-node disjoint-pair race that a row-lock design commits a cycle through; afterwards the tree walk terminates and both folders stay reachable |
 | The tree is at most 100 levels, and a tree that legal is never truncated | the service's cap on create (`folderDepth`) and on move (`destination depth + 1 + subtree height`); no DB constraint can express it | `services/folder.service.int.test.ts` (the 101st level refuses, naming the cap; a deep subtree under a root refuses too) and `services/tree.service.int.test.ts` (a 99-deep chain renders complete, with a note at the bottom) |
+| A raw statement's columns are read through a helper, never asserted as a type | `db/rows.ts` — `rawRows()`, `rawTimestamp()`, `rawTextArray()` — with the tree CTE asking for `epoch … ::bigint` and the array literal read as written (§3), because a raw result carries no column metadata | `db/rows.test.ts` (each shape a driver may deliver, and a throw rather than an invented `1970-01-01`) + `folders.repo.int.test.ts` (the walked row: depth, breadcrumb, and timestamps equal to the row that was inserted) — this is the assertion PR-09's first CI run was missing, when every `GET /api/tree` answered `500` |
 | An id in a **body** is the caller's or the answer is `404` | `folderById`/`noteById` scoped to `userId` before any insert or update, so the FK never fires (§5's `23503` row) | `routes/cross-user.int.test.ts` — the four-call matrix (note create, folder create, folder move, note move) against another user's folder, all four envelopes byte-identical to a nonexistent id, and both trees byte-identical afterwards |
 | A note body never crosses the tree wire | `treeResponseSchema` has no `content`, and `tree.service.ts` maps every row through `toNoteNode()`, which is the one place the cipher/iv/key-version columns are dropped | `services/tree.service.int.test.ts` + `routes/tree.routes.int.test.ts` (the payload is parsed, then searched for a `content` key) |
 | A stored body that will not authenticate is an error, never an empty note | `crypto/envelope.ts` throws; `mapError` renders `INTERNAL` and logs the note id (§5) | `routes/notes.routes.int.test.ts` (the blob is rewritten directly, then `GET /api/notes/:id` answers 500 with no `content` field), `plugins/error-handler.test.ts` (nothing about key versions on the wire) |

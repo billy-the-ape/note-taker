@@ -24,6 +24,7 @@ import {
   isDescendantOrSelf,
   listAllFolders,
   listFolders,
+  listFolderTree,
   moveFolder,
   renameFolder,
 } from './folders.repo.js';
@@ -121,6 +122,43 @@ describe('folders.repo', () => {
 
     await expect(listAllFolders(db, { userId: owner.id })).resolves.toHaveLength(2);
     await expect(listAllFolders(db, { userId: member.id })).resolves.toHaveLength(1);
+  });
+
+  it('walks the tree in one statement, and keeps the depth, the breadcrumb and the timestamps', async () => {
+    // The CTE is the one place PR-09 reads a raw statement for **application** data, and a raw statement hands
+    // back values with no column metadata attached. This is the assertion that would have caught the `500` every
+    // `GET /api/tree` returned on the first CI run: the mapping promised `Date`, the driver sent text, and
+    // `toFolderNode` called `.toISOString()` on it. Types cannot be trusted here, so the row is.
+    const { owner, member } = await pair();
+    const db = testDb();
+    const top = await createFolder(db, { userId: owner.id, name: 'Top' });
+    const mid = await createFolder(db, { userId: owner.id, name: 'Mid', parentId: top.id });
+    const leaf = await createFolder(db, { userId: owner.id, name: 'Leaf', parentId: mid.id });
+    await createFolder(db, { userId: member.id, name: 'Theirs' });
+
+    const rows = await listFolderTree(db, { userId: owner.id });
+
+    // Byte order on the name, and one row per level with its depth.
+    expect(rows.map((row) => [row.name, row.depth])).toStrictEqual([
+      ['Leaf', 2],
+      ['Mid', 1],
+      ['Top', 0],
+    ]);
+    expect(rows.map((row) => row.parentId)).toStrictEqual([mid.id, top.id, null]);
+    // Nobody else's rows, not even as a row this side would filter out later.
+    expect(new Set(rows.map((row) => row.userId))).toStrictEqual(new Set([owner.id]));
+
+    // The breadcrumb the CTE computes on the way down (§5.1), root-first.
+    expect(rows.map((row) => row.path)).toStrictEqual([['Top', 'Mid', 'Leaf'], ['Top', 'Mid'], ['Top']]);
+
+    // The timestamps: `Date`s, the same instants the rows carry, and not the epoch a failed parse would invent.
+    for (const row of rows) {
+      expect(row.createdAt).toBeInstanceOf(Date);
+      expect(Number.isNaN(row.createdAt.getTime())).toBe(false);
+    }
+    const walked = rows.find((row) => row.id === leaf.id);
+    expect(walked?.createdAt.getTime()).toBe(leaf.createdAt.getTime());
+    expect(walked?.updatedAt.getTime()).toBe(leaf.updatedAt.getTime());
   });
 
   it('looks a sibling up by (user, parent, name), root included', async () => {

@@ -13,10 +13,10 @@
  * `withApp`'s `env` override is the caller's business: this helper deliberately does not know about
  * `ALLOW_REGISTRATION`, because nothing here needs it.
  */
-import { ROUTES } from '@note-taker/contracts';
+import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, ROUTES } from '@note-taker/contracts';
 import type { FastifyInstance } from 'fastify';
 
-import { type Jar, jarAfter, jarHeaders } from './cookies.js';
+import { cookieHeader, cookieValue, type Jar, jarAfter, jarHeaders } from './cookies.js';
 
 /** Long enough for plan §10's minimum and not a password anyone reuses; these are test-only accounts. */
 export const TEST_PASSWORD = 'correct-horse-battery-staple';
@@ -98,4 +98,32 @@ export function envelopeOf(response: { json(): unknown }): Record<string, unknow
   const { error } = response.json() as { error: Record<string, unknown> };
   const { requestId: _requestId, ...envelope } = error;
   return envelope;
+}
+
+/**
+ * Headers of a **signed-out** browser that still holds a live `note_csrf` pair: the cookie and the matching
+ * `X-CSRF-Token`, and no `note_session`.
+ *
+ * Why a route test needs this: the CSRF guard is an app-wide `onRequest` hook (`plugins/csrf.ts`), so it decides
+ * a mutation *before* `requireAuth` sees it, and it answers `403` — never `401`, because a stale token says
+ * nothing about whether the caller is signed in (the SPA's one-shot recovery keys off exactly that). A test that
+ * sends an anonymous `POST` with no headers therefore measures the CSRF guard, not the session guard, and cannot
+ * tell a 401 regression from a 403 one. These headers say "the token half is fine, now show me what you do about
+ * the missing session", which is the assertion PR-09's routes actually need. The pair is not a credential —
+ * `GET /api/auth/status` hands it to anybody who asks, which is the point of double-submit.
+ *
+ * A request that *lacks* the header is still worth asserting, and PR-09 does: that one is `403`.
+ */
+export async function signedOutCsrfHeaders(app: FastifyInstance): Promise<Record<string, string>> {
+  const status = await app.inject({ method: 'GET', url: ROUTES.auth.status });
+  if (status.statusCode !== 200)
+    throw new Error(`${ROUTES.auth.status} failed (${status.statusCode}): ${status.body}`);
+  const token = cookieValue(status, CSRF_COOKIE_NAME);
+  if (token === undefined)
+    throw new Error(
+      `${ROUTES.auth.status} issued no ${CSRF_COOKIE_NAME} cookie: ${status.headers['set-cookie']}`,
+    );
+
+  const cookie = cookieHeader({ [CSRF_COOKIE_NAME]: token });
+  return { cookie: cookie ?? '', [CSRF_HEADER_NAME.toLowerCase()]: token };
 }

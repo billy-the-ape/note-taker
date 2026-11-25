@@ -19,7 +19,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { withApp } from '../test/helpers/app.js';
 import { jarHeaders } from '../test/helpers/cookies.js';
 import { catalogRows, resetDb, testDb } from '../test/helpers/db.js';
-import { bootstrapOwner, createMember, envelopeOf, whoAmI } from '../test/helpers/session.js';
+import {
+  bootstrapOwner,
+  createMember,
+  envelopeOf,
+  signedOutCsrfHeaders,
+  whoAmI,
+} from '../test/helpers/session.js';
 
 const db = testDb();
 
@@ -70,12 +76,17 @@ describe('GET /api/settings (§9.2 #22)', () => {
         expect(anonymous.statusCode).toBe(401);
         expect(envelopeOf(anonymous).code).toBe('UNAUTHORIZED');
 
+        // The mutation half has to arrive with a CSRF pair or the `onRequest` hook answers it `403` before the
+        // session is looked at (the folders suite pins that ordering); with the pair present, this is the same
+        // `401` as the `GET`, and it created no row.
         const patched = await app.inject({
           method: 'PATCH',
           url: ROUTES.settings,
+          headers: await signedOutCsrfHeaders(app),
           payload: { theme: 'dark' },
         });
         expect(patched.statusCode).toBe(401);
+        expect(envelopeOf(patched).code).toBe('UNAUTHORIZED');
 
         const rows = await catalogRows(sql`select count(*)::int as n from settings`);
         expect(rows[0]?.n).toBe(0);
@@ -144,15 +155,33 @@ describe('PATCH /api/settings (§9.2 #22)', () => {
         expect(empty.statusCode).toBe(400);
         expect(envelopeOf(empty).code).toBe('VALIDATION');
 
+        // A body that *is* JSON but is not an object: `updateSettingsSchema` has no shape to match, so this is
+        // still the schema's door and `400`. (It has to be sent as JSON — a string payload arrives as
+        // `text/plain`, which is the next request's business.)
         const notAnObject = await app.inject({
+          method: 'PATCH',
+          url: ROUTES.settings,
+          headers: { ...jarHeaders(owner), 'content-type': 'application/json' },
+          payload: JSON.stringify('dark'),
+        });
+        expect(notAnObject.statusCode).toBe(400);
+        expect(envelopeOf(notAnObject).code).toBe('VALIDATION');
+
+        // …and the transport's door, which this suite used to confuse with the schema's: `text/plain` has no
+        // parser, so Fastify refuses before routing with `415`, `mapError` keeps that status, and because
+        // `apiErrorCodeForStatus(415)` is deliberately undefined the code falls to `VALIDATION` rather than
+        // `INTERNAL`. Worth one assertion of its own: a client that forgot its `Content-Type` must be able to
+        // tell "wrong envelope" from "bad theme", and a `500` here would be a bug in the error plumbing.
+        const notJson = await app.inject({
           method: 'PATCH',
           url: ROUTES.settings,
           headers: jarHeaders(owner),
           payload: 'dark',
         });
-        expect(notAnObject.statusCode).toBe(400);
+        expect(notJson.statusCode).toBe(415);
+        expect(envelopeOf(notJson).code).toBe('VALIDATION');
 
-        // None of the three changed a byte.
+        // None of the four changed a byte.
         const after = await app.inject({ method: 'GET', url: ROUTES.settings, headers: jarHeaders(owner) });
         expect(after.json()).toEqual(before.json());
       },

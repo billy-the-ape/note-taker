@@ -36,7 +36,7 @@ import { and, asc, eq, isNull, sql } from 'drizzle-orm';
 
 import type { Db, DbOrTx } from '../client.js';
 import { newId } from '../ids.js';
-import { expectOne, firstOrNone, rawRows } from '../rows.js';
+import { expectOne, firstOrNone, rawRows, rawTextArray, rawTimestamp } from '../rows.js';
 import { type Folder, folders } from '../schema.js';
 
 export interface CreateFolderInput {
@@ -259,15 +259,29 @@ export async function isDescendantOrSelf(
  * One user's whole folder tree in **one** recursive CTE, each row carrying its depth and its breadcrumb path.
  *
  * The anchor is the set of the user's **root** folders, so `depth` and `path` fall out of the walk instead of a
- * second pass over the rows, and `parent.depth < ${TREE_WALK_GUARD}` is the bound §5.1 promises. `path` is
- * extended by array concatenation, which is the recursive spelling of the same aggregation a one-level
- * `array_agg` would compute: a recursive step only has the parent's path to hand down, and the result is the
- * root-first name trail the client renders as a breadcrumb (PR-12) without walking back up per row.
+ * second pass over the rows, and `parent.depth < ${TREE_WALK_GUARD}` is the bound §5.1 promises. `path` is the
+ * §5.1 breadcrumb, built by concatenation on the way down: a recursive step only has the parent's path to hand,
+ * and `array_agg` cannot see the ancestor chain from inside the recursive term. It is metadata for the walk and
+ * not a wire field — `folderNodeSchema` has no path, and PR-12 rebuilds the nesting from `parentId` — but it is
+ * asserted in `folders.repo.int.test.ts`, because a column nobody reads is a column nobody notices when it comes
+ * back empty.
  *
  * Ordered by `name collate "C"` — byte order — so the answer is the same on a `C` and an `en_US.utf8` cluster
  * and no client has to sort twice to get what the server promised (§4 #12). The result is deliberately *flat*:
  * `folderNodeSchema` is a flat object with a `parentId`, so assembling `children` arrays here would be a
  * contract change PR-09 is not allowed to make.
+ *
+ * **Why the timestamps are cast, which is the whole point of this statement's shape.** A raw
+ * `db.execute(sql`…`)` carries no column metadata, so no layer between Postgres and this function knows
+ * `created_at` was ever a timestamp: PR-09's first CI run wrote `row.created_at as Date`, `toFolderNode` called
+ * `.toISOString()` on the text that came back, and every `GET /api/tree` answered `500`. Asking for
+ * `epoch … ::bigint` gives the value one unambiguous JS reading instead of hoping the driver guessed right, and
+ * {@link rawTimestamp} still tolerates the shapes it might arrive in anyway. The `floor` is not decoration:
+ * `numeric::bigint` **rounds**, while a JavaScript date parse of the microsecond text Postgres writes keeps the
+ * millisecond and drops the rest, so without it the same instant could come back one millisecond apart from the
+ * row that was inserted — the difference `folders.repo.int.test.ts` refuses to allow. The breadcrumb stays a
+ * plain `text[]` — arrays in a recursive CTE are boring and proven, and {@link rawTextArray} reads the literal
+ * Postgres writes — so the only new thing in this statement is a cast, not a type experiment.
  */
 export async function listFolderTree(db: Db, input: { readonly userId: string }): Promise<FolderTreeRow[]> {
   const result = await db.execute(sql`
@@ -276,8 +290,8 @@ export async function listFolderTree(db: Db, input: { readonly userId: string })
                f.user_id,
                f.parent_id,
                f.name,
-               f.created_at,
-               f.updated_at,
+               floor(extract(epoch from f.created_at) * 1000)::bigint as created_at,
+               floor(extract(epoch from f.updated_at) * 1000)::bigint as updated_at,
                0                      as depth,
                array [f.name]::text[] as path
           from folders f
@@ -288,8 +302,8 @@ export async function listFolderTree(db: Db, input: { readonly userId: string })
                child.user_id,
                child.parent_id,
                child.name,
-               child.created_at,
-               child.updated_at,
+               floor(extract(epoch from child.created_at) * 1000)::bigint,
+               floor(extract(epoch from child.updated_at) * 1000)::bigint,
                parent.depth + 1,
                parent.path || child.name
           from folders child
@@ -305,10 +319,10 @@ export async function listFolderTree(db: Db, input: { readonly userId: string })
     userId: String(row.user_id),
     parentId: row.parent_id === null || row.parent_id === undefined ? null : String(row.parent_id),
     name: String(row.name),
-    createdAt: row.created_at as Date,
-    updatedAt: row.updated_at as Date,
+    createdAt: rawTimestamp(row.created_at),
+    updatedAt: rawTimestamp(row.updated_at),
     depth: Number(row.depth),
-    path: Array.isArray(row.path) ? row.path.map(String) : [],
+    path: rawTextArray(row.path),
   }));
 }
 

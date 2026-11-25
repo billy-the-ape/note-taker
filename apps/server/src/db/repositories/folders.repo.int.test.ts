@@ -25,8 +25,7 @@ import {
   listAllFolders,
   listFolders,
   listFolderTree,
-  moveFolder,
-  renameFolder,
+  patchFolder,
 } from './folders.repo.js';
 
 async function pair(): Promise<UserPair> {
@@ -220,12 +219,12 @@ describe('folders.repo', () => {
     const db = testDb();
     const created = await createFolder(db, { userId: owner.id, name: 'Before' });
 
-    const renamed = await renameFolder(db, { userId: owner.id, id: created.id, name: 'After' });
+    const renamed = await patchFolder(db, { userId: owner.id, id: created.id, name: 'After' });
     expect(renamed).toMatchObject({ name: 'After', id: created.id });
     expect(renamed?.updatedAt.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
 
     await expect(
-      renameFolder(db, { userId: member.id, id: created.id, name: 'Not yours' }),
+      patchFolder(db, { userId: member.id, id: created.id, name: 'Not yours' }),
     ).resolves.toBeUndefined();
     await expect(folderById(db, { userId: owner.id, id: created.id })).resolves.toMatchObject({
       name: 'After',
@@ -242,7 +241,7 @@ describe('folders.repo', () => {
     // The root already holds `Reports`, so this move is a duplicate sibling: the database says so, and PR-09
     // translates it into a 409. The row must be untouched afterwards.
     await expectSqlState(
-      moveFolder(db, { userId: owner.id, id: nested.id, parentId: null }),
+      patchFolder(db, { userId: owner.id, id: nested.id, parentId: null }),
       '23505',
       'folders_unique_sib',
     );
@@ -252,9 +251,32 @@ describe('folders.repo', () => {
 
     // A legal move: sideways into another folder.
     const sideways = await createFolder(db, { userId: owner.id, name: 'Side' });
-    const moved = await moveFolder(db, { userId: owner.id, id: nested.id, parentId: sideways.id });
+    const moved = await patchFolder(db, { userId: owner.id, id: nested.id, parentId: sideways.id });
     expect(moved).toMatchObject({ parentId: sideways.id });
     await expect(namesAt(owner.id, sideways.id)).resolves.toStrictEqual(['Reports']);
+  });
+
+  it('renames and moves in one statement, which is the pair the sibling index judges', async () => {
+    const { owner } = await pair();
+    const db = testDb();
+    const from = await createFolder(db, { userId: owner.id, name: 'from' });
+    const to = await createFolder(db, { userId: owner.id, name: 'to' });
+    const moving = await createFolder(db, { userId: owner.id, name: 'a', parentId: from.id });
+    // A sibling called `b` already hangs under `from`. Renaming first and moving afterwards — what
+    // `PATCH /api/folders/:id` used to do — hit `folders_unique_sib` in the parent the folder was leaving, so a
+    // request describing a perfectly legal `(to, b)` was refused for a clash it would not have had there.
+    await createFolder(db, { userId: owner.id, name: 'b', parentId: from.id });
+
+    const patched = await patchFolder(db, {
+      userId: owner.id,
+      id: moving.id,
+      name: 'b',
+      parentId: to.id,
+    });
+
+    expect(patched).toMatchObject({ name: 'b', parentId: to.id });
+    await expect(namesAt(owner.id, from.id)).resolves.toStrictEqual(['b']);
+    await expect(namesAt(owner.id, to.id)).resolves.toStrictEqual(['b']);
   });
 
   it('deletes a folder and its whole subtree, notes included (ON DELETE CASCADE)', async () => {

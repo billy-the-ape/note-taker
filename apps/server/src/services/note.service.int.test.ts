@@ -203,6 +203,54 @@ describe('root, move, and version (§4 #19, §7)', () => {
     expect((await noteRow(created.id)).version).toBe(1);
   });
 
+  it('renames and moves in one request, judged in the folder the note lands in', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const from = await folders.create({ userId: user.id, name: 'from' });
+    const to = await folders.create({ userId: user.id, name: 'to' });
+    const moving = await notes.create({ userId: user.id, name: 'x', folderId: from.id });
+    // The name `y` is taken **in the folder the note is leaving** and free in the one it is going to. Two
+    // statements — rename, then move — made that a `409`: the rename hit `notes_unique_sib` against `from`, and
+    // the re-read that looks for the winner searched `to`, found nothing, and answered with a bare conflict for a
+    // request that described a perfectly legal `(to, y)`.
+    await notes.create({ userId: user.id, name: 'y', folderId: from.id });
+
+    const patched = await notes.patch({ userId: user.id, id: moving.id, name: 'y', folderId: to.id });
+
+    expect(patched).toMatchObject({ id: moving.id, name: 'y', folderId: to.id, version: 1 });
+    const row = await noteById(db, { userId: user.id, id: moving.id });
+    expect([row?.name, row?.folderId]).toStrictEqual(['y', to.id]);
+    // And the note it used to clash with is untouched: the destination decided, not the source.
+    expect((await listAllNotes(db, { userId: user.id })).map((note) => note.name)).toStrictEqual(['y', 'y']);
+  });
+
+  it('refuses a name the destination already holds without moving or renaming anything', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const from = await folders.create({ userId: user.id, name: 'from' });
+    const to = await folders.create({ userId: user.id, name: 'to' });
+    const moving = await notes.create({
+      userId: user.id,
+      name: 'notes',
+      folderId: from.id,
+      content: 'one two',
+    });
+    const taken = await notes.create({ userId: user.id, name: 'notes', folderId: to.id });
+
+    // Same name, different folder: legal where it is, illegal where it is going — and the conflict names the row
+    // that won, which is the only recovery the client has.
+    const clash = await notes.patch({ userId: user.id, id: moving.id, folderId: to.id }).then(
+      () => undefined,
+      (thrown: unknown) => thrown as ConflictError,
+    );
+
+    expect(clash).toBeInstanceOf(ConflictError);
+    expect(clash?.data).toEqual({ id: taken.id });
+    // The whole request is absent, not half of it: neither the move nor a rename happened. One statement means
+    // there is no half-applied state to observe, whichever half of the request a collision touches.
+    const row = await noteById(db, { userId: user.id, id: moving.id });
+    expect([row?.name, row?.folderId, row?.version]).toStrictEqual(['notes', from.id, 1]);
+    expect(row?.wordCount).toBe(2);
+  });
+
   it('deletes the row and its ciphertext together, and a second delete is a 404', async () => {
     const user = await createUser(db, { username: 'a', role: 'member' });
     const created = await notes.create({ userId: user.id, name: 'temporary', content: 'body' });

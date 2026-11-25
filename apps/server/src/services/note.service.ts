@@ -1,7 +1,7 @@
 /**
  * The note service: create, read, rename/move, delete (docs/plans/mvp/MVP-09.md §5.5–§5.6, plan §9.2 #16–#20).
  *
- * Three things about this file are the design, not incidental:
+ * Four things about this file are the design, not incidental:
  *
  * * **The id exists before the ciphertext does.** The envelope's AAD is `note:<uuid>` (plan §10), so
  *   `sealNoteContent()` needs the id the row will have; the service mints it with `newId()` and hands it to
@@ -17,6 +17,12 @@
  *   `EnvelopeError` (tampered ciphertext, a key version the ring lost) is a server fault: the route answers
  *   `500 INTERNAL` and never `200` with `content: ''`, which would be indistinguishable from an empty note
  *   (§5.6, and §7's "the client must never see an empty body standing in for a failure").
+ * * **A rename and a move are one statement.** `PATCH` may carry `name` and `folderId` together, and the
+ *   sibling check below is against the folder the note will **land** in — which is only true if the write that
+ *   moves it is the same write that renames it. See `patchNote` in `notes.repo.ts`: two updates were a `409` for
+ *   a clash in the folder the note was leaving, and a half-applied request when the second one failed. The
+ *   whole of {@link NoteService.patch} therefore runs in one transaction, and the loser-of-a-race re-read runs
+ *   outside it, because Postgres rejects every statement after a unique violation until the rollback.
  *
  * The name rules themselves are the contract's; this file only calls {@link storedNoteName} once, on the way
  * in. `domain/name.ts` explains why stripping twice is a bug rather than a redundancy.
@@ -30,18 +36,17 @@ import {
 
 import { openNoteContent, sealNoteContent } from '../crypto/envelope.js';
 import type { Keyring } from '../crypto/keys.js';
-import type { Db } from '../db/client.js';
+import type { Db, DbOrTx } from '../db/client.js';
 import { newId } from '../db/ids.js';
 import { isUniqueViolation } from '../db/pg-error.js';
 import { folderById } from '../db/repositories/folders.repo.js';
 import {
   createNote,
   deleteNote,
-  moveNote,
   noteByFolderAndName,
   noteById,
   noteNamesInFolder,
-  renameNote,
+  patchNote,
 } from '../db/repositories/notes.repo.js';
 import type { Note } from '../db/schema.js';
 import { ConflictError, NotFoundError, PayloadTooLargeError } from '../domain/errors.js';
@@ -130,9 +135,14 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
    * note in your folder" into a 404 instead of a foreign key violation, and it is the first line of defence the
    * `23503` mapping in `error-handler.ts` sits behind.
    */
-  async function assertFolderIsMine(userId: string, folderId: string | null): Promise<void> {
+  async function assertFolderIsMine(
+    executor: DbOrTx,
+    userId: string,
+    folderId: string | null,
+  ): Promise<void> {
     if (folderId === null) return;
-    if ((await folderById(db, { userId, id: folderId })) === undefined) throw new NotFoundError('folder');
+    if ((await folderById(executor, { userId, id: folderId })) === undefined)
+      throw new NotFoundError('folder');
   }
 
   /**
@@ -148,23 +158,38 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
   }
 
   /**
-   * The name for a note the client *did* name: strip the display extension, then clash.
+   * The check a note the client *did* name has to pass.
    *
    * Not uniquified, deliberately — `plan.md` next to an existing `plan` is answered with `CONFLICT` and the
-   * winner's id rather than a stored `plan-2` the user never typed. `exceptId` is the note being renamed, which
-   * may keep its own name.
+   * winner's id rather than a stored `plan-2` the user never typed (§5.5). `exceptId` is the note being renamed,
+   * which may keep its own name.
+   *
+   * It takes the **executor**, not the pool, for one reason: on a move, the answer must come from the same
+   * transaction as the write that lands the note. Asked outside, it describes a folder the note is only on its
+   * way to, and that is how a legal `PATCH {name, folderId}` gets refused for a clash in the folder the note is
+   * leaving.
    */
-  async function chosenName(
-    input: { readonly userId: string; readonly folderId: string | null; readonly name: string },
-    exceptId?: string,
-  ): Promise<string> {
-    const stored = storedNoteName(input.name);
-    const clash = await noteByFolderAndName(db, { ...input, name: stored });
-    if (clash !== undefined && clash.id !== exceptId) throw nameClash(clash.id, 'note');
-    return stored;
+  async function assertNoteNameFree(
+    executor: DbOrTx,
+    input: {
+      readonly userId: string;
+      readonly folderId: string | null;
+      readonly name: string;
+      readonly exceptId?: string;
+    },
+  ): Promise<void> {
+    const clash = await noteByFolderAndName(executor, input);
+    if (clash !== undefined && clash.id !== input.exceptId) throw nameClash(clash.id, 'note');
   }
 
-  /** The same re-read `folder.service.ts` does: the index says "someone won", the client needs the winner's id. */
+  /**
+   * The same re-read `folder.service.ts` does: the index says "someone won", the client needs the winner's id.
+   *
+   * Always on the pool and never on the caller's transaction: after a unique violation Postgres answers every
+   * further statement with `25P02` until that transaction rolls back, so this is only meaningful once it has.
+   * The winner is committed by then — a write that fails on a unique index waits for the writer that got there
+   * first, which is the same reason the row is findable here at all.
+   */
   async function lostNameRace(userId: string, folderId: string | null, name: string): Promise<ConflictError> {
     const clash = await noteByFolderAndName(db, { userId, folderId, name });
     return clash === undefined
@@ -174,7 +199,7 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
 
   return {
     async create({ userId, name, folderId = null, content }): Promise<NoteWithContent> {
-      await assertFolderIsMine(userId, folderId);
+      await assertFolderIsMine(db, userId, folderId);
 
       // The contract's schema already refuses an oversized body, so this is the transport net for a caller that
       // skipped the schema (a future internal caller): refuse before a key is used, not after storing a blob
@@ -184,10 +209,10 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
         throw new PayloadTooLargeError(NOTE_CONTENT_MAX_BYTES);
       }
 
-      const storedName =
-        name === undefined
-          ? await generatedName(userId, folderId)
-          : await chosenName({ userId, folderId, name });
+      // One INSERT is atomic on its own, so a create needs no transaction — only the same two checks the patch
+      // below makes, in the folder the row is being born in.
+      const storedName = name === undefined ? await generatedName(userId, folderId) : storedNoteName(name);
+      if (name !== undefined) await assertNoteNameFree(db, { userId, folderId, name: storedName });
 
       // The AAD is the row's id, so the id comes first, and the body is sealed against it before the insert.
       const id = newId();
@@ -212,29 +237,62 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
     },
 
     async patch({ userId, id, name, folderId }): Promise<NoteNode> {
-      const current = await noteById(db, { userId, id });
-      if (current === undefined) throw new NotFoundError('note');
+      const storedName = name === undefined ? undefined : storedNoteName(name);
+      // The `(folder, name)` the transaction is about to write. It exists because the loser of a name race has
+      // to be answered *outside* that transaction — Postgres closes a transaction to further statements the
+      // moment a statement violates an index — and out here neither half of the pair is knowable any more.
+      // Assigned immediately before the write, which is the only statement that can violate anything.
+      let attempted: { readonly folderId: string | null; readonly name: string } | undefined;
 
-      const targetFolderId = folderId === undefined ? current.folderId : folderId;
-      const moving = targetFolderId !== current.folderId;
-      if (moving) await assertFolderIsMine(userId, targetFolderId);
-
-      const storedName =
-        name === undefined ? current.name : await chosenName({ userId, folderId: targetFolderId, name }, id);
-
+      let row: Note;
       try {
-        const renamed =
-          name === undefined
-            ? current
-            : ((await renameNote(db, { userId, id, name: storedName })) ?? current);
-        if (!moving) return toNoteNode(renamed);
-        const moved = await moveNote(db, { userId, id, folderId: targetFolderId });
-        // Neither write touches `version`: a rename or a move is not a content edit (§8's rule, DATA-MODEL §2).
-        return toNoteNode(moved ?? renamed);
+        row = await db.transaction(async (tx) => {
+          // Load, check and write in one transaction, because the question being asked — "is `name` free in the
+          // folder this note will be in?" — has no answer that survives contact with another writer unless the
+          // folder is the one the write itself establishes. Renaming here while the row still sat in its source
+          // folder was the bug: a `PATCH {name, folderId}` was refused for a clash it did not have, and a move
+          // that then failed left the rename applied (§5.5, and `patchNote`).
+          const current = await noteById(tx, { userId, id });
+          if (current === undefined) throw new NotFoundError('note');
+
+          const destination = folderId === undefined ? current.folderId : folderId;
+          const moving = destination !== current.folderId;
+          if (moving) await assertFolderIsMine(tx, userId, destination);
+
+          const nextName = storedName ?? current.name;
+          if (storedName !== undefined || moving) {
+            // A move alone can collide too: the note keeps its name, and the folder it is going to may already
+            // hold that name. Checking it here rather than letting the index answer means the 409 can carry the
+            // winner's id, which is the whole recovery the client has.
+            await assertNoteNameFree(tx, { userId, folderId: destination, name: nextName, exceptId: id });
+          }
+
+          attempted = { folderId: destination, name: nextName };
+          const updated = await patchNote(tx, {
+            userId,
+            id,
+            ...(storedName === undefined ? {} : { name: storedName }),
+            // Only a real move goes in: an absent `folderId` means "leave it where it is", and a rename alone
+            // must not rewrite the folder the note is already in.
+            ...(moving ? { folderId: destination } : {}),
+          });
+          // Loaded two statements earlier in this transaction, so a miss is a concurrent delete, which is the
+          // same answer the request would have received a moment before it started.
+          if (updated === undefined) throw new NotFoundError('note');
+          // `version` is untouched by this statement: a rename or a move is not a content edit (§8's rule,
+          // DATA-MODEL §2), and PR-10's optimistic lock must not move because of something typed in a sidebar.
+          return updated;
+        });
       } catch (error) {
-        if (isUniqueViolation(error)) throw await lostNameRace(userId, targetFolderId, storedName);
+        if (isUniqueViolation(error)) {
+          throw attempted === undefined
+            ? new ConflictError('that name is already used in this folder')
+            : await lostNameRace(userId, attempted.folderId, attempted.name);
+        }
         throw error;
       }
+
+      return toNoteNode(row);
     },
 
     async remove({ userId, id }): Promise<void> {

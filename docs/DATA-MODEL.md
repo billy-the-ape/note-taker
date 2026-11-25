@@ -198,6 +198,15 @@ so the root is one more level and collides like anything else. `src/db/schema.in
 definitions and the violation itself, in the root and inside a folder; `folders_unique_sib` is deferred while
 drizzle-kit builds an index, which is also why the migration is ordered the way it is.
 
+Both indexes are checked **per statement**, which is what makes a rename-and-move a single statement rather than
+two: `patchNote` and `patchFolder` write the name and the parent column in one `UPDATE`, so the row is judged by
+the `(parent, name)` the request asked for. Renaming first and re-parenting afterwards puts the row in the
+position *half* the request described while the index is deciding — a legal `PATCH {name, parentId}` refused for a
+clash in the folder the row was leaving — and a second statement that fails after the first committed leaves
+exactly that half applied with nothing to tell the client which it was. Proven at statement level in
+`folders.repo.int.test.ts` and `notes.repo.int.test.ts` ("renames and moves in one statement"), and at the wire in
+`routes/notes.routes.int.test.ts`.
+
 Cycle prevention is **not** a database constraint (Postgres has no recursive CHECK), and it is not a
 read-then-write either. PR-09 owns it, as-built: `create`, `move` and `delete` in `services/folder.service.ts`
 each run in one transaction that FIRST takes
@@ -262,8 +271,9 @@ UPDATE notes
   a conflict is a normal answer here, not a bug.
 - The row comes back whole, so the new `version` is available to return to the client without a second query
   (and no window between the two).
-- `version` is bumped **only** by a content write. `renameNote` and `moveNote` touch `name`/`folder_id` and
-  `updated_at` and leave `version` alone, so renaming or re-filing a note never invalidates an open editor.
+- `version` is bumped **only** by a content write. `patchNote` and `patchFolder` — the one statement behind each
+  `PATCH` — touch `name`/`folder_id`/`parent_id` and `updated_at` and leave `version` alone, so renaming or
+  re-filing a row never invalidates an open editor.
 - Two writers that read the same version: exactly one wins, asserted concurrently in
   `notes.repo.int.test.ts`. Nothing is merged and nothing is lost silently.
 - The key rotation (PR-06's `apps/server/src/scripts/rotate-note-key.ts`) is the only other writer of these
@@ -310,7 +320,7 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | Username unique case-insensitively | `users_username_lower_uidx` on `lower(username)` | `schema.int.test.ts` (definition + `Kayla`/`kayla` → `23505`) |
 | Exactly one owner | `users_one_owner_uidx` (partial unique on `role = 'owner'`) | `schema.int.test.ts` (a second explicit `role='owner'` insert → `23505` from that constraint); the concurrent-`/setup` race is `routes/auth.routes.int.test.ts` (three simultaneous setups → one `200`, two `409`, one owner row) |
 | A role-less insert is never an owner | column `DEFAULT 'member'` | `schema.int.test.ts` (two raw role-less inserts coexist, both `member`) |
-| One name per `(user, folder)`, root included | `folders_unique_sib` / `notes_unique_sib` + `COALESCE` | `folders.repo.int.test.ts`, `notes.repo.int.test.ts` (inside a folder **and** at the root) |
+| One name per `(user, folder)`, root included | `folders_unique_sib` / `notes_unique_sib` + `COALESCE`, and one `UPDATE` per `PATCH` (§3) so the index never judges a half-applied rename-and-move | `folders.repo.int.test.ts`, `notes.repo.int.test.ts` (inside a folder **and** at the root; and a rename+move whose new name is free at the destination but taken at the source, which two statements refused) |
 | Two users may use the same name in the same place | `user_id` is the first index column | `folders.repo.int.test.ts` |
 | Deleting a folder deletes its subtree, notes included | `ON DELETE CASCADE` on `parent_id`/`folder_id` | `folders.repo.int.test.ts` (three levels deep, one note two levels down) |
 | Deleting a user deletes everything they own | `ON DELETE CASCADE` on every `user_id` | `folders.repo.int.test.ts` (other user's rows survive, so the zeros mean something) |

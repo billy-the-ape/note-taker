@@ -309,6 +309,79 @@ describe('PATCH and DELETE /api/notes/:id (§9.2 #19, #20)', () => {
     );
   });
 
+  it('judges a rename-and-move by the destination, and names the winner when it collides there', async () => {
+    await withApp(
+      async (app: FastifyInstance) => {
+        const owner = await bootstrapOwner(app);
+        const makeFolder = async (name: string) => {
+          const response = await app.inject({
+            method: 'POST',
+            url: ROUTES.folders,
+            headers: jarHeaders(owner),
+            payload: { name },
+          });
+          expect(response.statusCode, response.body).toBe(201);
+          return folderNodeSchema.parse(response.json()).id;
+        };
+        const makeNote = async (payload: Record<string, unknown>) => {
+          const response = await app.inject({
+            method: 'POST',
+            url: ROUTES.notes,
+            headers: jarHeaders(owner),
+            payload,
+          });
+          expect(response.statusCode, response.body).toBe(201);
+          return noteWithContentSchema.parse(response.json());
+        };
+        const from = await makeFolder('inbox');
+        const to = await makeFolder('archive');
+        // `minutes` is taken in the folder the note is leaving and free in the one it is going to. Renaming
+        // before moving answered this request with a 409 for that clash — in the wrong folder — and the re-read
+        // that looks for the winner found nothing in the right one.
+        await makeNote({ name: 'minutes', folderId: from });
+        const moving = await makeNote({ name: 'summary', folderId: from });
+
+        const patched = await app.inject({
+          method: 'PATCH',
+          url: ROUTES.note(moving.id),
+          headers: jarHeaders(owner),
+          payload: { name: 'minutes.md', folderId: to },
+        });
+        expect(patched.statusCode, patched.body).toBe(200);
+        expect(noteNodeSchema.parse(patched.json())).toMatchObject({
+          id: moving.id,
+          name: 'minutes',
+          folderId: to,
+          version: 1,
+        });
+
+        // The same request shape the other way round is a real collision, and `data.id` — the row that won — is
+        // the whole recovery. Refused, so nothing happened: neither the move nor the rename.
+        const third = await makeNote({ name: 'outline', folderId: from });
+        const clash = await app.inject({
+          method: 'PATCH',
+          url: ROUTES.note(third.id),
+          headers: jarHeaders(owner),
+          payload: { name: 'minutes', folderId: to },
+        });
+        expect(clash.statusCode, clash.body).toBe(409);
+        expect(clash.json()).toMatchObject({ error: { code: 'CONFLICT', data: { id: moving.id } } });
+
+        const stillThere = await app.inject({
+          method: 'GET',
+          url: ROUTES.note(third.id),
+          headers: jarHeaders(owner),
+        });
+        expect(noteWithContentSchema.parse(stillThere.json())).toMatchObject({
+          name: 'outline',
+          folderId: from,
+          version: 1,
+        });
+      },
+      { db },
+    );
+  });
+
   it('deletes with 204 and no body, and the row is gone for both readers', async () => {
     await withApp(
       async (app: FastifyInstance) => {

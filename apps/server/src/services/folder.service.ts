@@ -34,8 +34,7 @@ import {
   folderDepth,
   folderSubtreeHeight,
   isDescendantOrSelf,
-  moveFolder,
-  renameFolder,
+  patchFolder,
   takeFolderMoveLock,
 } from '../db/repositories/folders.repo.js';
 import { countNotesInFolder } from '../db/repositories/notes.repo.js';
@@ -136,9 +135,15 @@ async function assertFolderNameFree(
  *
  * Reading rather than guessing matters: the index only says "someone got there first", and the client's whole
  * recovery — adopt the row that exists instead of creating a second one — needs that row's id.
+ *
+ * `executor` is the **pool**, and only ever the pool: a transaction that has just violated an index is closed to
+ * every further statement until it rolls back (Postgres answers `25P02`), so asking it for the winner would turn
+ * a `409` the client can act on into a `500`. Each caller therefore catches the violation *outside* its
+ * transaction and reads here, by which time the winner is committed — a write that fails on a unique index has
+ * waited for the writer that got there first, which is the same reason the row is findable at all.
  */
 async function lostNameRace(
-  executor: DbOrTx,
+  executor: Db,
   input: { readonly userId: string; readonly parentId: string | null; readonly name: string },
 ): Promise<ConflictError> {
   const clash = await folderByParentAndName(executor, input);
@@ -155,85 +160,114 @@ export function createFolderService(options: { readonly db: Db }): FolderService
 
   return {
     async create({ userId, name, parentId = null }): Promise<FolderNode> {
-      const created = await db.transaction(async (tx) => {
-        await takeFolderMoveLock(tx, userId);
+      let created: Folder;
+      try {
+        created = await db.transaction(async (tx) => {
+          await takeFolderMoveLock(tx, userId);
 
-        // A create cannot produce a cycle, so only the depth rule applies — and it needs the destination's
-        // depth and nothing else, because a brand-new folder carries no subtree.
-        if (parentId !== null) {
-          const parent = await folderById(tx, { userId, id: parentId });
-          if (parent === undefined) throw new NotFoundError('folder');
-          const parentDepth = (await folderDepth(tx, { userId, id: parentId })) ?? 0;
-          // `fitsWithinFolderDepth` is the contract's formula and its precondition is a real parent depth; a
-          // folder at the root is not expressible in it (there is no parent), and lands at depth 0, which can
-          // never overflow the cap.
-          if (!fitsWithinFolderDepth(parentDepth, 0)) throw folderTooDeep(parentDepth + 1);
-        }
+          // A create cannot produce a cycle, so only the depth rule applies — and it needs the destination's
+          // depth and nothing else, because a brand-new folder carries no subtree.
+          if (parentId !== null) {
+            const parent = await folderById(tx, { userId, id: parentId });
+            if (parent === undefined) throw new NotFoundError('folder');
+            const parentDepth = (await folderDepth(tx, { userId, id: parentId })) ?? 0;
+            // `fitsWithinFolderDepth` is the contract's formula and its precondition is a real parent depth; a
+            // folder at the root is not expressible in it (there is no parent), and lands at depth 0, which can
+            // never overflow the cap.
+            if (!fitsWithinFolderDepth(parentDepth, 0)) throw folderTooDeep(parentDepth + 1);
+          }
 
-        await assertFolderNameFree(tx, { userId, parentId, name });
-        try {
+          await assertFolderNameFree(tx, { userId, parentId, name });
+          // Nothing is caught around the insert on purpose. The check above is not a substitute for the index,
+          // but the re-read that turns a lost race into a 409 carrying the winner's id cannot run inside the
+          // transaction that has just lost it, so the violation is answered out here.
           return await createFolder(tx, { userId, parentId, name });
-        } catch (error) {
-          // The check above is not a substitute for the index: two concurrent creates in the same folder both
-          // see the name free, and one of them has to be told so rather than getting an opaque 500.
-          if (isUniqueViolation(error)) throw await lostNameRace(tx, { userId, parentId, name });
-          throw error;
-        }
-      });
+        });
+      } catch (error) {
+        // Two concurrent creates in the same folder both see the name free, and one of them has to be told so
+        // rather than getting an opaque 500.
+        if (isUniqueViolation(error)) throw await lostNameRace(db, { userId, parentId, name });
+        throw error;
+      }
       return toFolderNode(created);
     },
 
     async patch({ userId, id, name, parentId }): Promise<FolderNode> {
-      const updated = await db.transaction(async (tx) => {
-        await takeFolderMoveLock(tx, userId);
+      // The `(parent, name)` the transaction is about to write, for the loser of a name race out here: after a
+      // unique violation Postgres closes that transaction to every further statement, so neither half of the pair
+      // can be recovered from it once it has failed. Assigned immediately before the write, which is the only
+      // statement in here that can violate one.
+      let attempted: { readonly parentId: string | null; readonly name: string } | undefined;
 
-        const current = await folderById(tx, { userId, id });
-        if (current === undefined) throw new NotFoundError('folder');
+      let updated: Folder;
+      try {
+        updated = await db.transaction(async (tx) => {
+          await takeFolderMoveLock(tx, userId);
 
-        const targetParentId = parentId === undefined ? current.parentId : parentId;
-        const moving = targetParentId !== current.parentId;
+          const current = await folderById(tx, { userId, id });
+          if (current === undefined) throw new NotFoundError('folder');
 
-        if (moving) {
-          // "Is that my folder?" is answered before "would that be a cycle?", so somebody else's id stays a 404
-          // instead of becoming a fact about their tree. (`isDescendantOrSelf` is user-scoped too, so it can
-          // only ever say "no" about a foreign target — but the 404 must not depend on that.)
-          if (targetParentId !== null) {
-            const target = await folderById(tx, { userId, id: targetParentId });
-            if (target === undefined) throw new NotFoundError('folder');
-            // `isDescendantOrSelf` also answers `true` for `targetId === id`, i.e. "into itself", which is the
-            // smallest cycle there is and needs no special case here.
-            if (await isDescendantOrSelf(tx, { userId, id, targetId: targetParentId })) {
-              throw new ConflictError('a folder cannot be moved inside itself');
+          const targetParentId = parentId === undefined ? current.parentId : parentId;
+          const moving = targetParentId !== current.parentId;
+
+          if (moving) {
+            // "Is that my folder?" is answered before "would that be a cycle?", so somebody else's id stays a 404
+            // instead of becoming a fact about their tree. (`isDescendantOrSelf` is user-scoped too, so it can
+            // only ever say "no" about a foreign target — but the 404 must not depend on that.)
+            if (targetParentId !== null) {
+              const target = await folderById(tx, { userId, id: targetParentId });
+              if (target === undefined) throw new NotFoundError('folder');
+              // `isDescendantOrSelf` also answers `true` for `targetId === id`, i.e. "into itself", which is the
+              // smallest cycle there is and needs no special case here.
+              if (await isDescendantOrSelf(tx, { userId, id, targetId: targetParentId })) {
+                throw new ConflictError('a folder cannot be moved inside itself');
+              }
+            }
+
+            // §5.2: the destination's depth *and* the height of what is being carried. The upward walk alone
+            // would let a subtree that already reaches depth 99 be re-parented under a shallow root.
+            const parentDepth =
+              targetParentId === null ? -1 : ((await folderDepth(tx, { userId, id: targetParentId })) ?? 0);
+            const height = await folderSubtreeHeight(tx, { userId, id });
+            if (parentDepth >= 0 && !fitsWithinFolderDepth(parentDepth, height)) {
+              throw folderTooDeep(parentDepth + 1 + height);
             }
           }
 
-          // §5.2: the destination's depth *and* the height of what is being carried. The upward walk alone
-          // would let a subtree that already reaches depth 99 be re-parented under a shallow root.
-          const parentDepth =
-            targetParentId === null ? -1 : ((await folderDepth(tx, { userId, id: targetParentId })) ?? 0);
-          const height = await folderSubtreeHeight(tx, { userId, id });
-          if (parentDepth >= 0 && !fitsWithinFolderDepth(parentDepth, height)) {
-            throw folderTooDeep(parentDepth + 1 + height);
+          const nextName = name ?? current.name;
+          if (name !== undefined || moving) {
+            await assertFolderNameFree(tx, {
+              userId,
+              parentId: targetParentId,
+              name: nextName,
+              exceptId: id,
+            });
           }
-        }
 
-        const nextName = name ?? current.name;
-        if (name !== undefined || moving) {
-          await assertFolderNameFree(tx, { userId, parentId: targetParentId, name: nextName, exceptId: id });
+          attempted = { parentId: targetParentId, name: nextName };
+          // One statement, whichever halves the request carried — `patchFolder`. Renaming while the folder still
+          // hung under its old parent judged the new name against the wrong set of siblings, which is how a
+          // `PATCH {name, parentId}` that is legal at the destination got refused for a clash it would not have
+          // had there.
+          const patched = await patchFolder(tx, {
+            userId,
+            id,
+            ...(name === undefined ? {} : { name }),
+            ...(moving ? { parentId: targetParentId } : {}),
+          });
+          // Read two statements ago in this same transaction, so a miss is a concurrent delete — and a folder
+          // that is gone is the answer this request would have got had it started a moment later.
+          if (patched === undefined) throw new NotFoundError('folder');
+          return patched;
+        });
+      } catch (error) {
+        if (isUniqueViolation(error)) {
+          throw attempted === undefined
+            ? new ConflictError('that name is already used in this folder')
+            : await lostNameRace(db, { userId, parentId: attempted.parentId, name: attempted.name });
         }
-
-        try {
-          const renamed =
-            name === undefined ? current : ((await renameFolder(tx, { userId, id, name })) ?? current);
-          if (!moving) return renamed;
-          return (await moveFolder(tx, { userId, id, parentId: targetParentId })) ?? renamed;
-        } catch (error) {
-          if (isUniqueViolation(error)) {
-            throw await lostNameRace(tx, { userId, parentId: targetParentId, name: nextName });
-          }
-          throw error;
-        }
-      });
+        throw error;
+      }
       return toFolderNode(updated);
     },
 

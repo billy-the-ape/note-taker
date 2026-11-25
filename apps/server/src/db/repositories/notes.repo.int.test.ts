@@ -23,11 +23,10 @@ import {
   deleteNote,
   listAllNotes,
   listNotes,
-  moveNote,
   noteByFolderAndName,
   noteById,
+  patchNote,
   recentNotes,
-  renameNote,
   writeNoteContent,
 } from './notes.repo.js';
 
@@ -201,7 +200,7 @@ describe('notes.repo', () => {
     // One name in both places, so `unique.md` cannot move up: the sibling index decides, not the repository,
     // and PR-09 renders the failure as a 409. The row must still be where it was.
     await expectSqlState(
-      moveNote(db, { userId: owner.id, id: inside.id, folderId: null }),
+      patchNote(db, { userId: owner.id, id: inside.id, folderId: null }),
       '23505',
       'notes_unique_sib',
     );
@@ -210,10 +209,10 @@ describe('notes.repo', () => {
     });
 
     // Rename the root note and the very same move becomes legal: the constraint was the collision, nothing else.
-    const renamed = await renameNote(db, { userId: owner.id, id: atRoot.id, name: 'renamed.md' });
+    const renamed = await patchNote(db, { userId: owner.id, id: atRoot.id, name: 'renamed.md' });
     expect(renamed).toMatchObject({ name: 'renamed.md', version: 1 });
 
-    const moved = await moveNote(db, { userId: owner.id, id: inside.id, folderId: null });
+    const moved = await patchNote(db, { userId: owner.id, id: inside.id, folderId: null });
     expect(moved).toMatchObject({ folderId: null, id: inside.id });
     // Renames and moves never touch `version`: only a content write is a new version, which is what lets a
     // rename happen without invalidating every open editor (PR-10's 409 depends on that).
@@ -222,6 +221,24 @@ describe('notes.repo', () => {
       'renamed.md',
       'unique.md',
     ]);
+  });
+
+  it('renames and moves in one statement, which is the pair the sibling index judges', async () => {
+    const { owner } = await pair();
+    const db = testDb();
+    const from = await createFolder(db, { userId: owner.id, name: 'from' });
+    const to = await createFolder(db, { userId: owner.id, name: 'to' });
+    const moving = await makeNote(db, owner.id, { name: 'a', folderId: from.id });
+    // A note called `b` already sits in the folder `moving` is leaving. Renaming first and moving afterwards —
+    // what `PATCH /api/notes/:id` used to do — hit `notes_unique_sib` here, in a folder the note was on its way
+    // out of, and the request that described a perfectly legal `(to, b)` was refused.
+    await makeNote(db, owner.id, { name: 'b', folderId: from.id });
+
+    const patched = await patchNote(db, { userId: owner.id, id: moving.id, name: 'b', folderId: to.id });
+
+    expect(patched).toMatchObject({ name: 'b', folderId: to.id, version: 1 });
+    expect(namesOf(await listNotes(db, { userId: owner.id, folderId: from.id }))).toStrictEqual(['b']);
+    expect(namesOf(await listNotes(db, { userId: owner.id, folderId: to.id }))).toStrictEqual(['b']);
   });
 
   it('builds the conditional update the contract asks for: WHERE id AND version, RETURNING *', () => {

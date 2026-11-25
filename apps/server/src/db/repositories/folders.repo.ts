@@ -156,33 +156,32 @@ export async function listAllFolders(db: Db, input: { readonly userId: string })
   return db.select().from(folders).where(eq(folders.userId, input.userId)).orderBy(asc(folders.name));
 }
 
-/** Renames a folder; `undefined` means the row was not the caller's to rename. */
-export async function renameFolder(
-  db: DbOrTx,
-  input: FolderKey & { readonly name: string },
-): Promise<Folder | undefined> {
-  const updated = await db
-    .update(folders)
-    .set({ name: input.name, updatedAt: new Date() })
-    .where(and(eq(folders.id, input.id), eq(folders.userId, input.userId)))
-    .returning();
-  return firstOrNone(updated);
-}
-
 /**
- * Reparents a folder (`parentId: null` moves it to the root).
+ * The one statement behind `PATCH /api/folders/:id`: rename, move, or **both at once**.
  *
- * No cycle check here, on purpose: it belongs with PR-09's per-user advisory lock, and a check without that
- * lock would be a race that looks like a guard. What the database does guarantee is that a move never
- * produces two siblings with one name.
+ * The reasoning is `patchNote`'s, and it applies here for the same reason: a sibling clash is decided by
+ * `(user_id, parent_id, name)`, so a rename that runs while the folder still sits under its **current** parent
+ * is judged against the wrong parent. `PATCH {name, parentId}` naming a name one of the source's other children
+ * already held was refused for a clash the destination did not have — a legal request answered `409`. Writing
+ * both columns in one UPDATE is the smallest statement in which the row is in the place the caller asked for at
+ * the moment the index looks.
+ *
+ * No cycle check here, on purpose: it belongs with PR-09's per-user advisory lock, and a check without that lock
+ * would be a race that looks like a guard. What the database does guarantee is that a move never produces two
+ * siblings with one name — which is exactly what `parentId` and `name` together have to be judged by.
  */
-export async function moveFolder(
+export async function patchFolder(
   db: DbOrTx,
-  input: FolderKey & { readonly parentId: string | null },
+  input: FolderKey & { readonly name?: string | undefined; readonly parentId?: string | null | undefined },
 ): Promise<Folder | undefined> {
   const updated = await db
     .update(folders)
-    .set({ parentId: input.parentId, updatedAt: new Date() })
+    .set({
+      ...(input.name === undefined ? {} : { name: input.name }),
+      // Only an absent key means "leave it where it is"; `parentId: null` is the root, and it is a change.
+      ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+      updatedAt: new Date(),
+    })
     .where(and(eq(folders.id, input.id), eq(folders.userId, input.userId)))
     .returning();
   return firstOrNone(updated);

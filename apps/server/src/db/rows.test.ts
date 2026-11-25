@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { rawTextArray, rawTimestamp } from './rows.js';
+import { expectOne, firstOrNone, rawRows, rawTextArray, rawTimestamp } from './rows.js';
 
 /**
  * The pure half of reading a **raw** statement (PR-09).
@@ -10,7 +10,39 @@ import { rawTextArray, rawTimestamp } from './rows.js';
  * `GET /api/tree` answered `500` in CI because a mapping asserted `Date` on text. The driver's shape is not
  * something a test should discover in production, and the parser is total: every branch here is a shape it may
  * meet.
+ *
+ * Which is also why `vitest.config.ts` gates **this file** rather than letting the integration report decide:
+ * the integration job drives a real driver, which takes only the happy path of each branch, so the fallbacks
+ * below are unreachable there by construction (`vitest.integration.config.ts` says the same from the other
+ * side). A file whose whole purpose is surviving shapes the suite cannot produce has to be measured by the
+ * suite that can produce them.
  */
+describe('the row unwrappers', () => {
+  it('takes the one row a scoped returning-statement produced', () => {
+    expect(expectOne([{ id: 'a' }], 'insert note')).toEqual({ id: 'a' });
+    // Nothing back means the row was deleted under the caller, which is a bug, and saying so beats handing
+    // `undefined` back as data.
+    expect(() => expectOne([], 'delete note')).toThrow(
+      /expected exactly one row back from delete note, got 0/,
+    );
+  });
+
+  it('reads the optional row as a value or as nothing', () => {
+    expect(firstOrNone([{ id: 'a' }, { id: 'b' }])).toEqual({ id: 'a' });
+    expect(firstOrNone([])).toBeUndefined();
+  });
+
+  it('accepts both shapes a raw statement comes back in', () => {
+    // drizzle's own two spellings, which is why the tolerance exists once instead of in every repository.
+    expect(rawRows<{ id: string }>([{ id: 'a' }])).toEqual([{ id: 'a' }]);
+    expect(rawRows<{ id: string }>({ rows: [{ id: 'a' }], count: 1 })).toEqual([{ id: 'a' }]);
+    // Anything else is no rows, which is what a `select` that found nothing has to mean.
+    expect(rawRows(undefined)).toStrictEqual([]);
+    expect(rawRows(null)).toStrictEqual([]);
+    expect(rawRows({ rowCount: 0 })).toStrictEqual([]);
+  });
+});
+
 describe('rawTimestamp', () => {
   it('reads the epoch-milliseconds shape the tree statement asks for', () => {
     const millis = 1_700_000_000_000;

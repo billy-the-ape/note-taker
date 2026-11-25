@@ -27,8 +27,10 @@ import { type ChangePasswordRequest, changePassword, signOutEverywhere } from '.
  * `ROUTES.auth.password`, or a mistyped current password would sign the person out of a session that
  * PR-07 has just proved is still alive.
  *
- * The empty options bag below is not slack: `change-password.test.tsx` fails the moment anything here
- * clears the cache or navigates, which is the mutation that a "session hygiene" refactor would make.
+ * The absence of `onSuccess` in the hook below is not slack: `change-password.test.tsx` fails the
+ * moment anything here clears the cache or navigates, which is the mutation that a "session hygiene"
+ * refactor would make. There is no options bag to keep empty — `mutationFn` is the whole config, and
+ * the test is what stops one being added back.
  */
 export function useChangePassword() {
   const client = useApiClient();

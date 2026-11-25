@@ -39,7 +39,7 @@ assertions live here and not in PR-08).
   `CONFLICT` **with the existing id**, cycle ⇒ `CONFLICT`, depth cap ⇒ `VALIDATION`, cross-user id ⇒ `404`,
   non-empty folder delete without `cascade=true` ⇒ `CONFLICT`.
 - Tree depth is server-capped at 100 levels (root = depth 0); the server rejects, it never truncates silently.
-- Web Vitest config currently has an overall `apps/web/src` threshold row 55/55/50/55 (armed by PR-08).
+- Web Vitest config currently has an overall `apps/web/src` threshold row 55/55/50/55 (armed by PR-16; plan §14).
 
 ## 3. Global PR rules
 

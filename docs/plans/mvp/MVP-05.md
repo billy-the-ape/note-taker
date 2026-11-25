@@ -195,7 +195,8 @@ engine can read the conflict payload without re-fetching the note.
   scope because contracts needs no DB.
 - Add the **`apps/web/src/lib`** row thresholds (80/80/75/80) to `apps/web/vitest.config.ts` and **drop PR-01's
   `passWithNoTests: true`** — your mocked-`fetch` tests are the first web tests, so from here on an empty web suite is a
-  failure. The overall `apps/web/src` row still waits for PR-08's components.
+  failure. The overall `apps/web/src` row still waits: plan §14 assigns it to PR-16, which lands the first components a
+  Postgres-free web suite can render.
 - Acceptance includes the **negative control**: with `packages/contracts/dist` deleted, `pnpm -w typecheck` fails to
   resolve `@note-taker/contracts` — proof that `exports` → `dist` is what CI relies on.
 

@@ -854,8 +854,9 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   acceptance and PR-03's `unit` job. It is set on the web config only: the server has `env.test.ts`/`app.test.ts` from
   day one, and an empty server suite should be red. The web config also carries **no `coverage.thresholds`**, because a
   threshold over a scope with nothing in it is a guaranteed red: the `apps/web/src/lib` row of §14 is armed by **PR-05**
-  (whose mocked-`fetch` tests for `lib/api.ts` are the first web tests) and the overall `apps/web/src` row by **PR-08**
-  (the first components).
+  (whose mocked-`fetch` tests for `lib/api.ts` are the first web tests) and the overall `apps/web/src` row by
+  **PR-16** (the first components a Postgres-free web suite can render; §14 says why that ended up being PR-16 and
+  not PR-08, whose screens had not landed when the row was armed).
   **`AGENTS.md` is updated here, not deferred:** the file lists **no commands today**, so this PR **adds** the real
   ones it introduces (`pnpm i / dev / build / lint / typecheck / test`) — the file's first-ever command list —
   because §1's same-PR doc rule — inherited from
@@ -1050,7 +1051,8 @@ merge with the placeholder still in place — see "Jobs added later" below)
   one status refetch, exactly one replay, second 403 surfaces the error) and the 401 hook. Those tests are what arm the
   `apps/web/src/lib` row of §14's threshold table, so PR-05 adds that row's thresholds to
   `apps/web/vitest.config.ts` and drops PR-01's `passWithNoTests: true` (the overall `apps/web/src` row still waits for
-  PR-08's components).
+  components — §14 assigns it to PR-16, the PR that lands the first screen with components a Postgres-free web suite can
+  render, and not to PR-08).
 - **Coverage:** ≥ 90% lines and ≥ 85% branches in `packages/contracts` (the `packages/contracts` row of the §14
   threshold table: 90/90/85/90 here, ratcheting to 95 across the board after PR-19; pure module, no excuse, and it is a
   `unit`-job scope because contracts needs no DB).
@@ -1198,9 +1200,11 @@ merge with the placeholder still in place — see "Jobs added later" below)
   owns**, because the `/app` shell and its guard belong to PR-12), `features/auth/*`,
   `components/ui/*` (Button, Input, Field, Dialog, Menu, Toast, Spinner — Radix primitives + Tailwind),
   Tailwind theme tokens (light/dark via `prefers-color-scheme` default), global error/not-found boundaries. It also
-  **arms the rest of the web coverage gate**: it adds the overall `apps/web/src` row of §14's threshold table to
-  `apps/web/vitest.config.ts` (the `apps/web/src/lib` row was armed by PR-05, and PR-01's `passWithNoTests: true` was
-  dropped there — from PR-05 on, an empty web suite is a failure, not a pass).
+  **keeps the rest of the web coverage gate**: the overall `apps/web/src` row of §14's threshold table was **armed by
+  PR-16**, not by this PR (PR-16 landed the first components a Postgres-free web suite can render before this PR merged),
+  so this PR must not add that row — it keeps it green and raises it to whatever its own auth screens clear. The
+  `apps/web/src/lib` row was armed by PR-05, and PR-01's `passWithNoTests: true` was dropped there — from PR-05 on, an
+  empty web suite is a failure, not a pass.
 - **Acceptance (playwright-able, against routes this PR owns):** unauth visit → `/login`; `needsSetup` → `/setup`;
   wrong password shows the server message; success lands on **`/welcome`**; refresh keeps the session; the sign-out
   control on `/welcome` returns to `/login`; `/login` when authed redirects to `/welcome`; password inputs have labels
@@ -1713,12 +1717,13 @@ Rules:
 - Flaky policy: `retries: 1` for e2e only; a test that fails on re-run gets an immediate follow-up issue/PR.
 - The two `apps/web` rows are armed when the web scope first has tests to measure: **PR-05** turns on
   `apps/web/src/lib` (mocked-`fetch` tests for `lib/api.ts`) and drops PR-01's `passWithNoTests: true`;
-  the overall `apps/web/src` row was **PR-08**'s to turn on with its component tests, and **PR-16**
-  armed it instead — PR-08 had not merged when PR-16 landed the first screen whose components a
-  Postgres-free web suite can render (`/app/settings`), and a row naming a scope nothing measures is
-  not a gate. Before PR-05 the web config passes with zero files and
-  declares no thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by
-  the PR named in its `enforced by` cell.
+  the overall `apps/web/src` row was **PR-08**'s, and **PR-16 armed it instead** — PR-08 had not merged when PR-16
+  landed the first screen whose components a Postgres-free web suite can render (`/app/settings`), and a row naming a
+  scope nothing measures is not a gate. **This bullet is the authority on that row:** `MVP-08.md` §7 now tells PR-08 to
+  keep the existing row and raise it, never to add a second one, and the `MVP-01` / `MVP-03` / `MVP-05` / `MVP-12`
+  passages that dated the arming to PR-08 say PR-16. Before PR-05 the web config passes with zero files and declares no
+  thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by the PR named in its
+  `enforced by` cell.
 
 ---
 

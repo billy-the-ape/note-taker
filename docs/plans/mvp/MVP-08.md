@@ -30,7 +30,9 @@ context + route guards, and the UI kit everything else reuses. **No `/app` shell
 
 - `apps/web` (Vite 7 + React 19 + TanStack Router file-based routes + TanStack Query + Tailwind v4), with
   `routes/__root.tsx`, a placeholder `routes/index.tsx`, and `lib/{api.ts,queryClient.ts}` from PR-05.
-  `apps/web/vitest.config.ts` has an `apps/web/src/lib` threshold row and **no** overall `apps/web/src` row.
+  `apps/web/vitest.config.ts` carries **both** web coverage rows: `apps/web/src/lib` (armed by PR-05)
+  and the overall `apps/web/src` row, which **PR-16 armed** rather than this PR (§7) — it already
+  exists, so it is yours to keep green, not to add.
 - `@note-taker/contracts` exports `registerSchema`, `loginSchema`, `changePasswordSchema`, `sessionUserSchema`,
   `ROUTES` path constants, and the error envelope types.
 - The server (PR-07) serves: `GET /api/auth/status` (`{needsSetup, registrationOpen}`, issues `note_csrf`),
@@ -85,12 +87,18 @@ this PR's acceptance testable on its own.
 - No global client store (no Redux/Zustand): Query + Router cover state. Transient UI state is local + a tiny `ui` store
   persisted in `localStorage` (needed later by PR-12/13; keep it minimal now).
 
-## 7. Coverage gate you arm
+## 7. Coverage gate you keep (and may raise)
 
-Add the overall **`apps/web/src`** row to `apps/web/vitest.config.ts`: **55 lines / 55 functions / 50 branches /
-55 statements** (it ratchets to 65 after PR-19). The `apps/web/src/lib` row (80/80/75/80) already exists from PR-05, and
-`passWithNoTests: true` was dropped there — from PR-05 on, an empty web suite is a failure. Keep thresholds in the
-config, never in CI flags.
+The overall **`apps/web/src`** row — **55 lines / 55 functions / 50 branches / 55 statements**, ratcheting to 65 after
+PR-19 — is **already in `apps/web/vitest.config.ts`**: **PR-16 armed it** (plan §14, `MVP-16.md` §9), because this PR had
+not merged when PR-16 landed the first screen whose components a Postgres-free web suite can render. So:
+
+- **Do not add a second `apps/web/src` row.** Edit the existing one; never lower it (§3).
+- Your auth screens are the first `/login` / `/signup` / `/welcome` tests in that scope, so *raising* the row is what
+  §3's "this PR raises one" now means: run `pnpm coverage`, read the number, and set thresholds the new suite clears
+  with room to spare.
+- `apps/web/src/lib` (80/80/75/80) already exists from PR-05, and `passWithNoTests: true` was dropped there — from
+  PR-05 on, an empty web suite is a failure. Keep thresholds in the config, never in CI flags.
 
 ## 8. Acceptance criteria (playwright-able in spirit; assert in Vitest + testing-library now, PR-19 replays them in e2e)
 
@@ -105,7 +113,8 @@ config, never in CI flags.
       member and lands on `/welcome`. With the flag false: `/signup` is unreachable from the UI and a direct visit
       redirects to `/login`. On a **fresh install** (flag true, `needsSetup: true`): the link is hidden and a direct
       `/signup` visit redirects to `/setup`.
-- [ ] `apps/web/src` overall coverage ≥ 55/55/50/55; `pnpm coverage` green in the `unit` job.
+- [ ] `apps/web/src` overall coverage ≥ 55/55/50/55 — the row **PR-16** armed (§7), not one you add — and
+      `pnpm coverage` green in the `unit` job; higher numbers, with the thresholds raised to match, are the goal.
 
 ## 9. Out of scope
 
@@ -120,7 +129,8 @@ Task: PR-08
 
 ## What
 routes setup/login/signup/welcome, features/auth session context + guard plumbing, components/ui v1 (Radix + Tailwind),
-Tailwind light/dark tokens, error + not-found boundaries, web coverage row armed (55/55/50/55).
+Tailwind light/dark tokens, error + not-found boundaries, overall `apps/web/src` coverage row kept green (the
+55/55/50/55 row PR-16 armed) and raised to whatever this PR's suite clears.
 
 ## Acceptance evidence
 - vitest run: guard redirects, signup visibility matrix (flag × owner-exists × needsSetup), error rendering

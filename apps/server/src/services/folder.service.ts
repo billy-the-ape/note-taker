@@ -34,6 +34,7 @@ import {
   folderDepth,
   folderSubtreeHeight,
   isDescendantOrSelf,
+  lockFolderRow,
   patchFolder,
   takeFolderMoveLock,
 } from '../db/repositories/folders.repo.js';
@@ -275,8 +276,14 @@ export function createFolderService(options: { readonly db: Db }): FolderService
       await db.transaction(async (tx) => {
         await takeFolderMoveLock(tx, userId);
 
-        const current = await folderById(tx, { userId, id });
-        if (current === undefined) throw new NotFoundError('folder');
+        // The **row** lock, taken before the counts below and before the delete — see {@link lockFolderRow}. The
+        // advisory lock above serializes this delete against every other *folder* mutation of this user, but a note
+        // create is not a folder mutation and holds no such lock: it only holds the `KEY SHARE` on this row that
+        // every foreign-key insert takes. `folderById` would have answered the same ownership question and left the
+        // gate open, because a read that does not lock lets the count below answer "empty" about a folder someone
+        // is writing into right now — and the cascade then deletes a note whose `POST` the client was just told
+        // succeeded. Locking first turns that into the answer the gate was built to give: `409`.
+        if (!(await lockFolderRow(tx, { userId, id }))) throw new NotFoundError('folder');
 
         if (!cascade) {
           const childFolders = await countChildren(tx, { userId, parentId: id });

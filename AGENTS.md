@@ -73,6 +73,18 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `404 NOT_FOUND` — never a `500` from `23503`, and never a `403` that would confirm the id exists. The route
   handlers stay thin: ownership, cycles, the 100-level cap and the envelope failures are decided in the service,
   and `plugins/error-handler.ts`'s `mapError()` is the one place a status is chosen.
+- **A delete's emptiness gate locks the folder row, and a generated name never conflicts** (PR-09): the advisory
+  lock above serializes folder mutations against each other, but a note `INSERT` takes no such lock — it takes the
+  `KEY SHARE` on the folder row that every foreign-key insert takes. So `remove()` in `services/folder.service.ts`
+  calls `lockFolderRow()` (`SELECT … FOR UPDATE`, which answers the ownership question with `404` in the same
+  statement) **before** `countChildren()`/`countNotesInFolder()`. Count first and the gate can answer "empty" about
+  a folder someone is writing into; the `DELETE` then waits on that same `KEY SHARE` only after the gate opened, and
+  cascades over the row that won — a `204` for a delete that destroyed a note whose `POST` had returned `201`. Do
+  not "simplify" that read back into `folderById`. Both races are asserted in
+  `services/folder.service.int.test.ts`. Second half: a unique violation on a **generated** `new-file-<msepoch>`
+  name is re-picked with a fresh read (`GENERATED_NAME_ATTEMPTS` in `services/note.service.ts`) and never answered
+  `409` with a stranger's id, because a generated name is the one name the server may change (§5.5); a name the
+  client typed still clashes on purpose. Concurrent creates are asserted in `services/note.service.int.test.ts`.
 - **The schema lives in one file and the docs follow it.** `apps/server/src/db/schema.ts` is the source of truth;
   a new column ships with its generated SQL in `apps/server/migrations/` in the same PR, and
   `docs/DATA-MODEL.md` (created by PR-04) is rewritten in that same PR — it is what PR-06/07/09/10 read.

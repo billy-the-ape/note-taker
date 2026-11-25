@@ -67,6 +67,30 @@ describe('POST /api/notes naming (§5.5)', () => {
     expect(await listAllNotes(db, { userId: user.id })).toHaveLength(2);
   });
 
+  it('creates four nameless notes at one instant without any of them losing', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+
+    // The test above is sequential, and sequential is the easy case for free: by the time the second create reads
+    // the folder's names, the first has committed. Started together is the case the code has to earn — every one
+    // of these reads "no names yet", so every one picks `new-file-<NOW_MS>`, and `notes_unique_sib` then admits
+    // exactly one. The loser used to be answered `409 CONFLICT` carrying the winner's id, which is the right
+    // recovery for a name somebody typed and a wrong one for a name the server invented: the client never sent
+    // this name, and the note it is being pointed at is not the note it asked to create (§5.5,
+    // `docs/NAME-RULES.md`). So the service re-picks, and four is deliberately more than two: a retry that gave
+    // up after one more try would still pass a two-way test.
+    const settled = await Promise.allSettled([0, 1, 2, 3].map(() => notes.create({ userId: user.id })));
+
+    const rejected = settled.filter((result) => result.status === 'rejected');
+    // Asserting the rejections themselves, so a failure prints the reason rather than a count.
+    expect(rejected.map((result) => (result as PromiseRejectedResult).reason)).toStrictEqual([]);
+
+    const names = settled.flatMap((result) => (result.status === 'fulfilled' ? [result.value.name] : []));
+    expect(names).toHaveLength(4);
+    expect(new Set(names).size).toBe(4);
+    expect(names).toContain(`new-file-${NOW_MS}`);
+    expect(await listAllNotes(db, { userId: user.id })).toHaveLength(4);
+  });
+
   it('strips the display extension and stores the base', async () => {
     const user = await createUser(db, { username: 'a', role: 'member' });
     const created = await notes.create({ userId: user.id, name: 'Draft.md', content: 'hello' });

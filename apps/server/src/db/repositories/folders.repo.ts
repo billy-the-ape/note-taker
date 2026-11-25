@@ -112,6 +112,29 @@ export async function folderById(db: DbOrTx, key: FolderKey): Promise<Folder | u
 }
 
 /**
+ * Locks the folder row (`FOR UPDATE`) and reports whether it is the caller's, so the caller can decide between
+ * `404` and "continue".
+ *
+ * **Why a delete needs this and the per-user advisory lock does not give it.** `notes.folder_id` is an
+ * `ON DELETE CASCADE` foreign key, and inserting a note takes a `KEY SHARE` lock on the folder row it points at.
+ * `FOR UPDATE` conflicts with `KEY SHARE`, so this statement waits for an in-flight note insert into that folder
+ * to finish; the *next* statement — the emptiness count — then reads a snapshot that includes it, and a folder
+ * that gained a note under the delete is refused with `409` instead of cascade-deleting a note whose `POST` the
+ * client was just told succeeded. Count first and lock later (as `DELETE FROM folders` alone would do) waits on
+ * the same `KEY SHARE` but has already answered "empty", and the cascade destroys the row that won the race.
+ * A note insert that starts *after* this lock is the other half of the same story: it blocks here, and lands on
+ * the FK check once the delete commits, which `note.service.ts` answers with `404 NOT_FOUND` for the folder.
+ *
+ * Takes `DbOrTx` and is only meaningful inside a transaction, like every other locking read here.
+ */
+export async function lockFolderRow(db: DbOrTx, key: FolderKey): Promise<boolean> {
+  const found = (await db.execute(
+    sql`select id from folders where id = ${key.id} and user_id = ${key.userId} for update`,
+  )) as unknown as readonly { id: string }[];
+  return found.length > 0;
+}
+
+/**
  * The sibling lookup that lets a service answer "is that name taken here?" before it inserts, i.e. the same
  * comparison `folders_unique_sib` makes — including the root, where the indexed value is the `COALESCE`
  * sentinel rather than `NULL`.

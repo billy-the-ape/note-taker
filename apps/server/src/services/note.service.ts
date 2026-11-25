@@ -126,6 +126,17 @@ export interface NoteServiceOptions {
 }
 
 /** Builds the service over one pool and one keyring; `buildApp()` registers one per process. */
+/**
+ * How many times a note with a **generated** name may pick a new one before its create gives up (the loop in
+ * `create` below).
+ *
+ * Five is not a tuned number. Contention here is bounded by how many nameless creates land in one folder inside
+ * the same millisecond, and every retry re-reads that folder, so the second attempt already sees the row that won
+ * and `uniquify` moves to the next free suffix. What the bound is for is an exit: a future unique index nobody
+ * thought about should fail a request, not spin in the write path forever.
+ */
+const GENERATED_NAME_ATTEMPTS = 5;
+
 export function createNoteService(options: NoteServiceOptions): NoteService {
   const { db, keyring } = options;
   const now = options.now ?? Date.now;
@@ -209,22 +220,56 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
         throw new PayloadTooLargeError(NOTE_CONTENT_MAX_BYTES);
       }
 
-      // One INSERT is atomic on its own, so a create needs no transaction — only the same two checks the patch
-      // below makes, in the folder the row is being born in.
-      const storedName = name === undefined ? await generatedName(userId, folderId) : storedNoteName(name);
-      if (name !== undefined) await assertNoteNameFree(db, { userId, folderId, name: storedName });
-
-      // The AAD is the row's id, so the id comes first, and the body is sealed against it before the insert.
+      // The AAD is the row's id, so the id comes first, and the body is sealed against it before the insert. The
+      // id is minted once even though a generated name may be chosen more than once below: the row does not exist
+      // yet on any attempt, and the envelope is bound to that id, not to the name.
       const id = newId();
       const sealed = sealNoteContent(plaintext, id, keyring);
-      try {
-        const row = await createNote(db, { id, userId, folderId, name: storedName, content: sealed });
-        // The plaintext is already in hand; returning it is not a shortcut around decryption (that is what
-        // `GET` proves) but the absence of a needless round-trip in the write path.
-        return toNoteWithContent(row, plaintext);
-      } catch (error) {
-        if (isUniqueViolation(error)) throw await lostNameRace(userId, folderId, storedName);
-        throw error;
+
+      if (name !== undefined) {
+        const storedName = storedNoteName(name);
+        // One INSERT is atomic on its own, so a create needs no transaction — only the same check the patch below
+        // makes, in the folder the row is being born in.
+        await assertNoteNameFree(db, { userId, folderId, name: storedName });
+        try {
+          const row = await createNote(db, { id, userId, folderId, name: storedName, content: sealed });
+          return toNoteWithContent(row, plaintext);
+        } catch (error) {
+          // A name the client *typed* stays its name: `plan` beside an existing `plan` is `409` with the winner's
+          // id, never a stored `plan-2` nobody asked for (§5.5). The race below is not this request's.
+          if (isUniqueViolation(error)) throw await lostNameRace(userId, folderId, storedName);
+          throw error;
+        }
+      }
+
+      // A name the client did **not** type is the one name this server is allowed to change on its own (§5.5), so
+      // losing this race is not the client's problem to receive.
+      //
+      // {@link generatedName} reads the folder's names and picks the next free suffix, and two nameless creates in
+      // the same folder in the same millisecond — a double-clicked "New note", which a sequential test can only
+      // ever simulate one at a time — both read the same "free". The loser's INSERT waits on `notes_unique_sib`
+      // until the winner commits and then fails with `23505`. Answering that with `409 CONFLICT` would report a
+      // clash on a name the client never sent and hand back the id of a note it never intended to open, which is
+      // precisely what `docs/NAME-RULES.md` and `docs/API.md` promise does not happen. So re-read and try again:
+      // every attempt is a fresh statement, so it sees the row that just won, and `uniquify` moves to the next
+      // suffix. The bound exists only so that a pathological fan-out — or some future unique index nobody
+      // anticipated — cannot spin here forever; the last attempt falls back to the old `409`, which at least names
+      // a row that exists.
+      //
+      // `23505` is the only thing this can be: the other constraints on the insert are the primary key (a fresh
+      // v7 UUID) and two foreign keys, and those are `23503`, which falls through untouched — including the case
+      // of the folder being deleted underneath this create, which stays the `404` it has always been.
+      for (let attempt = 1; ; attempt += 1) {
+        const storedName = await generatedName(userId, folderId);
+        try {
+          const row = await createNote(db, { id, userId, folderId, name: storedName, content: sealed });
+          // The plaintext is already in hand; returning it is not a shortcut around decryption (that is what
+          // `GET` proves) but the absence of a needless round-trip in the write path.
+          return toNoteWithContent(row, plaintext);
+        } catch (error) {
+          if (!isUniqueViolation(error)) throw error;
+          if (attempt >= GENERATED_NAME_ATTEMPTS) throw await lostNameRace(userId, folderId, storedName);
+        }
       }
     },
 

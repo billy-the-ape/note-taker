@@ -25,6 +25,7 @@ import {
   listAllFolders,
   listFolders,
   listFolderTree,
+  lockFolderRow,
   patchFolder,
 } from './folders.repo.js';
 
@@ -321,6 +322,43 @@ describe('folders.repo', () => {
     expect(await countFrom('sessions')).toBe(0);
     // …and it is the *other* user's settings row that survives, so the zeros above are about cascades.
     expect(await countFrom('settings')).toBe(1);
+  });
+
+  it('locks the folder row for the delete gate, for its owner only, and really blocks', async () => {
+    const { owner, member } = await pair();
+    const db = testDb();
+    const created = await createFolder(db, { userId: owner.id, name: 'Gate' });
+
+    // The ownership question and the row lock are one statement, so the delete answers "not yours" exactly the
+    // way it answers "not there" — and takes no lock on a stranger's row while doing it.
+    await db.transaction(async (tx) => {
+      await expect(lockFolderRow(tx, { userId: owner.id, id: created.id })).resolves.toBe(true);
+    });
+    await db.transaction(async (tx) => {
+      await expect(lockFolderRow(tx, { userId: member.id, id: created.id })).resolves.toBe(false);
+    });
+
+    // And the lock is a lock rather than a `SELECT` with `for update` written in it: a second caller has to wait
+    // for the first. This is the property `folder.service.ts`’s emptiness gate leans on (DATA-MODEL §3), and the
+    // waiting — not the return value — is what a unit test could not fake. The sleep runs in the database, so it
+    // is not a `setTimeout` hoping the machine is slow; only the lower bound is asserted, because a loaded CI box
+    // can only make the wait longer.
+    const holding = db.transaction(async (tx) => {
+      await lockFolderRow(tx, { userId: owner.id, id: created.id });
+      await tx.execute(sql`select pg_sleep(0.4)`);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const startedAt = Date.now();
+    await db.transaction(async (tx) => {
+      await expect(lockFolderRow(tx, { userId: owner.id, id: created.id })).resolves.toBe(true);
+    });
+    const waitedMs = Date.now() - startedAt;
+    await holding;
+
+    expect(
+      waitedMs,
+      `the second lock took ${waitedMs}ms, so it did not queue behind the first`,
+    ).toBeGreaterThanOrEqual(250);
   });
 
   it('answers PR-09’s cycle question by walking ancestors (isDescendantOrSelf)', async () => {

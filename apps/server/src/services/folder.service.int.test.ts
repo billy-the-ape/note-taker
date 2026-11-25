@@ -18,9 +18,11 @@ import { FOLDER_MAX_DEPTH, type FolderNode } from '@note-taker/contracts';
 import { sql } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { sealNoteContent } from '../crypto/envelope.js';
 import { getKeyring } from '../crypto/keys.js';
+import { newId } from '../db/ids.js';
 import { listAllFolders } from '../db/repositories/folders.repo.js';
-import { listAllNotes } from '../db/repositories/notes.repo.js';
+import { createNote, listAllNotes } from '../db/repositories/notes.repo.js';
 import type { Folder } from '../db/schema.js';
 import { ConflictError, NotFoundError, ValidationError } from '../domain/errors.js';
 import { createUser } from '../test/fixtures.js';
@@ -32,8 +34,14 @@ import { createTreeService } from './tree.service.js';
 const db = testDb();
 const folders = createFolderService({ db });
 const tree = createTreeService({ db });
-/** Only the cascade test needs a real note, and a real note needs the process keyring. */
-const notes = createNoteService({ db, keyring: getKeyring() });
+/**
+ * Notes appear twice: the cascade test needs a real one, and the delete-race test needs to insert one **on another
+ * transaction**, which is a repository call rather than a service call (`note.service.ts` writes on the pool, and
+ * the pool is not where the lock is held). Both need the process keyring, because a note is a sealed envelope
+ * before it is a row.
+ */
+const keyring = getKeyring();
+const notes = createNoteService({ db, keyring });
 
 /** `FOLDER_MAX_DEPTH` is the deepest *legal* depth, so the cap is one more than it. */
 const CAP = FOLDER_MAX_DEPTH + 1;
@@ -321,7 +329,7 @@ describe('cross-user ids in bodies (§5.4)', () => {
   });
 });
 
-describe('concurrent moves and the per-user advisory lock (§5.3, §7)', () => {
+describe('concurrent moves, the per-user advisory lock and the folder row lock (§5.3, §7)', () => {
   it('serialises two adjacent moves started as siblings: one commits, the other conflicts', async () => {
     const user = await createUser(db, { username: 'a', role: 'member' });
     const a = await folders.create({ userId: user.id, name: 'A' });
@@ -393,5 +401,51 @@ describe('concurrent moves and the per-user advisory lock (§5.3, §7)', () => {
     // truncation if a cycle had committed.
     const walked = await tree.get({ userId: user.id });
     expect(walked.folders).toHaveLength(4);
+  });
+
+  it('loses a note create to the folder row lock, never to the cascade', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const folder = await folders.create({ userId: user.id, name: 'vanity' });
+
+    // Not "a note exists" — the count would simply see it — but "a note is on its way", which is the shape the
+    // emptiness gate has to survive. This insert runs on its own connection and never commits until the sleep is
+    // over, so for the length of that sleep the folder looks empty to every other transaction on the pool while
+    // the row that will land in it holds the `KEY SHARE` on the folder that every foreign-key insert takes.
+    const arrivingId = newId();
+    const inserting = db.transaction(async (tx) => {
+      await createNote(tx, {
+        id: arrivingId,
+        userId: user.id,
+        folderId: folder.id,
+        name: 'arriving',
+        content: sealNoteContent('do not lose me', arrivingId, keyring),
+      });
+      await tx.execute(sql`select pg_sleep(0.5)`);
+    });
+    // Long enough that the insert above is in flight, short enough that its sleep still has most of itself left to
+    // hold the delete waiting. The sleep is in the database, so this is not a race against a slow machine.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const refused = await folders.remove({ userId: user.id, id: folder.id, cascade: false }).then(
+      () => undefined,
+      (thrown: unknown) => thrown as ConflictError,
+    );
+    await inserting;
+
+    // Delete the folder row without the `FOR UPDATE` and this is the moment the bug shows: the count ran before
+    // any lock, answered "empty", and the `DELETE` then waited on that same `KEY SHARE` only after the gate had
+    // already opened — and cascaded over the row that won. Here that is a `204` for a delete that destroyed a
+    // note the client was told about a moment earlier, which is the data destruction `docs/DATA-MODEL.md` §3 says
+    // the gate exists to prevent, so the answer has to be `409` and the note has to survive.
+    expect(refused).toBeInstanceOf(ConflictError);
+    expect(refused?.message).toContain('1 note(s)');
+
+    const parents = await snapshot(user.id);
+    expect(parents.has(folder.id)).toBe(true);
+    expect(await listAllNotes(db, { userId: user.id })).toHaveLength(1);
+    // Readable through the service, so "survived" means a note the user can open rather than a row somewhere.
+    const read = await notes.read({ userId: user.id, id: arrivingId });
+    expect(read.name).toBe('arriving');
+    expect(read.content).toBe('do not lose me');
   });
 });

@@ -81,10 +81,14 @@ code a client could act on wrongly (**PR-09**):
   versions and fingerprints (which a client cannot act on), and the one body a client might misread as success is
   `content: ""` — an empty note it would then feel safe overwriting. The operator needs to know *which* row, so
   the id is attached to the log, next to the `requestId` the envelope already carries.
-* **A move or create that would exceed 100 levels → `VALIDATION`/400**, with `details[].path` of `parentId` (or
-  `folderId` for a note) and a message that states the cap and the depth it would have produced. Nothing is
-  silently truncated: a tree that cannot be built is refused, because a folder quietly dropped at level 101 is
-  data the user can neither see nor delete.
+* **A folder create or move that would exceed 100 levels → `VALIDATION`/400**, with `details[].path` of `parentId`
+  — always that field, because it is the only field that can ask for more depth than the tree has — and a message
+  that states the cap and the depth it would have produced. Nothing is silently truncated: a tree that cannot be
+  built is refused, because a folder quietly dropped at level 101 is data the user can neither see nor delete.
+  **A note never produces this error**, in either direction: notes are leaves, so creating one or moving one cannot
+  deepen the tree, and the folder it lands in was already within the cap. A note whose `folderId` is unknown or
+  belongs to someone else is the `404` above. There is no depth `VALIDATION` carrying `details[].path` of
+  `folderId` for a client to write handling for.
 
 One number a client may act on is not in the body: a `429` from a rate limit carries `Retry-After` in whole
 seconds — the time the sliding window itself reports — and nothing else writes that header. The envelope above

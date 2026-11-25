@@ -230,9 +230,18 @@ Two more things the same transaction decides, both because the tree is data and 
 * **The cascade is the schema's, and the refusal is the service's.** `deleteFolder()` is one `DELETE` over
   `(id, user_id)`; the descendant folders and the notes inside them go because `parent_id`/`folder_id` are
   `ON DELETE CASCADE` (§2) — there is no delete-then-recurse in JavaScript, and therefore no state where a folder
-  is gone and its children are not. What the API adds is the *gate*: without `?cascade=true` the service first
-  counts direct children (`countChildren()`) and the notes in this folder (`countNotesInFolder()`) and refuses a
-  non-empty one with `409 CONFLICT`, because a recursive delete the user did not ask for is data destruction.
+  is gone and its children are not. What the API adds is the *gate*: without `?cascade=true` the service locks the
+  folder row first (`lockFolderRow()`, `FOR UPDATE`) and **only then** counts direct children
+  (`countChildren()`) and the notes in this folder (`countNotesInFolder()`), refusing a non-empty one with
+  `409 CONFLICT`, because a recursive delete the user did not ask for is data destruction.
+  The row lock is not decoration, and the per-user advisory lock above does not provide it: a note `INSERT` takes
+  `KEY SHARE` on the folder row it points at, and `FOR UPDATE` conflicts with that. Count first and the answer can
+  be "empty" about a folder someone is writing into right now, and the later `DELETE` waits on the very same
+  `KEY SHARE` only after the gate has already opened — then cascading over the row that won the race, so the client
+  is told `204` for a delete that destroyed a note whose `POST` it was told had succeeded a moment earlier. Locking
+  first makes the count read a snapshot that includes the committed insert (→ `409`); an insert that starts
+  afterwards blocks on this lock and dies on its foreign key once the delete commits (→ `404` for the folder).
+  Asserted concurrently in `services/folder.service.int.test.ts`, next to the cycle-race tests that share the file.
 * **One read serves the whole tree.** `listFolderTree()` is a single recursive CTE over the caller's rows that
   returns folders flat with their `depth` and a root-first `path` breadcrumb (walk metadata: `folderNodeSchema`
   has no path field, and PR-12 rebuilds the nesting from `parentId`), ordered by `name collate "C", id` so the
@@ -333,6 +342,8 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | A password change changes the password and revokes the other devices together | one transaction in `auth.service.ts` — `setUserPassword`, `deleteSessionsOfUser` and `rotateSessionToken` all run on the caller's `tx` | `services/auth.service.int.test.ts` (a change whose last statement fails leaves the old hash and both sessions exactly as they were, and still refuses with the service's own `401`) |
 | An install has an owner before anyone joins | `users_one_owner_uidx` here + `auth.service.ts`'s two guards | `routes/registration.int.test.ts` (`POST /api/auth/register` answers `403` on an empty database even with `ALLOW_REGISTRATION=true`, and `needsSetup` stays `true`) |
 | A folder move never creates a cycle | per-user `pg_advisory_xact_lock` + the ancestor walk inside it (§3) | `services/folder.service.int.test.ts` — the adjacent pair started as siblings (one commits, one `409`) and the four-node disjoint-pair race that a row-lock design commits a cycle through; afterwards the tree walk terminates and both folders stay reachable |
+| A delete without `?cascade=true` never destroys a note that was created beside it | `lockFolderRow()` — the folder row's `FOR UPDATE`, taken **before** the emptiness counts (§3), which conflicts with the `KEY SHARE` a note insert takes on the parent row | `services/folder.service.int.test.ts` (a note create and a non-cascade delete of the same folder at once: either the folder survives with its note, or the create is refused for a folder that is gone — never a `204` over a note whose `201` was already acknowledged) |
+| A **generated** note name never answers `409` | `note.service.ts` re-picks the name when the insert loses `notes_unique_sib` (`GENERATED_NAME_ATTEMPTS`); a name the client typed still clashes, on purpose | `services/note.service.int.test.ts` (four nameless creates at one pinned clock, started together: four rows, four distinct names, no conflict — where the sequential pair test cannot see the race at all) |
 | The tree is at most 100 levels, and a tree that legal is never truncated | the service's cap on create (`folderDepth`) and on move (`destination depth + 1 + subtree height`); no DB constraint can express it | `services/folder.service.int.test.ts` (the 101st level refuses, naming the cap; a deep subtree under a root refuses too) and `services/tree.service.int.test.ts` (a 99-deep chain renders complete, with a note at the bottom) |
 | A raw statement's columns are read through a helper, never asserted as a type | `db/rows.ts` — `rawRows()`, `rawTimestamp()`, `rawTextArray()` — with the tree CTE asking for `epoch … ::bigint` and the array literal read as written (§3), because a raw result carries no column metadata | `db/rows.test.ts` (each shape a driver may deliver, and a throw rather than an invented `1970-01-01`) + `folders.repo.int.test.ts` (the walked row: depth, breadcrumb, and timestamps equal to the row that was inserted) — this is the assertion PR-09's first CI run was missing, when every `GET /api/tree` answered `500` |
 | An id in a **body** is the caller's or the answer is `404` | `folderById`/`noteById` scoped to `userId` before any insert or update, so the FK never fires (§5's `23503` row) | `routes/cross-user.int.test.ts` — the four-call matrix (note create, folder create, folder move, note move) against another user's folder, all four envelopes byte-identical to a nonexistent id, and both trees byte-identical afterwards |

@@ -522,7 +522,7 @@ describe('PUT /api/notes/:id/content (§9.2 #18, PR-10 §5)', () => {
     ).rejects.toBeInstanceOf(EnvelopeError);
   });
 
-  it('does not touch the version when the body is the same text again', async () => {
+  it('still bumps the version when the body is the same text again', async () => {
     const user = await createUser(db, { username: 'a', role: 'member' });
     const created = await notes.create({ userId: user.id, name: 'unchanged', content: 'same words' });
 

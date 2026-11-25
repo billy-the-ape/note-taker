@@ -187,7 +187,7 @@ The success side of the same endpoint, which is the half the editor lives on:
 // ← 200                                ETag: W/"v7"
 {
   "id": "0198…", "name": "Draft", "folderId": null, "version": 7,
-  "contentBytes": 12, "wordCount": 2, "content": "my new text",
+  "contentBytes": 11, "wordCount": 3, "content": "my new text",
   "contentUpdatedAt": "2026-11-19T09:04:11.000Z",
   "createdAt": "2026-11-19T09:00:00.000Z", "updatedAt": "2026-11-19T09:04:11.000Z"
 }

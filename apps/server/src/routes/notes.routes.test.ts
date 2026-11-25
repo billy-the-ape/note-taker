@@ -133,9 +133,10 @@ describe('If-Match (§9.2 #18) — the header the route reads', () => {
     }
     // The upper bound is `notes.version`'s own, not a convenient rounding: a tag above `int4` names a state no row
     // can ever hold, so it names nothing. It stays a refusal even against a body asking for the same unreachable
-    // number (`noteVersionSchema` has no maximum, so a hand-written request can send one), which is the difference
-    // between "this tag matches nothing" and "this tag matches a version that does not exist". The top of the range
-    // is a version a note can actually reach, so it is a tag like any other.
+    // number — the schema refuses such a body now too (`noteVersionSchema` caps it at `MAX_NOTE_VERSION`, the same
+    // number), which is the difference between "this tag matches nothing" and "this tag matches a version that does
+    // not exist", and it holds whether or not the caller parsed the body. The top of the range is a version a note
+    // can actually reach, so it is a tag like any other.
     expect(ifMatchAdmits('W/"v2147483647"', 2_147_483_647)).toBe(true);
     const outOfRange: readonly (readonly [string, number])[] = [
       ['W/"v2147483648"', 2_147_483_648],

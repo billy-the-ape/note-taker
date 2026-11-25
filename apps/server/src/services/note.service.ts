@@ -37,6 +37,7 @@
  * in. `domain/name.ts` explains why stripping twice is a bug rather than a redundancy.
  */
 import {
+  MAX_NOTE_VERSION,
   NOTE_CONTENT_MAX_BYTES,
   type NoteNode,
   type NoteWithContent,
@@ -368,6 +369,12 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
      *    conditional update can only speak for `baseVersion`; if the caller's `If-Match` named a different
      *    version then the write it asked for is the one the RFC forbids — "the method is applied only to a state
      *    the precondition matches" — so nothing is written and the scoped re-read gives the honest answer (§5).
+     *    **A `baseVersion` the column cannot hold is settled the same way, for the same reason:** `notes.version`
+     *    is an `int4`, so comparing `3_000_000_000` in the `WHERE` is not "zero rows" but Postgres `22003` (value
+     *    out of range), which `mapError()` has no case for and would report as `500 INTERNAL` on the strength of a
+     *    number the caller invented. `noteVersionSchema` refuses such a body on the wire (**PR-10** review); the
+     *    check below is the net under a caller that reached the service past the schema, which is also where the
+     *    cap in 1 lives.
      * 3. **Sealing comes after both, and the write is the only statement.** No read precedes the `UPDATE`: the
      *    version is *compared*, never trusted, and `version + 1` happens in the same statement as the new
      *    envelope, so two tabs that read the same version cannot both win and there is no intermediate state for
@@ -386,6 +393,11 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
         throw new PayloadTooLargeError(NOTE_CONTENT_MAX_BYTES);
       }
       if (ifMatchAdmitsBase === false) throw await staleWrite(userId, id);
+      // A version outside the column cannot match any row, so it is the same fact as a stale one — and it must not
+      // reach the statement, where comparing it is a `22003` rather than an empty result set. `MAX_NOTE_VERSION`
+      // is the contract's own bound, the one `noteVersionSchema` applies to this field, so the wire and this net
+      // cannot disagree about what the domain is.
+      if (baseVersion < 1 || baseVersion > MAX_NOTE_VERSION) throw await staleWrite(userId, id);
 
       // The AAD is the row's id, so the body is sealed against the id it will be stored under — the same id the
       // write filters on, which is what makes a ciphertext copied from another note fail to authenticate.

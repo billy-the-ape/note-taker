@@ -24,6 +24,7 @@
 import {
   contentUpdateSchema,
   createNoteSchema,
+  MAX_NOTE_VERSION,
   type NoteNode,
   type NoteWithContent,
   noteIdParamsSchema,
@@ -69,19 +70,16 @@ const ANY_ENTITY_TAG = '*';
 const ENTITY_TAG = /^(?:W\/)?"v(\d+)"$/;
 
 /**
- * The ceiling of `notes.version`: the column is an `integer` (`int4`), so no state of a note was ever tagged
- * above this — the same bound `crypto/keys.ts` puts on `notes.key_version` for the same reason.
- */
-const MAX_NOTE_VERSION = 2_147_483_647;
-
-/**
  * The version one entity-tag names, or `undefined` when it names none: a digest, a typo, a version of zero (no
- * note has ever been version 0), or a number past what the column can hold.
+ * note has ever been version 0), or a number past what the column can hold — `MAX_NOTE_VERSION`, which is also
+ * the ceiling `noteVersionSchema` puts on the **body** half of this same precondition, so the two halves of one
+ * request are bounded by one number rather than by two ideas of it.
  *
- * The upper bound is what makes "names nothing" the honest description rather than "names something absurd": an
- * out-of-range tag reports as naming no state at all, so it cannot agree with a body even when the body asks for
- * that same unreachable number — a write against either would have matched no row, and would have been answered
- * from the scoped re-read anyway.
+ * That bound is what makes "names nothing" the honest description rather than "names something absurd": an
+ * out-of-range tag reports as naming no state at all, so it cannot quietly agree with a body asking for the same
+ * unreachable number. On a request the schema has parsed that is true twice over; what the bound is for is the
+ * header, which is only ever as trustworthy as the client that wrote it, and this function's other callers, which
+ * are not the route.
  */
 function entityTagVersion(tag: string): number | undefined {
   const match = ENTITY_TAG.exec(tag);

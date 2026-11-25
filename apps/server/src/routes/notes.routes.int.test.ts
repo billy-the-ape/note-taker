@@ -606,6 +606,49 @@ describe('PUT /api/notes/:id/content (§9.2 #18)', () => {
     );
   });
 
+  it('refuses a baseVersion the version column cannot hold, before it reaches SQL', async () => {
+    await withApp(
+      async (app: FastifyInstance) => {
+        const owner = await bootstrapOwner(app);
+        const created = await app.inject({
+          method: 'POST',
+          url: ROUTES.notes,
+          headers: jarHeaders(owner),
+          payload: { name: 'bounded', content: 'small body' },
+        });
+        const note = noteWithContentSchema.parse(created.json());
+
+        // `baseVersion` is compared against `notes.version`, which is an `int4`. A body naming a version past that
+        // ceiling is not a stale state — no note has ever been at 3_000_000_000 — it is a field outside the range
+        // the contract describes, and `noteVersionSchema` used to say only `min(1)`. Handed to Postgres it raises
+        // `22003` (value out of range for integer), which `mapError()` deliberately has no case for, so the answer
+        // was `500 INTERNAL`: a number nobody can store becoming the server's emergency, in a body the client
+        // wrote. `400 VALIDATION` naming the field is the same door `If-Match` was bounded to in review, one
+        // number and one code away.
+        for (const baseVersion of [2_147_483_648, 3_000_000_000, 99_999_999_999]) {
+          const refused = await put(app, owner, { id: note.id, content: 'x', baseVersion });
+          expect(refused.statusCode, refused.body).toBe(400);
+          expect(refused.json()).toMatchObject({
+            error: { code: 'VALIDATION', details: [{ path: 'baseVersion' }] },
+          });
+        }
+
+        // Refused without touching the row: `version` is still 1, and the top of the legal range is still writable
+        // in principle (`baseVersion: 1` matches, which the tests above this one prove).
+        const read = await app.inject({
+          method: 'GET',
+          url: ROUTES.note(note.id),
+          headers: jarHeaders(owner),
+        });
+        expect(noteWithContentSchema.parse(read.json())).toMatchObject({
+          version: 1,
+          content: 'small body',
+        });
+      },
+      { db },
+    );
+  });
+
   it('lets exactly one of two clients on the same version win, and tells the loser the server state', async () => {
     await withApp(
       async (app: FastifyInstance) => {

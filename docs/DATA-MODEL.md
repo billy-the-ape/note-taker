@@ -286,6 +286,10 @@ UPDATE notes
   a header naming a version other than the one being written against is answered from that same scoped re-read
   without any write at all. There is no `412` in this API's nine codes, so a violated precondition is a
   `VERSION_CONFLICT` (or the `404` the re-read says is true) rather than a status no client has a recovery for.
+- A `baseVersion` outside `[1, int4 max]` never reaches this statement at all. `noteVersionSchema` refuses it with
+  `400 VALIDATION` and `putContent` re-checks it before sealing, because comparing a number the column cannot hold
+  in the `WHERE` is not "zero rows" — it is Postgres `22003`, which the error handler would have to report as a
+  server error on the strength of a value the caller invented.
 - The row comes back whole, so the new `version` is available to return to the client without a second query
   (and no window between the two).
 - `version` is bumped **only** by a content write. `patchNote` and `patchFolder` — the one statement behind each

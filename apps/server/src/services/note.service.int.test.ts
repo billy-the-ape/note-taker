@@ -19,7 +19,7 @@
  * `VERSION_CONFLICT` carrying the server's body), and what it means when the row it would have described cannot
  * be decrypted.
  */
-import { NOTE_CONTENT_MAX_BYTES, type NoteWithContent } from '@note-taker/contracts';
+import { MAX_NOTE_VERSION, NOTE_CONTENT_MAX_BYTES, type NoteWithContent } from '@note-taker/contracts';
 import { sql } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 
@@ -475,6 +475,37 @@ describe('PUT /api/notes/:id/content (§9.2 #18, PR-10 §5)', () => {
     // it had also stored it — put a body past the cap in the database that the API then refuses to read back.
     const row = await noteRow(created.id);
     expect([row.version, row.content_bytes, row.word_count]).toEqual([1, 5, 1]);
+  });
+
+  it('answers a baseVersion the version column cannot hold from the re-read, not from SQL', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'huge-base', content: 'server text' });
+
+    // `notes.version` is an `int4`. A `baseVersion` past that ceiling is not a stale read — no note was ever at
+    // 3_000_000_000 — and it must never reach the statement, because comparing it in the `WHERE` is Postgres
+    // `22003` (value out of range), which `mapError()` has no case for: a number the caller invented would come
+    // back as `500 INTERNAL`. `noteVersionSchema` refuses it on the wire; this is the same refusal under a caller
+    // that reached the service past the schema, and it answers the way a write that matched nothing answers.
+    for (const baseVersion of [MAX_NOTE_VERSION + 1, 3_000_000_000]) {
+      const stale = await failure(
+        notes.putContent({ userId: user.id, id: created.id, content: 'enormous base', baseVersion }),
+      );
+      expect(stale, String(baseVersion)).toBeInstanceOf(VersionConflictError);
+      expect((stale as VersionConflictError).data).toEqual({ content: 'server text', version: 1 });
+    }
+
+    // A version that cannot exist cannot belong to a row either, so an id with nothing behind it is still the
+    // `404` it has always been — never the conflict that would confirm the note exists.
+    await notes.remove({ userId: user.id, id: created.id });
+    const gone = await failure(
+      notes.putContent({
+        userId: user.id,
+        id: created.id,
+        content: 'enormous base',
+        baseVersion: 3_000_000_000,
+      }),
+    );
+    expect(gone).toBeInstanceOf(NotFoundError);
   });
 
   it('lets an unreadable body fail rather than describe itself as the server state in a 409', async () => {

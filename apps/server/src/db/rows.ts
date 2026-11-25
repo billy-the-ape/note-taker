@@ -134,7 +134,7 @@ function parsePostgresArrayLiteral(text: string): string[] | undefined {
   let index = 0;
   const at = (i: number): string => body[i] ?? '';
 
-  while (index <= body.length - 1) {
+  while (index < body.length) {
     if (at(index) === '"') {
       let element = '';
       let closed = false;

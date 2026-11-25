@@ -282,12 +282,14 @@ describe('folder delete (§4 #15)', () => {
     const { a, b } = await twoUsers();
     const theirs = await folders.create({ userId: b.id, name: 'theirs' });
 
+    // Thunks, for the reason the notes suite spells out: an array of calls would start all three at once, and the
+    // rejections that arrive before their `expect` are unhandled rejections rather than passing assertions.
     for (const attempt of [
-      folders.patch({ userId: a.id, id: theirs.id, name: 'mine-now' }),
-      folders.patch({ userId: a.id, id: theirs.id, parentId: null }),
-      folders.remove({ userId: a.id, id: theirs.id, cascade: true }),
+      () => folders.patch({ userId: a.id, id: theirs.id, name: 'mine-now' }),
+      () => folders.patch({ userId: a.id, id: theirs.id, parentId: null }),
+      () => folders.remove({ userId: a.id, id: theirs.id, cascade: true }),
     ]) {
-      await expect(attempt).rejects.toBeInstanceOf(NotFoundError);
+      await expect(attempt()).rejects.toBeInstanceOf(NotFoundError);
     }
     // Their row is untouched, and the attempt did not leave a partial write behind.
     const parents = await snapshot(b.id);

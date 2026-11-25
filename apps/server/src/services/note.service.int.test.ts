@@ -291,12 +291,16 @@ describe('ownership on body ids (§5.4)', () => {
     const b = await createUser(db, { username: 'b', role: 'member' });
     const theirs = await notes.create({ userId: b.id, name: 'private', content: 'not yours' });
 
+    // Started one at a time, on purpose. Written as an array of calls, all three promises are created before the
+    // first `await`, so the two later rejections land while nothing is listening for them and Node reports an
+    // unhandled rejection — Vitest then exits 1 with every assertion in the file green. Thunks keep "assert this
+    // one failed" and "run it" in the same statement, which is what the loop actually means.
     for (const attempt of [
-      notes.read({ userId: a.id, id: theirs.id }),
-      notes.patch({ userId: a.id, id: theirs.id, name: 'mine' }),
-      notes.remove({ userId: a.id, id: theirs.id }),
+      () => notes.read({ userId: a.id, id: theirs.id }),
+      () => notes.patch({ userId: a.id, id: theirs.id, name: 'mine' }),
+      () => notes.remove({ userId: a.id, id: theirs.id }),
     ]) {
-      await expect(attempt).rejects.toBeInstanceOf(NotFoundError);
+      await expect(attempt()).rejects.toBeInstanceOf(NotFoundError);
     }
     expect((await notes.read({ userId: b.id, id: theirs.id })).content).toBe('not yours');
   });

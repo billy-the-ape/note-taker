@@ -21,7 +21,7 @@
  */
 import { newFileName, stripMd, uniquify } from '@note-taker/contracts';
 
-import { ConflictError } from '../domain/errors.js';
+import { ConflictError } from './errors.js';
 
 /**
  * The value to put in `notes.name` for a name a client sent.

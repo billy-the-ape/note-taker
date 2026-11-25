@@ -83,6 +83,37 @@ describe('POST /api/notes (§9.2 #16)', () => {
     );
   });
 
+  it('creates from a request that carried no body at all, which is the request #16 is about', async () => {
+    await withApp(
+      async (app: FastifyInstance) => {
+        const owner = await bootstrapOwner(app);
+        // `payload: {}` and no payload are two different requests. With no body there is no `Content-Type`, so
+        // Fastify runs no content-type parser and the handler is handed `undefined` — and `createNoteSchema` is an
+        // object schema, so a route that parses that directly answers the simplest request in the API with
+        // `400 VALIDATION`. Every other test in this file sends a payload, which is why the wire-level assertion
+        // belongs here: `docs/API.md` row 16 promises "no body is a valid note", and only a real request says
+        // whether the server agrees.
+        const response = await app.inject({ method: 'POST', url: ROUTES.notes, headers: jarHeaders(owner) });
+        expect(response.statusCode, response.body).toBe(201);
+
+        const note = noteWithContentSchema.parse(response.json());
+        expect(note.name).toMatch(/^new-file-\d+$/);
+        expect(note.folderId).toBeNull();
+        expect(note.version).toBe(1);
+
+        // And the 201 is backed by a row: the read decrypts the sealed empty string rather than inventing one.
+        const read = await app.inject({
+          method: 'GET',
+          url: ROUTES.note(note.id),
+          headers: jarHeaders(owner),
+        });
+        expect(read.statusCode, read.body).toBe(200);
+        expect(noteWithContentSchema.parse(read.json()).content).toBe('');
+      },
+      { db },
+    );
+  });
+
   it('stores a body verbatim and reports its UTF-8 size, then serves the same text back', async () => {
     await withApp(
       async (app: FastifyInstance) => {

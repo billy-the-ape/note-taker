@@ -61,7 +61,18 @@ export const noteRoutes: FastifyPluginAsync<NoteRoutesOptions> = async (app, { s
     ROUTES.notes,
     { preHandler: guard.requireAuth },
     async (request, reply): Promise<NoteWithContent> => {
-      const body = createNoteSchema.parse(request.body);
+      // `?? {}` is what makes "no body is a valid note" true rather than merely documented. A request with no
+      // `Content-Type` — `fetch(url, { method: 'POST' })`, which is what `apps/web/src/lib/api.ts` sends when it
+      // has no body — is parsed by no content-type parser at all, so `request.body` is `undefined`, and
+      // `createNoteSchema` is an object schema: `undefined` is a `ZodError` and the caller gets `400 VALIDATION`
+      // for the request the contract calls the simplest one in the API. Every test posted `{}`, which is a
+      // different request, so none of them could tell.
+      //
+      // The one case this cannot fix, and should not: a request that *declares* `application/json` and sends an
+      // empty body is refused by Fastify's own parser (`FST_ERR_CTP_EMPTY_JSON_BODY`) before this handler runs,
+      // and `error-handler.ts` renders that as `400 VALIDATION` too. That is a client that announced JSON and
+      // sent none; defaulting it here would be the route disagreeing with the transport about what a header means.
+      const body = createNoteSchema.parse(request.body ?? {});
       reply.code(201);
       return service.create({ userId: guard.authenticated(request).user.id, ...body });
     },

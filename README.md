@@ -62,8 +62,9 @@ docker compose --env-file .env -f docker/compose.yml up -d     # http://<host>:$
 
 Same two flags as the dev stack, same reason (`docs/DEPLOY.md` §1), and `make prod-up`/`prod-ps`/`prod-logs`
 behind them. `pnpm check:env` lints a production `.env` — the file, not your shell — against the rules
-`env.ts` enforces at boot, and CI asserts it against two fixtures
-(`scripts/fixtures/prod-missing-key.env`, `scripts/fixtures/prod-no-dsn.env`).
+`env.ts` enforces at boot, and CI asserts it against four fixtures
+(`scripts/fixtures/`: `prod-missing-key.env`, `prod-no-dsn.env` for the rules; `prod-redaction.env`,
+`prod-wrong-variable.env` for the promise that a failure report never prints the key it is reporting on).
 
 **Why the Makefile spells Docker out.** Compose resolves its project directory from the compose file's
 location, so `docker compose -f docker/compose.dev.yml …` alone would load `.env` from `docker/` instead

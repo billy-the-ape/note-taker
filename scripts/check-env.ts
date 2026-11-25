@@ -6,6 +6,9 @@
  * pnpm check:env                                        # DOTENV_PATH ?? <repo root>/.env
  * DOTENV_PATH=scripts/fixtures/prod-missing-key.env pnpm check:env
  * pnpm check:env --file scripts/fixtures/prod-no-dsn.env # the same, without the environment variable
+ * pnpm check:env --file scripts/fixtures/prod-wrong-variable.env
+ *                                                       # a fixture whose whole point is its failure output:
+ *                                                       # the run must fail, and must not print the key
  * ```
  *
  * ## It is a linter, not a boot path
@@ -37,12 +40,26 @@
  * ## What it never does
  *
  * It never contacts Docker, a database or a key server; it never reads the file `NOTE_ENCRYPTION_KEY_FILE`
- * names (that path exists inside the container); and it never echoes a value that could be key material —
- * base64 in a terminal is base64 in a ticket. Values are judged by shape and length only. That promise covers
- * the *failure* paths too, which is where it was nearly broken: a malformed line, a duplicated key and a
- * `NOTE_ENCRYPTION_KEY_PREVIOUS` map tag all print the offending text, and the offending text is routinely a
- * key someone typed into the wrong place — so those three report length instead (`previewLine`,
- * `previewValue`, `safeTag`).
+ * names (that path exists inside the container); and it never prints anything that could be key material —
+ * base64 in a terminal is base64 in a ticket. Four helpers hold that promise, every failure path goes through
+ * one of them, and that is the point: a failure path is exactly where a key someone typed into the wrong place
+ * turns up, and "report the offending text" then means "print the key".
+ *
+ * - **`previewValue(name, value)`** — length only for a documented secret, **and length only for any value that
+ *   looks like base64 or hex of 20+ characters, whichever variable it was typed into.** The variable name is
+ *   not the classifier: a key pasted into `SECURE_COOKIES` is still a key, and "must be true or false (got
+ *   "cHIx…")" was a key on a terminal and in a ticket. A leading `/` is exempt, because the §3 rule about
+ *   `NOTE_ENCRYPTION_KEY_FILE` is a rule *about a path* and printing the path is the whole diagnostic.
+ * - **`previewLine(line)`** — for the lines that never parsed into `NAME=value`. Length only unless the line is
+ *   an assignment that holds no material: a whole key left on a line of its own names no documented variable,
+ *   and quoting "the first 40 characters of the offending text" quoted the key.
+ * - **`safeName(name)`** and **`safeTag(tag)`** — a *label* is printed when naming it is the report: a
+ *   documented variable, a short map version tag. A base64 key left on a line of its own parses as an
+ *   assignment, which turns the key into "the name of a variable nothing reads", and it was printed in full
+ *   while the sentence explained that it was unread.
+ *
+ * `preview()` is the low-level excerpt; it is not allowed on a value that might be a key, and the two rules
+ * above are what makes that verifiable instead of a request for care.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -212,10 +229,54 @@ export interface ParsedDotenv {
   readonly duplicates: MalformedLine[];
 }
 
-/** Short, single-line, quote-safe excerpt — and never of a key (see this file's header). */
+/** Short, single-line, quote-safe excerpt — never call it on a value that might be a key (see `previewValue`). */
 function preview(value: string): string {
   const oneLine = value.replace(/\s+/g, ' ').trim();
   return JSON.stringify(oneLine.length > 40 ? `${oneLine.slice(0, 40)}…` : oneLine);
+}
+
+/** A run long enough to carry a key, from base64's own alphabet — anchored nowhere, because the shape this
+ * exists to catch is a key with something else glued to it (a pasted `\n`, a stray quote, a second value).
+ * Hex is a subset, so hex keys need no second rule. */
+const MATERIAL_RUN = /[A-Za-z0-9+/]{20,}/;
+
+/**
+ * Would a report about this text hand a reader a key? A token holding a 20+ character run of base64 counts,
+ * unless the token is shaped like something a human typed as a *setting* rather than pasted as a secret: `.`,
+ * `_`, `:`, `-` and a leading `/` mark a path, a URL or a name, and none of them occur in base64. That
+ * exemption is not cosmetic — §3's rule about `NOTE_ENCRYPTION_KEY_FILE` is a rule about a *path*, and
+ * `/var/lib/postgresql/data` is 24 characters of the wrong alphabet to be redacted while being diagnosed.
+ *
+ * Checked per whitespace-separated token, so `APP_NAME="<key> <key>"` is still recognised, and `20` is the
+ * floor: shorter than that, a value cannot be a note-encryption key, and `preview()`'s 40-character cut
+ * would print a *prefix* of one, which is the part that matters to an attacker and the part that mattered in
+ * the leak this function exists for.
+ */
+function looksLikeMaterial(value: string): boolean {
+  return value
+    .split(/\s+/)
+    .some(
+      (token) =>
+        MATERIAL_RUN.test(token) &&
+        !token.includes('.') &&
+        !token.includes('_') &&
+        !token.includes(':') &&
+        !token.includes('-') &&
+        !token.startsWith('/'),
+    );
+}
+
+/**
+ * A variable *name* is printed only when naming it is the report. A documented name always is; an unknown one
+ * is, if it still looks like a name a human typed — because a whole base64 key on a line of its own parses as
+ * an assignment, and `SOME_BASE64…` is then "the name of a variable nobody reads", which this script would
+ * otherwise print in full while explaining that it is unread (and again while explaining that its value is
+ * empty). Unprintable names are reported by length, like values.
+ */
+function safeName(name: string): string {
+  if (KNOWN_KEYS.includes(name)) return name;
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && name.length <= 40 && !looksLikeMaterial(name)) return name;
+  return `<a name of ${name.length} chars, not printed>`;
 }
 
 /**
@@ -226,9 +287,16 @@ function preview(value: string): string {
  */
 const SECRET_KEYS: readonly string[] = [KEY_CURRENT, KEY_PREVIOUS, 'POSTGRES_PASSWORD', DATABASE_URL];
 
-/** `preview`, except a secret contributes its length and nothing else. */
+/**
+ * `preview`, except a secret contributes its length and nothing else — and so does anything else that looks
+ * like a key, whatever variable it landed in. The name of the variable is not the classifier: a key pasted
+ * into `SECURE_COOKIES` is still a key, and "must be true or false (got \"cHIx…\")" is a key printed in a
+ * terminal, which is the promise this file's header makes and this function exists to keep.
+ */
 function previewValue(name: string, value: string): string {
-  if (SECRET_KEYS.includes(name)) return `<${value.trim().length} chars, not printed>`;
+  if (SECRET_KEYS.includes(name) || looksLikeMaterial(value)) {
+    return `<${value.trim().length} chars, not printed>`;
+  }
   return preview(value);
 }
 
@@ -239,9 +307,20 @@ function previewValue(name: string, value: string): string {
  * variable it mentions — any of `SECRET_KEYS`, at a word boundary, and the line contributes its length.
  */
 function previewLine(line: string): string {
-  const named = SECRET_KEYS.find((name) => new RegExp(`(^|[^A-Za-z0-9_])${name}(?![A-Za-z0-9_])`).test(line));
-  if (named !== undefined) return `<${line.trim().length} chars, mentions ${named}, not printed>`;
-  return preview(line);
+  const trimmed = line.trim();
+  const named = SECRET_KEYS.find((name) =>
+    new RegExp(`(^|[^A-Za-z0-9_])${name}(?![A-Za-z0-9_])`).test(trimmed),
+  );
+  if (named !== undefined) return `<${trimmed.length} chars, mentions ${named}, not printed>`;
+  // No documented secret in it is not the same as nothing secret in it: the stray key pasted on a line of its
+  // own mentions no variable at all, and a line that is not `NAME=` at all has no value to reason about, only
+  // a shape. Print content only for a shape an operator could otherwise be told about in the abstract.
+  const assignment = /^([A-Za-z_][A-Za-z0-9_.]*)\s*=([\s\S]*)$/.exec(trimmed);
+  if (assignment === null) return `[a non-assignment line, ${trimmed.length} chars, not printed]`;
+  if (looksLikeMaterial(assignment[1] as string) || looksLikeMaterial(assignment[2] as string)) {
+    return `<${trimmed.length} chars, holds what looks like key material, not printed>`;
+  }
+  return preview(trimmed);
 }
 
 /**
@@ -355,7 +434,7 @@ export function parseDotenv(text: string): ParsedDotenv {
     if (previous !== undefined) {
       duplicates.push({
         line,
-        reason: `${key} is assigned twice (line ${previous} and line ${line}): one of the two values is ignored`,
+        reason: `${safeName(key)} is assigned twice (line ${previous} and line ${line}): one of the two values is ignored`,
         found: previewValue(key, value),
       });
       return;
@@ -439,12 +518,16 @@ class Report {
     const raw = this.value(name);
     if (raw === undefined) return undefined;
     if (!/^-?\d+$/.test(raw)) {
-      this.fail(`${name} must be an integer (got ${preview(raw)})`);
+      this.fail(`${safeName(name)} must be an integer (got ${previewValue(name, raw)})`);
       return undefined;
     }
     const value = Number(raw);
     if (value < minValue || value > maxValue) {
-      this.fail(`${name} must be an integer between ${minValue} and ${maxValue} (got ${value})`);
+      this.fail(
+        // `value` is a parsed number here, so there is nothing to redact; it is the *unparsable* shape that
+        // can hold a key, and `integer()` reports that one through `previewValue` above.
+        `${safeName(name)} must be an integer between ${minValue} and ${maxValue} (got ${value})`,
+      );
       return undefined;
     }
     return value;
@@ -456,7 +539,7 @@ class Report {
     const value = raw.toLowerCase();
     if (value === 'true' || value === '1') return true;
     if (value === 'false' || value === '0') return false;
-    this.fail(`${name} must be true or false (got ${preview(raw)})`);
+    this.fail(`${safeName(name)} must be true or false (got ${previewValue(name, raw)})`);
     return undefined;
   }
 
@@ -497,7 +580,9 @@ function missingKeyProblem(): string {
     'docker run --rm node:22-slim node -e ' +
     '\'console.log(require("crypto").randomBytes(32).toString("base64"))\'. ' +
     'There is no plaintext mode: development and test generate a key and persist it to .dev/note-key, ' +
-    'production refuses to boot'
+    'production refuses to boot. One exception to read before trusting this line: an installation on the ' +
+    'mounted-key variant of docs/DEPLOY.md §3 keeps the *path* in docker/compose.yml, where this preflight ' +
+    'cannot see it, and its .env legitimately holds neither variable'
   );
 }
 
@@ -506,7 +591,7 @@ function checkNodeEnv(report: Report): void {
   const value = report.value('NODE_ENV');
   if (value === undefined || value === 'production') return;
   report.fail(
-    `NODE_ENV=${preview(value)}: the production image bakes NODE_ENV=production and docker/compose.yml ` +
+    `NODE_ENV=${previewValue('NODE_ENV', value)}: the production image bakes NODE_ENV=production and docker/compose.yml ` +
       'repeats it in the app service, so this line is inert inside the stack and wrong outside it — a ' +
       'sourced .env would boot the app in a mode where the production invariants of env.ts are not armed. ' +
       'Delete the line (the image is what sets the mode).',
@@ -529,14 +614,17 @@ function checkNoteKey(report: Report): void {
     // The linter cannot open it: the path names a file inside the container, not one the preflight can see.
     if (!path.isAbsolute(file)) {
       report.fail(
-        `${KEY_FILE} must be an absolute path inside the container (got ${preview(file)}): crypto/keys.ts ` +
+        `${KEY_FILE} must be an absolute path inside the container (got ${previewValue(KEY_FILE, file)}): crypto/keys.ts ` +
           'reads it in the app process, not the shell that runs this preflight',
       );
     }
     report.note(
       `${KEY_FILE} is set, but docker/compose.yml still requires ${KEY_CURRENT}: its required-value ` +
-        'interpolation cannot express either/or. The mounted-key variant is the documented edit to that ' +
-        'file: add the volume, keep this variable, delete the required-value line (docs/DEPLOY.md §3).',
+        'interpolation cannot express either/or. The mounted-key variant of docs/DEPLOY.md §3 is an edit to ' +
+        `that file: add the volume, add ${KEY_FILE} there, delete the required-value line. This preflight reads ` +
+        'only .env, so an installation that keeps the key path in compose.yml alone looks to it like an ' +
+        'installation with no key — mirror the path into .env (the path is not the key), or read the note ' +
+        'in docs/DEPLOY.md §3 before treating the failure below as one.',
     );
   }
 
@@ -613,7 +701,7 @@ function checkNoteKey(report: Report): void {
     if (problem !== undefined) report.fail(problem);
     if (version !== undefined && Number(tag) === version) {
       report.fail(
-        `${KEY_PREVIOUS} holds the current version ${tag}: the map is decrypt-only and holds *older* keys, ` +
+        `${KEY_PREVIOUS} holds the current version ${safeTag(tag)}: the map is decrypt-only and holds *older* keys, ` +
           `while ${KEY_VERSION} is the current one. A rotation is ${KEY_VERSION}=<old>+1 with the old key ` +
           'moved into the map, in one edit (docs/DEPLOY.md §7).',
       );
@@ -674,7 +762,9 @@ function checkDatabase(report: Report): void {
     return;
   }
   if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
-    report.fail(`${DATABASE_URL} must be a postgres:// or postgresql:// URL (got ${preview(url.protocol)})`);
+    report.fail(
+      `${DATABASE_URL} must be a postgres:// or postgresql:// URL (got ${previewValue(DATABASE_URL, url.protocol)})`,
+    );
   }
   if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
     report.note(
@@ -713,7 +803,7 @@ function checkOvershadowed(report: Report): void {
   for (const [key, pinned] of OVERSHADOWED_BY_COMPOSE) {
     if (report.value(key) === undefined) continue;
     report.note(
-      `${key} is set here, but compose.yml pins it to ${pinned}; inside the container it is inert.`,
+      `${safeName(key)} is set here, but compose.yml pins it to ${pinned}; inside the container it is inert.`,
     );
   }
 }
@@ -733,7 +823,9 @@ function checkNumbers(report: Report): void {
 
   const logLevel = report.value('LOG_LEVEL');
   if (logLevel !== undefined && !LOG_LEVELS.includes(logLevel)) {
-    report.fail(`LOG_LEVEL must be one of ${LOG_LEVELS.join(' | ')} (got ${preview(logLevel)})`);
+    report.fail(
+      `LOG_LEVEL must be one of ${LOG_LEVELS.join(' | ')} (got ${previewValue('LOG_LEVEL', logLevel)})`,
+    );
   }
 }
 
@@ -764,7 +856,7 @@ function checkBlankLines(report: Report): void {
     if (!report.isSetButEmpty(key)) continue;
     const documented = DOCUMENTED_DEFAULTS.get(key);
     report.fail(
-      `${key} is set but empty (nothing after the equals sign): fill the line or delete it` +
+      `${safeName(key)} is set but empty (nothing after the equals sign): fill the line or delete it` +
         (documented === undefined
           ? ''
           : ` — its documented default is ${documented}, and an empty value is not that default`) +
@@ -778,7 +870,7 @@ function checkKnownKeys(report: Report, parsed: ParsedDotenv): void {
   for (const key of parsed.values.keys()) {
     if (KNOWN_KEYS.includes(key)) continue;
     report.note(
-      `${key} is not a variable of docs/DEPLOY.md §4, so nothing reads it — not Compose, not env.ts, not ` +
+      `${safeName(key)} is not a variable of docs/DEPLOY.md §4, so nothing reads it — not Compose, not env.ts, not ` +
         'this preflight. Delete it rather than leave a value nobody honours (a mode is never taken from ' +
         'this file, and the dev-only Vite knob is not a deploy setting).',
     );
@@ -819,6 +911,9 @@ const USAGE = `check-env — preflight a production .env (docs/plans/mvp/MVP-18.
   pnpm check:env                                          # DOTENV_PATH ?? <repo root>/.env
   DOTENV_PATH=scripts/fixtures/prod-missing-key.env pnpm check:env
   pnpm check:env --file scripts/fixtures/prod-no-dsn.env  # the same, without the environment variable
+  pnpm check:env --file scripts/fixtures/prod-wrong-variable.env
+                                                        # a fixture whose whole point is its failure output:
+                                                        # the run must fail, and must not print the key
 
 Exit codes: 0 the file satisfies every documented production rule, 1 it does not,
 2 there was no file to judge. Warnings never change the exit code.

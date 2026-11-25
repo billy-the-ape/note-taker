@@ -63,11 +63,14 @@ RUN pnpm install --frozen-lockfile
 FROM deps AS build
 
 # The rest of the tree. `.dockerignore` is what keeps it small and, importantly, keeps the host's
-# `node_modules` and any real `.env` out of the build context entirely.
+# `node_modules`, its `dist`s and any real `.env` out of the build context entirely — which needs `**/`
+# prefixes, since Docker anchors every pattern at the context root and the host's `node_modules` are under
+# `apps/*/`, not at the root.
 COPY . .
 
 # The deletes are load-bearing, not tidiness: `tsc` does not remove output whose source has gone away, so a
-# `dist/` copied from a developer's machine could ship a file no source file produces any more.
+# `dist/` copied from a developer's machine could ship a file no source file produces any more. `.dockerignore`
+# now excludes `**/dist`, so this is the second line of defence rather than the only one.
 RUN rm -rf apps/server/dist apps/web/dist packages/contracts/dist && pnpm build
 
 # ── stage 3: the production tree, and the assertions that it is one ─────────────────────────────────
@@ -170,9 +173,12 @@ USER node
 
 EXPOSE 3000
 
-# No `curl` in the runtime layer (`node:22-slim` ships none, and installing a download tool in a runtime
-# image to ask one question is out of scope, docs/plans/mvp/MVP-18.md §5), so the probe is Node's own fetch.
-# The path is the `ROUTES.healthz` value stage 3 asserted resolves, and `127.0.0.1` is deliberate over
+# No `curl` in *this* image: the healthcheck below uses Node's own `fetch`, and no layer of ours installs a
+# download tool to ask one question (out of scope for the runtime, docs/plans/mvp/MVP-18.md §5). Whether the
+# base keeps a `curl` is the base's business and cannot be read off `docker history` — the layer *commands* of
+# `node:22-slim`'s ancestors mention curl either way — so DEPLOY.md §2 step 5 asks a container of the finished
+# image about the tools this image adds, which is the claim that can be checked. The path is the
+# `ROUTES.healthz` value stage 3 asserted resolves, and `127.0.0.1` is deliberate over
 # `localhost`: a healthcheck whose result depends on DNS resolution fails for reasons that have nothing to do
 # with the app. A 503 (the database probe failing) is a *failing* healthcheck, which is the intended meaning:
 # `healthy` means the app answers, not that a process exists.

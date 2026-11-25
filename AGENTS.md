@@ -25,7 +25,7 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 | `pnpm db:generate` / `pnpm db:migrate` | drizzle-kit (PR-04), run in `apps/server`: generate the SQL into the committed `apps/server/migrations/`, or apply it. Both need a running Postgres; neither needs a `.env`. There is **no `db:push`**, by design (plan §5): the migration history is what ships. |
 | `pnpm db:seed` | The demo tree, idempotently (PR-09 — `apps/server/src/scripts/seed-demo.ts`, run with `NODE_ENV=development tsx`): the owner, the nested folders and the notes, **sealed with the keyring of the process that runs it** rather than a test key, and readable by the app afterwards. Needs a running Postgres; refuses `NODE_ENV=production` before it builds a keyring or opens a pool. It never truncates and never reseeds — a run reports `created`/`kept` per folder and note, so a second run on edited content is a no-op — and the password it prints is stored only as its argon2 hash. `src/scripts/seed-demo.int.test.ts` proves both halves. |
 | `pnpm generate:key` | Prints a fresh 32-byte note-encryption key as base64 on stdout, for `NOTE_ENCRYPTION_KEY` (PR-06, dev/CI only — root `scripts/generate-keys.ts`, run through the server workspace's `tsx`). A production host generates its key with the `docker run --rm node:22-slim node -e '…randomBytes(32)…'` one-liner instead, which PR-18's runbook documents. |
-| `pnpm check:env` | The production `.env` preflight (PR-18 — root `scripts/check-env.ts`, `NODE_ENV=production tsx`, which reads `DOTENV_PATH ?? <repo root>/.env` **as text with its own parser**). It is a linter, not a boot path: `loadDevEnvFile()` is a no-op in `production` by design and it would judge the shell rather than the file, so the preflight could not tell an operator anything about the file they were deploying. Its rules are `env.ts`'s production invariants plus the DSN carve-out (`check-env.ts`'s header): the file may carry `DATABASE_URL` **or** the `POSTGRES_*` trio, fails only with neither, warns when both disagree. Exit 1 on any problem; nothing it reports is a secret, and key material is never printed. `docs/DEPLOY.md` §4 is the table it enforces. |
+| `pnpm check:env` | The production `.env` preflight (PR-18 — root `scripts/check-env.ts`, `NODE_ENV=production tsx`, which reads `DOTENV_PATH ?? <repo root>/.env` **as text with its own parser**). It is a linter, not a boot path: `loadDevEnvFile()` is a no-op in `production` by design and it would judge the shell rather than the file, so the preflight could not tell an operator anything about the file they were deploying. Its rules are `env.ts`'s production invariants plus the DSN carve-out (`check-env.ts`'s header): the file may carry `DATABASE_URL` **or** the `POSTGRES_*` trio, fails only with neither, warns when both disagree. Exit 1 on any problem. Nothing it reports is a secret: every value is reported by shape and length (`previewValue`, `previewLine`, `safeName`, `safeTag`, behind `looksLikeMaterial`), **whatever variable the value was typed into** — a key pasted into `SECURE_COOKIES`, or left on a line of its own (which parses as a variable *named* after the key), is still a key, and the failure output is pasted into tickets. `docs/DEPLOY.md` §4 is the table it enforces, and CI asserts all four fixtures, including that the two redaction ones still *fail* while printing neither the fixture key nor its first 20 characters. Because it reads only `.env`, an installation on §3's mounted-key variant is reported as keyless **by design**; §3 states the two ways to reconcile that, and which one you are on. |
 | `make prod-up` / `prod-down` / `prod-ps` / `prod-logs` / `prod-build` / `prod-config` | The production stack (`docker/compose.yml` + `docker/Dockerfile`, PR-18): `db` + `app`, **one** published port (`${HOST_PORT:-3000}:3000`), database unpublished, migrations run inside the app before `listen()`. `prod-config` is the parse-time preflight that fails naming `NOTE_ENCRYPTION_KEY` without contacting the daemon. `docs/DEPLOY.md` is the runbook and pins the same invocation; these targets are that command behind `make`, and unlike `db-*` they do **not** depend on `bootstrap-env`, because a production `.env` is generated (§2) and a copied `.env.example` has no key. |
 | `make db-up` / `db-down` / `db-reset` | Dev Postgres 16 in Docker (`docker/compose.dev.yml`, PR-02): start it (and wait for healthy), stop it, or recreate it with its volume. `make dev`/`build`/`test`/`coverage` are the `pnpm` equivalents behind one interface, and `make bootstrap-env` only creates `.env`. The database commands are `pnpm`-only (`pnpm db:generate`, `pnpm db:migrate`); `make` has no `db:*` target for them, and `pnpm db:seed` (PR-09) is a pnpm script for the same reason. |
 
@@ -94,8 +94,11 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   dirs, then the root `pnpm build`), prunes with `pnpm --filter @note-taker/server deploy --prod`, and the
   runtime stage copies only `node_modules`, `apps/server/{package.json,dist,migrations}` and `apps/web/dist`.
   It bakes `ENV NODE_ENV=production` (so the `env.ts` guard is always armed and nobody hand-sets a mode),
-  runs as `USER node`, `EXPOSE 3000`, and healthchecks with a **Node `fetch`, because `node:22-slim` has no
-  `curl`** — `docker/entrypoint.sh` is `exec node apps/server/dist/index.js` and nothing else: no pnpm, no
+  runs as `USER node`, `EXPOSE 3000`, and healthchecks with a **Node `fetch`** — this image installs no download
+  tool of its own, and the base's own layers are not knowable from `docker history` (whose layer *commands*
+  mention `curl` because `node:22-slim`'s ancestors installed it), so "no toolchain in the runtime layer" is
+  verified by asking a container with `command -v` and counting a hit only under `/app` (`docs/DEPLOY.md` §2
+  step 5) — `docker/entrypoint.sh` is `exec node apps/server/dist/index.js` and nothing else: no pnpm, no
   tsx, no `.ts`. Env checking and migrations therefore happen **inside** the compiled bootstrap, before the
   port is bound. The pruned install must carry the **compiled** `@note-taker/contracts`
   (`package.json` + `dist/`, reached through `exports`) and the stage asserts that with Node's own resolver.
@@ -105,8 +108,16 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   all run through `docker compose exec -T db`. Operator scripts run as
   `exec app node apps/server/dist/scripts/rotate-note-key.js`; if one ever needs pnpm, tsx, a `.ts` entry or
   a published DB port, the fix is to move it under `apps/server/src/scripts/` and rebuild, never to add dev
-  tooling to the runtime stage. `docs/DEPLOY.md` is the runbook PR-18 owns: backups (with the key), the
-  restore drill, rotation, password recovery, and the troubleshooting table.
+  tooling to the runtime stage. **`.dockerignore` patterns are anchored at the context root** (learned in
+  PR-16's review): unlike `.gitignore` they do *not* repeat at every level, so plain `node_modules` and `dist`
+  matched only the root's while a workspace's real ones live under `apps/*/`, and `COPY . .` poured them over
+  the image's own install — hence `**/node_modules`, `**/dist`, `**/*.tsbuildinfo`, with the Dockerfile's
+  `rm -rf` of the dists demoted to the second line of defence. `docs/DEPLOY.md` is the runbook PR-18 owns: backups (with the key), the
+  restore drill, rotation, password recovery, and the troubleshooting table. Its own commands are review
+  targets, not decoration: they source `.env` before using `$VARS` (`--env-file` fills Compose's interpolation,
+  never your shell), they print whole pino lines (pino writes `msg` last, so `grep -o 'keyring ready.*'` throws
+  away `keyVersion` and `keyFingerprint`, the fields the text then tells you to compare), and §3 says up front
+  what the section does to `pnpm check:env`.
 - **The schema lives in one file and the docs follow it.** `apps/server/src/db/schema.ts` is the source of truth;
   a new column ships with its generated SQL in `apps/server/migrations/` in the same PR, and
   `docs/DATA-MODEL.md` (created by PR-04) is rewritten in that same PR — it is what PR-06/07/09/10 read.

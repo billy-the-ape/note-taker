@@ -163,7 +163,8 @@ jobs:
         env:
           # The key from `scripts/fixtures/prod-no-dsn.env`, whose base64 decodes to
           # `pr18-fixture-key-not-a-secretxx!`. It is a fixture, not a secret: step 2 below is proving that
-          # *filling the line in* is what turns the preflight green.
+          # *filling the line in* is what turns the preflight green, and the two redaction fixtures reuse the
+          # same value so one prefix grep covers all of them.
           FIXTURE_KEY: cHIxOC1maXh0dXJlLWtleS1ub3QtYS1zZWNyZXR4eCE=
         run: |
           set -euo pipefail
@@ -230,6 +231,31 @@ jobs:
           grep -q 'not printed' "$report/redaction.log" || {
             echo '::error::the redacted preview is missing its length-only form'
             cat "$report/redaction.log"
+            exit 1
+          }
+
+          # 5. The two shapes the first redaction fix left behind, both found by re-reading the failure paths
+          #    after it shipped: a key typed into a variable that is **not** the key (so the rule that fires is a
+          #    boolean rule, and the name of the variable is no reason at all to print the value), and a key left
+          #    on a line of its own (which parses as an assignment *named after the key*, and was therefore
+          #    printed while the report explained that nothing reads it). One fixture, both shapes, same rule.
+          if DOTENV_PATH=scripts/fixtures/prod-wrong-variable.env pnpm check:env >"$report/wrongvar.log" 2>&1; then
+            echo '::error::a note-encryption key in SECURE_COOKIES passed check:env; it is not a boolean'
+            exit 1
+          fi
+          grep -q 'SECURE_COOKIES' "$report/wrongvar.log" || {
+            echo '::error::the wrong-variable rule was not reported, so there is nothing to check for leakage'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
+            exit 1
+          }
+          if grep -qF "${FIXTURE_KEY:0:20}" "$report/wrongvar.log"; then
+            echo '::error::check:env printed a key it was only reporting the shape of — length only, whatever variable it was typed into'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
+            exit 1
+          fi
+          grep -q 'not printed' "$report/wrongvar.log" || {
+            echo '::error::neither report in the wrong-variable fixture used the length-only form'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
             exit 1
           }
       # The same three properties the runbook's §2 preflight promises an operator, asserted where a runner

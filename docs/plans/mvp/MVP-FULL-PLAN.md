@@ -1482,12 +1482,16 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   `NODE_ENV=production` — `docker compose --env-file .env -f docker/compose.yml exec app node -e "console.log(process.env.NODE_ENV)"`
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
-  `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
+  the runtime image adds no build or download tool of its own — proven by asking a container of the image
+  (`command -v`, a hit counting only if it lives under `/app`), **not** by `docker history`, whose layer
+  *commands* mention `curl` because the base image's ancestors installed it, whether or not the finished image
+  keeps it (this sentence corrected while reviewing PR-16: the original read "`docker history` shows no dev deps
+  and no `curl`", a check that prints LEAK on a correct image); image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production — **and** on that same clean VM, with nothing on it but Docker,
   `docker compose --env-file .env -f docker/compose.yml config` exits non-zero naming the variable without creating a
   single container: that is the form §15 step 2b runs, backed by `${NOTE_ENCRYPTION_KEY:?…}` in the app service. The
   dev/CI form is asserted **in the CI `build` job**, where the repo toolchain exists and never from the runbook: `pnpm
-  check:env`, run against two fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
+  check:env`, run against four fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
   environment — defined as `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero
   listing the same missing
   variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. Two details make that
@@ -1495,7 +1499,10 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   comes from its script line, §16) and **no `DATABASE_URL` line** — the runbook's file carries the `POSTGRES_*` trio,
   which is exactly what satisfies the preflight's DSN rule even though the *boot* guard demands a composed
   `DATABASE_URL` in the process (§10). A third assertion pins the negative case: a `.env` with neither form exits
-  non-zero naming both options.
+  non-zero naming both options. Two more pin a promise about the *report itself* — added after PR-16's first review
+  found the failure paths printing the key they were reporting on: fixtures whose values are pasted into a malformed
+  line, into a boolean, and onto a line of their own must still fail and still name the rule, while neither the whole
+  value nor its first 20 characters may appear in the log (a prefix grep, because the leak was a truncated one).
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
   the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
   "$POSTGRES_USER" "${POSTGRES_DB}_restore"` — the scratch DB must exist before the pipe can succeed; `gunzip -c

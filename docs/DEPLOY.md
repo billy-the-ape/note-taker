@@ -4,7 +4,8 @@ Note Taker ships as two containers and one published port. This is the operator 
 deploy-side contract of PR-18: the commands here are the commands `docker/compose.yml` and
 `docker/Dockerfile` take, in the order they run. The Compose-level ones — the preflight, the interpolation,
 the one-port mapping, the §3 edit — are asserted by CI on every pull request (`.github/workflows/CI.yml`,
-`build` job) against this very file; `pnpm check:env`'s two fixtures are asserted in the same job. The
+`build` job) against this very file; `pnpm check:env`'s four fixtures are asserted in the same job — two for the
+rules, two for the promise that its own failure output never prints a key. The
 container-execution sections (§5–§8) are the drill to run on the host, in order, and they are PR-18's
 acceptance runbook: a step that does not behave as written here is a bug in this file, and this file is the
 thing under review.
@@ -155,8 +156,9 @@ migrations **inside the app**, before it binds the port. There is no migration c
 `db:migrate` step to forget; see §8 for what that implies for upgrades.
 
 `ps` printing `healthy` is the interesting column: that status comes from the image's `HEALTHCHECK`, which
-is a `node -e` with `fetch` — `node:22-slim` ships no `curl`, and installing a download tool into a runtime
-layer to ask one question is not worth it:
+is a `node -e` with `fetch`. It deliberately does not use `curl`: this image installs no download tool, and a
+healthcheck that shells out to a binary it does not own would depend on what whatever base image tag happens
+to keep (see step 5) — `fetch` is Node's own, so the check can only fail for a real reason:
 
 ```bash
 docker inspect --format '{{.State.Health.Status}}' "$(docker compose --env-file .env \
@@ -176,9 +178,27 @@ curl -fsS "http://localhost:${HOST_PORT:-3000}/api/healthz"                     
 docker compose --env-file .env -f docker/compose.yml exec app \
   node -e "console.log(process.env.NODE_ENV)"                                   # production
 docker compose --env-file .env -f docker/compose.yml exec app id -u              # not 0
-docker history --no-trunc "$(docker compose --env-file .env -f docker/compose.yml images -q app)" \
-  | grep -E 'curl|tsx|typescript|vitest' && echo 'LEAK' || echo 'runtime layer clean'
+docker run --rm --entrypoint sh "$(docker compose --env-file .env \
+  -f docker/compose.yml images -q app)" -c '
+  leak=""
+  for tool in curl wget tsx tsc vite vitest pnpm drizzle-kit biome eslint prettier nodemon pino-pretty; do
+    found=$(command -v "$tool" 2>/dev/null) || continue
+    case "$found" in /app/*) leak="$leak $tool=$found";; esac
+  done
+  [ -z "$leak" ] || { echo "LEAK, this image put a tool on PATH:$leak"; exit 1; }
+  echo "clean: no build tool or download tool of ours; node $(node -v) as uid $(id -u)"'
 ```
+
+That last command is the "no toolchain in the runtime layer" check, and it asks the **filesystem** rather than
+`docker history` on purpose. `docker history --no-trunc` prints the *commands* of every layer including the
+base image's, and `node:22-slim`'s ancestors build Node with `apt-get install … curl wget …` in their history
+whether or not the finished image keeps those binaries — so `docker history … | grep curl` reports `LEAK` on a
+perfectly clean image, which is not a check. Grepping only this image's own layers is not much better: our own
+`RUN` lines mention those very tool names while asserting they are absent, so the history text matches either
+way. What can be verified is the narrower claim this file actually makes — **this** image adds no build tool
+and no download tool — and the only way to verify that is to ask a container of the image, judging a hit by
+whether it lives under `/app`, the one place this image writes. A `curl` in `/usr/bin` is the base image's
+business; a `/app/apps/server/node_modules/.bin/vite` is a bug in the Dockerfile, and this prints it.
 
 `NODE_ENV` printing `production` with **no `NODE_ENV` entry in `.env`** is the whole configuration story in
 one line: the image bakes `ENV NODE_ENV=production` and `compose.yml` repeats it in the app service, so the
@@ -230,6 +250,29 @@ an explicit edit to `docker/compose.yml` — four pieces, all required:
    **External, not internal:** a declared internal volume belongs to the stack, and `docker compose down -v`
    deletes stack volumes — a reflex command whose outcome here is that every note body in `pgdata` becomes
    unrecoverable (§5). External means you created it once and Compose only refers to it.
+
+**What this section does to `pnpm check:env` — read this before the preflight next fails.** After these four
+pieces `.env` holds neither `NOTE_ENCRYPTION_KEY` nor `NOTE_ENCRYPTION_KEY_FILE`, so the preflight reports *no
+note-encryption key* on an installation that is correct. That is not a contradiction to fix in the container: the
+preflight judges `.env` **as text** and has no way to see `compose.yml`, which is where the path now lives (the
+same reason it wants `NODE_ENV` and `DATABASE_URL` *absent*, §4). Pick one of two ways to make them agree, and
+know which you picked:
+
+* **Mirror the path into `.env`** — add `NOTE_ENCRYPTION_KEY_FILE=/run/secrets/note_key` there. It is a path,
+  not a key, so this costs nothing in the file's sensitivity, the preflight passes, and the container is
+  unaffected: `app.environment:` sets the identical value, and Compose lets `environment:` override
+  `env_file:`. Choose this if the preflight runs in CI, as this repository's own does.
+* **Leave `.env` holding neither** — the more locked-down reading of this section. The preflight is then simply
+  not a check that can be run against this installation: its one line is expected, and `env.ts` in the container
+  stays the authority (§4). What you may *not* do is re-add a `NOTE_ENCRYPTION_KEY` to `.env`, or to
+  `compose.yml`, to silence the preflight: piece 3 removed it because Compose would then keep demanding it at
+  `config` time, and the *reason* it must stay out of `.env` is precedence — `readNoteEncryptionKey()` in
+  `env.ts` prefers the inline variable whenever one is configured, so an old key line left in `.env` would be
+  used and the mounted file silently ignored. That is the one mistake in this section that writes a database
+  with the wrong key.
+
+Either way, the failure mode to remember is asymmetric: a preflight that cannot see the path is a nuisance, and
+a key that wins precedence by accident is data loss.
 
 Then create the volume and put the key in it, without the key ever touching the host filesystem:
 
@@ -498,13 +541,16 @@ NOTE_ENCRYPTION_KEY_VERSION=2
 
 ```bash
 docker compose --env-file .env -f docker/compose.yml up -d
-docker compose --env-file .env -f docker/compose.yml logs --since 2m app | grep -o 'keyring ready.*'
+docker compose --env-file .env -f docker/compose.yml logs --since 2m app | grep 'keyring ready'
 ```
 
 `crypto/keys.ts` logs `note encryption keyring ready` with `keyVersion`, `keyFingerprint` and
-`previousVersions` — the fingerprint being the first 8 hex of the key's sha256, and never key material. That
-line is how you confirm the container is holding the key you think it is, and it is the line to compare
-against after a restore, a rotation, or a redeploy you are not sure took.
+`previousVersions` — the fingerprint being the first 8 hex of the key's sha256, and never key material. Note
+the `grep` prints **the whole log line**: the app logs JSON, and pino writes `msg` last, so the three fields
+above come *before* the words `keyring ready` in the line. `grep -o 'keyring ready.*'` therefore prints the
+message and throws the fields away, which is precisely the half you came here to read. That line is how you
+confirm the container is holding the key you think it is, and it is the line to compare against after a
+restore, a rotation, or a redeploy you are not sure took.
 
 **4. Rotate, dry-run first.** The script ships in the image (it is compiled into
 `apps/server/dist/scripts/` by `pnpm build`); no `tsx`, no `pnpm`, no toolchain in the container:

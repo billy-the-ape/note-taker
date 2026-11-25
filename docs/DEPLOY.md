@@ -194,8 +194,9 @@ docker compose --env-file .env -f docker/compose.yml exec app \
 
 ## 3. The mounted key file variant
 
-By default the key lives in `.env`. The alternative is `NOTE_ENCRYPTION_KEY_FILE`, which `crypto/keys.ts`
-reads at boot, so the key never appears in a shell, in `docker inspect`, or in a file someone might commit.
+By default the key lives in `.env`. The alternative is `NOTE_ENCRYPTION_KEY_FILE`, which the keyring reads at
+boot through `readNoteEncryptionKey()` in `apps/server/src/env.ts`, so the key never appears in a shell, in
+`docker inspect`, or in a file someone might commit.
 Compose interpolation cannot express "either this variable or that one", so this variant is an explicit edit
 to `docker/compose.yml` — four pieces, all required:
 
@@ -212,7 +213,23 @@ Then create the volume and put the key in it, without the key ever touching the 
 
 ```bash
 docker volume create note-taker_notes-keys
-printf '%s\n' "$NOTE_ENCRYPTION_KEY" | docker run --rm -i -v note-taker_notes-keys:/secrets node:22-slim node -e '
+
+# The uid:gid the app process runs as, read out of the app image rather than guessed — our Dockerfile sets
+# `USER node` by *name*, and recent node:22-slim tags resolve that to 65532 where older ones said 1000. If
+# the image does not exist yet, `docker compose --env-file .env -f docker/compose.yml build` first; §2
+# builds it as part of `up -d`.
+read -r app_uid app_gid <<< "$(docker run --rm --entrypoint sh note-taker-app:latest -c 'echo "$(id -u) $(id -g)"')"
+
+printf '%s\n' "$NOTE_ENCRYPTION_KEY" | docker run --rm -i \
+  -v note-taker_notes-keys:/secrets -e APP_UID="$app_uid" -e APP_GID="$app_gid" \
+  node:22-slim node -e '
+const fs = require("fs");
+const uid = Number(process.env.APP_UID);
+const gid = Number(process.env.APP_GID);
+if (!Number.isInteger(uid) || !Number.isInteger(gid)) {
+  console.error("APP_UID/APP_GID must be the numeric uid and gid the app runs as; nothing was written");
+  process.exit(1);
+}
 const chunks = [];
 process.stdin.on("data", (c) => chunks.push(c)).on("end", () => {
   const key = Buffer.concat(chunks).toString("utf8").trim();
@@ -220,18 +237,41 @@ process.stdin.on("data", (c) => chunks.push(c)).on("end", () => {
     console.error("the value on stdin is not base64 of 32 bytes; nothing was written");
     process.exit(1);
   }
-  require("fs").writeFileSync("/secrets/note_key", key + "\n", { mode: 0o600 });
-  console.log("wrote /secrets/note_key");
+  fs.writeFileSync("/secrets/note_key", key + "\n", { mode: 0o600 });
+  // The app opens this file as its own user, and this container is root: without the chown the file is
+  // root-owned 0600 and the app can never read it.
+  fs.chownSync("/secrets/note_key", uid, gid);
+  console.log("wrote /secrets/note_key — mode 0600, owned by " + uid + ":" + gid);
 });'
+
 docker compose --env-file .env -f docker/compose.yml up -d
+# The acceptance check for this section, and it prints nothing: opening the file is the whole question.
+docker compose --env-file .env -f docker/compose.yml exec app \
+  sh -c 'head -c 0 "$NOTE_ENCRYPTION_KEY_FILE" && echo "the app can open its key file"'
 ```
 
-Three details in that block are load-bearing. The volume name is the **full** `note-taker_notes-keys`,
-because `compose.yml` declares the volume with that explicit `name:` so the one-off writer above and the
-`app` service's mount are the same volume by construction rather than by both sides guessing Compose's
-project-prefix rules. The key arrives on **stdin**: `-e KEY=…` and an inline `node -e '<base64>'` both put
-the key in `argv`, which `ps`, a shell history and `/proc` all read. And the write is `mode: 0o600`, because
-a key file that any other user of the host can read is a key file that any other user of the host has.
+Four details in that block are load-bearing.
+
+* **The volume name is the full `note-taker_notes-keys`**, because the step-4 edit declares the volume with
+  that explicit `name:` so the one-off writer above and the `app` service's mount are the same volume by
+  construction rather than by both sides guessing Compose's project-prefix rules. The shipped file declares
+  only `pgdata`: this volume exists only if you made that edit and ran the command above.
+* **The key arrives on stdin.** `-e KEY=…` and an inline `node -e '<base64>'` both put the key in `argv`,
+  which `ps`, a shell history and `/proc` all read. The uid and gid travel as environment variables because
+  they are not secrets, and a numeric uid needs no `/etc/passwd` entry to be chowned to.
+* **The writer runs as root and then hands the file over.** `node:22-slim` sets no `USER`, so that container
+  is root, while `USER node` is a fact about *our* image — and it is that uid which must own the file. So the
+  writer chowns to the pair read out of the app image, and what lands is `65532:65532 0600` (or
+  `1000:1000` on an older base): readable by exactly the process that needs it.
+* **`--user node` on the writer is not the same fix.** A fresh named volume's root directory is root-owned
+  `0755`, so a non-root writer cannot create the file in it, and the `node` user of a base image is not
+  guaranteed to be the `node` user baked into the app image. Ownership wrong in the other direction —
+  root-owned `0600` — is the loud failure: the app answers
+  `NOTE_ENCRYPTION_KEY_FILE (/run/secrets/note_key) could not be read: EACCES`, the boot guard exits non-zero
+  before the port is bound, and the container restarts forever without ever reporting `healthy` (§9).
+
+The write is `mode: 0600` for the reason it is written at all: a key file another user of the host can read
+is a key file that user has — `0644` would be the sloppy way to make the same file world-readable.
 
 To move an *existing* installation onto a mounted key, `set -a; . ./.env; set +a` first (§1) so
 `$NOTE_ENCRYPTION_KEY` is the key the database was already written with, and pipe that value in: the command
@@ -409,7 +449,7 @@ docker run --rm node:22-slim node -e 'console.log(require("crypto").randomBytes(
 ```
 
 The old base64 is copied out of `.env` **in your editor**, from the file you are editing: it is the one value
-in this procedure that must not travel through a terminal, a shell history or a ticket, and the four lines
+in this procedure that must not travel through a terminal, a shell history or a ticket, and the three lines
 below are written by moving text inside one file rather than by pasting a secret into a command line.
 
 Then write the three lines:
@@ -564,6 +604,7 @@ existed a moment ago.
 | `error while interpolating services.app.environment.NOTE_ENCRYPTION_KEY: required variable … is missing a value` | Working as designed: the stack refuses to start without a key rather than booting with an empty one. §2 step 1–2. Nothing was created — that failure happens before Docker is asked for anything. |
 | `env file /…/note-taker/.env not found` | You ran Compose from `docker/`, or without `--env-file .env`. §1. Production targets deliberately do not create `.env` for you: a copied `.env.example` has no key (§2). |
 | `no note-encryption key: set NOTE_ENCRYPTION_KEY …` in `app` logs | The key reached the container empty (a `KEY=` line with nothing after the `=` is an empty value, not the default). `pnpm check:env` names that shape; production never generates a key, and never falls back to plaintext. |
+| `NOTE_ENCRYPTION_KEY_FILE (/run/secrets/note_key) could not be read: EACCES`, and `app` restarts forever without reaching `healthy` | The key file exists but its owner is not the user the app runs as — the §3 writer ran as root and did not chown, so a `0600` file is readable only by a user that is not this one. Re-run the §3 writer with the `app_uid`/`app_gid` it reads from the app image, and check with `exec app sh -c 'head -c 0 "$NOTE_ENCRYPTION_KEY_FILE"'`, which opens the file and prints nothing. |
 | `DATABASE_URL is required in production` | `DATABASE_URL` reached the process unset — the `environment:` block in `compose.yml` composes it from the trio, so check the trio is complete in `.env` (§4), and that you did not set `DATABASE_URL=` (empty) in the file. |
 | `POSTGRES_PASSWORD must match [A-Za-z0-9]+` | The password has a reserved URL character and would have built a DSN pointing elsewhere. `openssl rand -hex 32`, and note that changing the *role's* password in the database is a separate statement (`ALTER ROLE`) the runbook does not do for you. |
 | `app` never becomes `healthy` | The healthcheck probes `http://127.0.0.1:3000/api/healthz` and a `503` counts as failing, so an app that cannot reach `db` is *unhealthy*, not healthy-with-a-problem. `logs app` first, then `ps` to see whether `db` is `healthy`; a fresh volume needs `initdb`, and `depends_on: service_healthy` waits for it. |

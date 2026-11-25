@@ -454,7 +454,13 @@ function keyProblem(label: string, value: string): string | undefined {
   return undefined;
 }
 
-/** The absence sentence of `env.ts`'s `missingNoteEncryptionKeyProblem()`, word for word. */
+/**
+ * The absence sentence of `env.ts`'s `missingNoteEncryptionKeyProblem()`, **adapted** rather than copied: the
+ * boot guard tells a process to generate a key with `node -e "…"`, which presupposes a repository checkout to
+ * run it in, and this linter runs on exactly the host that does not have one — so the same failure is told in
+ * the one form that host can act on (`docker run --rm node:22-slim …`). The rule is shared and deliberately so;
+ * the wording is not, and neither message quotes the other.
+ */
 function missingKeyProblem(): string {
   return (
     `no note-encryption key: set ${KEY_CURRENT} to base64 for 32 bytes or ${KEY_FILE} to a readable ` +

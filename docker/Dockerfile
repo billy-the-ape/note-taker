@@ -16,8 +16,9 @@
 #     `pnpm check:env` fails a file that does.
 #   * **The runtime dependency tree is pruned, and the pruning is asserted rather than trusted.** `prune`
 #     hands pnpm one production project, and then the stage proves it: Node's own resolver imports
-#     `@note-taker/contracts` from inside the pruned tree, no `.ts` file exists anywhere in what the runtime
-#     copies, none of the build toolchain is there, and the native argon2 binding the auth routes need is.
+#     `@note-taker/contracts` from inside the pruned tree, no `.ts` **source** file exists in what the runtime
+#     copies (the `*.d.ts` declarations `tsc` emitted beside the JavaScript are the only `.ts`-shaped thing
+#     that belongs there), none of the build toolchain is there, and the native argon2 binding the auth routes need is.
 #     A Dockerfile that only *hopes* `--prod` worked is how an image ends up needing `tsx` at 3 a.m.
 #   * **Only `node` runs.** `ENTRYPOINT` is `docker/entrypoint.sh`, whose whole job is
 #     `exec node apps/server/dist/index.js`: no pnpm, no tsx, no TypeScript, and no shell pipeline worth the
@@ -45,8 +46,9 @@ RUN corepack enable
 
 WORKDIR /app
 
-# The manifests and lockfile Compose and pnpm need in order to resolve the workspace, and nothing else: the
-# dependency install stays its own layer, so editing a `.ts` file never re-downloads the world.
+# The manifests and lockfile pnpm needs in order to resolve the workspace, and nothing else: Compose plays no
+# part in this `COPY`, the dependency install stays its own layer, and editing a `.ts` file never re-downloads
+# the world.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/server/package.json ./apps/server/
 COPY apps/web/package.json ./apps/web/
@@ -87,7 +89,12 @@ RUN pnpm deploy --filter=@note-taker/server --prod /opt/deploy
 #   1. Node's own resolver, run from inside the pruned tree — the same import the container will do. This is
 #      AGENTS.md's rule ("contracts resolves from its `dist`, never from `src`") asserted at build time
 #      rather than discovered by a container that cannot start.
-#   2. No `.ts` anywhere in what the runtime copies, i.e. no source leaked into the layer that serves notes.
+#   2. No `.ts` **source** file in what the runtime copies, i.e. no source leaked into the layer that serves
+#      notes. `*.d.ts` is excluded because it is output rather than source: `packages/contracts` builds with
+#      `declaration: true` and its `exports.types` points at `./dist/index.d.ts`, so a clean tree legitimately
+#      contains declaration files and an unqualified `-name '*.ts'` would fail it. The `if` on that line is
+#      load-bearing too: under `set -eu` a command whose status is inverted with `!` is exempt from errexit, so
+#      `! { find … | grep -q .; }` would be a no-op that a green build cannot tell apart from a clean tree.
 #   3. None of the build toolchain is in the tree: pruning is asserted, not assumed. The deployed manifest
 #      is also checked for the one thing `--config-dependencies` cannot guarantee on its own — a
 #      devDependency that reappears as a dependency.
@@ -115,7 +122,9 @@ RUN set -eu; \
   for dev in typescript tsx vitest vite drizzle-kit @vitest @biomejs; do \
     if [ -e "/opt/deploy/node_modules/$dev" ]; then echo "$dev is in the production tree"; exit 1; fi; \
   done; \
-  ! { find /app/apps/server/dist "$contracts" -type f -name "*.ts" | grep -q .; }; \
+  if find /app/apps/server/dist "$contracts" -type f -name '*.ts' ! -name '*.d.ts' | grep -q .; then \
+    echo 'a source .ts file is in the runtime tree'; exit 1; \
+  fi; \
   node --input-type=module -e 'const a = await import("@node-rs/argon2"); if (typeof a.hash !== "function") process.exit(1)'
 
 # ── stage 4: the runtime ────────────────────────────────────────────────────────────────────────────

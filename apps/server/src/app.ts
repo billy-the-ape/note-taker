@@ -177,8 +177,9 @@ async function registerAuth(
 }
 
 /**
- * The domain half of the API (docs/plans/mvp/MVP-09.md): `tree.routes.ts` (1) + `folders.routes.ts` (3) +
- * `notes.routes.ts` (4) + `settings.routes.ts` (2).
+ * The domain half of the API (docs/plans/mvp/MVP-09.md, plus `PUT /api/notes/:id/content` from
+ * docs/plans/mvp/MVP-10.md): `tree.routes.ts` (1) + `folders.routes.ts` (3) + `notes.routes.ts` (5) +
+ * `settings.routes.ts` (2).
  *
  * One service object per process, each built over the same injected pool, which is what makes the folder
  * transaction and the note's envelope share a connection with the rest of the request. Two things are

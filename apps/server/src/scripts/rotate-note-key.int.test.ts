@@ -5,7 +5,11 @@
  *
  * * The script runs as a **tsx subprocess**, never as `dist/scripts/rotate-note-key.js`: the `integration` CI
  *   job runs `pnpm build:packages` only, so the compiled form does not exist there (the `.js` is asserted
- *   where a real build happens — the `build` job and PR-18's image).
+ *   where a real build happens — the `build` job and PR-18's image). That rule, the two-key env and the
+ *   blocked-walk probe this suite polls now live in `src/test/helpers/rotation.ts`, because
+ *   `routes/notes.content-race.int.test.ts` re-tests the same guarantee one layer up, through a real
+ *   `PUT /api/notes/:id/content` — and a race that stopped running the script as a subprocess would still pass
+ *   here while going red in CI.
  * * The row counts per `key_version` are asserted before and after every run, because "the rewrite happened"
  *   and "nothing was left on the old tag" are different claims.
  * * The concurrency test drives the **repository's own conditional update** — the statement PR-10's route will
@@ -19,26 +23,31 @@
  *
  * The env fixtures are what an operator would set (§7's sequence, with the two operator steps — editing
  * `.env` and restarting the app — already done for us): the old key in `_PREVIOUS`, the new key current, the
- * version bumped. `DOTENV_PATH` points at a file that does not exist, which `loadDevEnvFile()` documents as a
- * no-op, so a developer's local `.env` cannot leak into a subprocess.
+ * version bumped. They are imported here from the shared helper, and `DOTENV_PATH` points at a file that does not
+ * exist, which `loadDevEnvFile()` documents as a no-op, so a developer's local `.env` cannot leak into a
+ * subprocess.
  */
-import { spawn } from 'node:child_process';
-import path from 'node:path';
-import process from 'node:process';
-import { fileURLToPath } from 'node:url';
-
 import { sql } from 'drizzle-orm';
 import { pino } from 'pino';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { openNoteContent, sealNoteContent } from '../crypto/envelope.js';
-import { buildKeyring, type Keyring } from '../crypto/keys.js';
+import type { Keyring } from '../crypto/keys.js';
 import { createDb, type Db } from '../db/client.js';
 import { newId } from '../db/ids.js';
 import { noteById, writeNoteContent } from '../db/repositories/notes.repo.js';
 import { type Note, notes } from '../db/schema.js';
-import { databaseUrl } from '../env.js';
 import { createOwner } from '../test/fixtures.js';
 import { resetDb, testDb } from '../test/helpers/db.js';
+import {
+  envAfter,
+  envBefore,
+  keyringAfter,
+  keyringBefore,
+  type RotationRun,
+  rotationLogLines,
+  runRotate,
+  waitForBlockedRotation,
+} from '../test/helpers/rotation.js';
 import {
   emptySummary,
   parseRotateArgs,
@@ -48,82 +57,14 @@ import {
   rowsPerKeyVersion,
 } from './rotate-note-key.js';
 
-/** Relative to `apps/server`, which is where `pnpm exec tsx` is asked to look for its local binary. */
-const SERVER_ROOT = fileURLToPath(new URL('../../', import.meta.url));
-const SCRIPT = path.join('src', 'scripts', 'rotate-note-key.ts');
-
+/** `resealAndWrite` wants a logger to report a skipped row to; nothing in this file reads it. */
 const logger = pino({ level: 'silent' });
-
-function keyBase64(seed: number): string {
-  return Buffer.from(Uint8Array.from({ length: 32 }, (_, index) => (index + seed) % 251)).toString('base64');
-}
-
-const KEY_1_B64 = keyBase64(11);
-const KEY_2_B64 = keyBase64(212);
-
-/** The env of the app *before* the rotation: one key, version 1 (the default). */
-const envBefore: Record<string, string> = {
-  NODE_ENV: 'test',
-  DATABASE_URL: databaseUrl(),
-  NOTE_ENCRYPTION_KEY: KEY_1_B64,
-  // `info`, because half of these assertions read the operator's own log lines — and pino drops them below
-  // that level. `error` here would make the suite assert on an empty stdout.
-  LOG_LEVEL: 'info',
-  DOTENV_PATH: path.join(SERVER_ROOT, 'no-such-env-file-for-tests'),
-};
-
-/** …and after: the new key is current, the old one is decrypt-only, and the version moved by hand. */
-const envAfter: Record<string, string> = {
-  ...envBefore,
-  NOTE_ENCRYPTION_KEY: KEY_2_B64,
-  NOTE_ENCRYPTION_KEY_VERSION: '2',
-  NOTE_ENCRYPTION_KEY_PREVIOUS: JSON.stringify({ 1: KEY_1_B64 }),
-};
 
 /** …and after the operator emptied `_PREVIOUS` too early, which is the lossy case §4 warns about. */
 const envAfterButForgetful: Record<string, string> = {
   ...envAfter,
   NOTE_ENCRYPTION_KEY_PREVIOUS: '',
 };
-
-const keyring1 = buildKeyring({ source: envBefore, logger });
-const keyring2 = buildKeyring({ source: envAfter, logger });
-
-interface RunResult {
-  readonly code: number | null;
-  readonly stdout: string;
-  readonly stderr: string;
-}
-
-/** The operator's command: `pnpm exec tsx src/scripts/rotate-note-key.ts [flags]`. */
-function runRotate(source: Record<string, string>, args: readonly string[] = []): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('pnpm', ['exec', 'tsx', SCRIPT, ...args], {
-      cwd: SERVER_ROOT,
-      env: { ...process.env, ...source },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
-  });
-}
-
-/** The JSON lines pino wrote, decoded. Anything unparsable is a bug this suite would rather see than hide. */
-function logLines(stdout: string): Record<string, unknown>[] {
-  return stdout
-    .split('\n')
-    .filter((line) => line.startsWith('{'))
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -159,23 +100,6 @@ function summarise(counts: Map<number, number>): Record<number, number> {
   return Object.fromEntries(counts);
 }
 
-/**
- * How many sessions are right now blocked on a row lock inside a `… for update` walk of `notes`. Polling this
- * instead of sleeping a fixed time is what makes the short-batch test deterministic: the condition it needs is
- * precisely "the script is queued behind the locker", and nothing else.
- */
-async function blockedWalkers(db: Db): Promise<number> {
-  const rows = (await db.execute(
-    sql`select count(*)::int as waiting
-          from pg_stat_activity
-         where state = 'active' and wait_event_type = 'Lock'
-           and query ilike '%key_version%'
-           and query ilike '%from notes%'
-           and query ilike '%for update%'`,
-  )) as unknown as { waiting: number }[];
-  return rows[0]?.waiting ?? 0;
-}
-
 describe('rotate-note-key', () => {
   beforeEach(async () => {
     await resetDb();
@@ -195,7 +119,8 @@ describe('rotate-note-key', () => {
 
   it('--verify reports what is left and exits 1 until nothing is', async () => {
     const owner = await createOwner(testDb());
-    for (const name of ['a', 'b', 'c']) await seedNote(testDb(), owner.id, name, `body ${name}`, keyring1);
+    for (const name of ['a', 'b', 'c'])
+      await seedNote(testDb(), owner.id, name, `body ${name}`, keyringBefore);
 
     const before = await runRotate(envAfter, ['--verify']);
     expect(before.code).toBe(1);
@@ -217,7 +142,7 @@ describe('rotate-note-key', () => {
     const texts = ['first body', '日本語 body', '', 'a'.repeat(20_000)];
     const seeded: Note[] = [];
     for (const [index, text] of texts.entries()) {
-      seeded.push(await seedNote(testDb(), owner.id, `note-${index}`, text, keyring1));
+      seeded.push(await seedNote(testDb(), owner.id, `note-${index}`, text, keyringBefore));
     }
     const versions = new Map(seeded.map((note) => [note.id, note.version]));
     const contentUpdated = new Map(seeded.map((note) => [note.id, note.contentUpdatedAt.getTime()]));
@@ -235,7 +160,7 @@ describe('rotate-note-key', () => {
       expect(row, `note ${note.name} disappeared`).toBeDefined();
       if (!row) continue;
       // The plaintext survived, the tag moved, and the statistics are still about the plaintext.
-      expect(openNoteContent(row, keyring2)).toBe(text);
+      expect(openNoteContent(row, keyringAfter)).toBe(text);
       expect(row.keyVersion).toBe(2);
       expect(row.contentBytes).toBe(Buffer.byteLength(text, 'utf8'));
       // Rotation is not a content edit: `version` is untouched (an open tab must not 409), and
@@ -247,7 +172,9 @@ describe('rotate-note-key', () => {
     // A second run is the interrupted-run case: nothing matches, nothing is written.
     const second = await runRotate(envAfter);
     expect(second.code).toBe(0);
-    const finished = logLines(second.stdout).find((line) => line.msg === 'note-key rotation finished');
+    const finished = rotationLogLines(second.stdout).find(
+      (line) => line.msg === 'note-key rotation finished',
+    );
     expect(finished).toBeDefined();
     expect(finished?.resealed).toBe(0);
     expect(summarise(await rowsPerKeyVersion(testDb()))).toEqual({ 2: texts.length });
@@ -255,7 +182,7 @@ describe('rotate-note-key', () => {
 
   it('--dry-run reports what it would rewrite and changes no bytes', async () => {
     const owner = await createOwner(testDb());
-    const note = await seedNote(testDb(), owner.id, 'dry', 'do not touch me', keyring1);
+    const note = await seedNote(testDb(), owner.id, 'dry', 'do not touch me', keyringBefore);
     const before = (await stored(owner.id, note.id))!;
 
     const run = await runRotate(envAfter, ['--dry-run']);
@@ -276,18 +203,24 @@ describe('rotate-note-key', () => {
     // row still tagged 1 is unreadable to this process — which is the point of the caveat, and the reason the
     // rotation must report and continue rather than abort: one bad row cannot be allowed to stop a live
     // database mid-rewrite. The rows already on version 2 are not selected at all.
-    const doomedOne = await seedNote(testDb(), owner.id, 'doomed-1', 'written under version 1', keyring1);
-    const doomedTwo = await seedNote(testDb(), owner.id, 'doomed-2', 'also version 1', keyring1);
-    const current = await seedNote(testDb(), owner.id, 'current', 'written under version 2', keyring2);
+    const doomedOne = await seedNote(
+      testDb(),
+      owner.id,
+      'doomed-1',
+      'written under version 1',
+      keyringBefore,
+    );
+    const doomedTwo = await seedNote(testDb(), owner.id, 'doomed-2', 'also version 1', keyringBefore);
+    const current = await seedNote(testDb(), owner.id, 'current', 'written under version 2', keyringAfter);
 
     const run = await runRotate(envAfterButForgetful);
     expect(run.code).toBe(1);
 
     expect(summarise(await rowsPerKeyVersion(testDb()))).toEqual({ 1: 2, 2: 1 });
     const untouched = await stored(owner.id, current.id);
-    expect(openNoteContent(untouched!, keyring2)).toBe('written under version 2');
+    expect(openNoteContent(untouched!, keyringAfter)).toBe('written under version 2');
 
-    const finished = logLines(run.stdout).find((line) => line.msg === 'note-key rotation finished');
+    const finished = rotationLogLines(run.stdout).find((line) => line.msg === 'note-key rotation finished');
     expect(finished?.failed).toEqual([doomedOne.id, doomedTwo.id].sort());
     expect(finished?.resealed).toBe(0);
     expect(run.stdout).toContain('could not re-seal this note');
@@ -295,12 +228,12 @@ describe('rotate-note-key', () => {
     // The rows are not corrupted, only unreadable to *this* process: the same env with `_PREVIOUS` back reads
     // them fine, which is what makes the operator's mistake recoverable up until the point the old key is gone.
     const stillReadable = await stored(owner.id, doomedOne.id);
-    expect(openNoteContent(stillReadable!, keyring1)).toBe('written under version 1');
+    expect(openNoteContent(stillReadable!, keyringBefore)).toBe('written under version 1');
   }, 60_000);
 
   it('reports a database ahead of its own configuration instead of rewriting it', async () => {
     const owner = await createOwner(testDb());
-    await seedNote(testDb(), owner.id, 'future', 'written under version 2', keyring2);
+    await seedNote(testDb(), owner.id, 'future', 'written under version 2', keyringAfter);
 
     // Pointing the *old* env at a rotated database is the failure this reports rather than accepting: with
     // `key_version < current` it would silently match nothing and claim success.
@@ -315,7 +248,7 @@ describe('rotate-note-key', () => {
     // wakes first: `stale` is the batch row the script would have buffered, and the autosave lands after it
     // was read. A script that re-wrote `stale` here would destroy the autosave; this one re-reads and skips.
     const owner = await createOwner(testDb());
-    const note = await seedNote(testDb(), owner.id, 'buffered', 'the stale body', keyring1);
+    const note = await seedNote(testDb(), owner.id, 'buffered', 'the stale body', keyringBefore);
     const stale: RotatableRow = {
       id: note.id,
       version: note.version,
@@ -328,27 +261,27 @@ describe('rotate-note-key', () => {
       userId: owner.id,
       noteId: note.id,
       baseVersion: note.version,
-      content: sealNoteContent('the autosave body', note.id, keyring2),
+      content: sealNoteContent('the autosave body', note.id, keyringAfter),
     });
     expect(autosaved).toBeDefined();
 
     const summary: RotateSummary = emptySummary();
-    const wrote = await resealAndWrite(testDb(), stale, keyring2, summary, logger);
+    const wrote = await resealAndWrite(testDb(), stale, keyringAfter, summary, logger);
 
     expect(wrote).toBe(false);
     expect(summary).toEqual({ resealed: 0, reread: 0, skipped: 1, failed: [] });
     const row = await stored(owner.id, note.id);
-    expect(openNoteContent(row!, keyring2)).toBe('the autosave body');
+    expect(openNoteContent(row!, keyringAfter)).toBe('the autosave body');
     expect(row!.version).toBe(note.version + 1);
     expect(row!.keyVersion).toBe(2);
   }, 60_000);
 
   it('loses nothing when an autosave lands on a row the rotation is walking', async () => {
     const owner = await createOwner(testDb());
-    const target = await seedNote(testDb(), owner.id, 'autosave-target', 'written before', keyring1);
+    const target = await seedNote(testDb(), owner.id, 'autosave-target', 'written before', keyringBefore);
     // More than one batch, so the script is genuinely mid-walk rather than done before anyone could race.
     for (const index of [1, 2, 3, 4]) {
-      await seedNote(testDb(), owner.id, `filler-${index}`, `filler ${index}`, keyring1);
+      await seedNote(testDb(), owner.id, `filler-${index}`, `filler ${index}`, keyringBefore);
     }
 
     const locker = createDb({ max: 1 });
@@ -358,7 +291,7 @@ describe('rotate-note-key', () => {
       release = resolve;
     });
 
-    let running: Promise<RunResult> | undefined;
+    let running: Promise<RotationRun> | undefined;
     try {
       // One transaction holds a row lock on the target so the script's `select … for update` has to wait for
       // it. That queue is the live-app condition §7 describes: autosave is writing while the rewrite runs.
@@ -376,7 +309,7 @@ describe('rotate-note-key', () => {
         userId: owner.id,
         noteId: target.id,
         baseVersion: target.version,
-        content: sealNoteContent('autosaved during the rotation', target.id, keyring2),
+        content: sealNoteContent('autosaved during the rotation', target.id, keyringAfter),
       });
 
       release();
@@ -391,7 +324,7 @@ describe('rotate-note-key', () => {
     const row = await stored(owner.id, target.id);
     // The writer wins — the script's stale buffer never lands — and it lands at the current key version,
     // having incremented `notes.version` exactly once.
-    expect(openNoteContent(row!, keyring2)).toBe('autosaved during the rotation');
+    expect(openNoteContent(row!, keyringAfter)).toBe('autosaved during the rotation');
     expect(row!.keyVersion).toBe(2);
     expect(row!.version).toBe(target.version + 1);
 
@@ -403,7 +336,7 @@ describe('rotate-note-key', () => {
 
   it('does not mistake a short batch for the end of the table', async () => {
     const owner = await createOwner(testDb());
-    const first = await seedNote(testDb(), owner.id, 'row-1', 'body 1', keyring1);
+    const first = await seedNote(testDb(), owner.id, 'row-1', 'body 1', keyringBefore);
 
     const locker = createDb({ max: 1 });
 
@@ -423,7 +356,7 @@ describe('rotate-note-key', () => {
           id: late,
           userId: owner.id,
           name: 'row-2',
-          ...sealNoteContent('body 2', late, keyring1),
+          ...sealNoteContent('body 2', late, keyringBefore),
           contentUpdatedAt: new Date(),
           updatedAt: new Date(),
         });
@@ -434,13 +367,7 @@ describe('rotate-note-key', () => {
       // Watch for the parked statement instead of sleeping a guess: `pg_stat_activity` shows the script waiting
       // on the row lock. If nobody was ever blocked the run proved nothing about the termination rule, so the
       // observation is asserted rather than assumed — a test that can miss its own race is how this bug shipped.
-      const watching = (async () => {
-        for (let tick = 0; tick < 80; tick += 1) {
-          if ((await blockedWalkers(testDb())) > 0) return true;
-          await sleep(100);
-        }
-        return false;
-      })();
+      const watching = waitForBlockedRotation(testDb());
 
       const [run, blocked] = await Promise.all([running, watching, inserting]);
       expect(
@@ -449,7 +376,7 @@ describe('rotate-note-key', () => {
       ).toBe(true);
 
       expect(run.code, run.stderr).toBe(0);
-      const finished = logLines(run.stdout).find((line) => line.msg === 'note-key rotation finished');
+      const finished = rotationLogLines(run.stdout).find((line) => line.msg === 'note-key rotation finished');
       // At least two commits, and never one fewer: the short batch, then a later batch that finds the row the
       // short batch would have abandoned, then the empty batch that really ends the walk.
       expect(Number(finished?.batches)).toBeGreaterThanOrEqual(2);

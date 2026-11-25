@@ -276,15 +276,24 @@ UPDATE notes
 ```
 
 - Zero rows back means the caller's `baseVersion` is stale, or the note is gone, or it belongs to someone else;
-  the repository returns `undefined` and **PR-10 renders that as `409`**. It is deliberately not an exception:
-  a conflict is a normal answer here, not a bug.
+  the repository returns `undefined` and **PR-10 renders that as a `404` or a `VERSION_CONFLICT`** — never as one
+  or the other on a guess. The statement filtered on `user_id`, so the two cases are the same answer at SQL level;
+  what separates them is one scoped `SELECT` afterwards, and answering `409` for a row the caller does not own
+  would confirm the row exists *and* hand over its decrypted body. That payload is deliberate: `data.content` and
+  `data.version` are the current server state, which PR-14's autosave compares with the exact snapshot it put on
+  the wire, so a write that committed but whose reply went missing is adopted instead of reported as a collision.
+- A second precondition sits above this one, in the transport: `PUT …/content` accepts an optional `If-Match`, and
+  a header naming a version other than the one being written against is answered from that same scoped re-read
+  without any write at all. There is no `412` in this API's nine codes, so a violated precondition is a
+  `VERSION_CONFLICT` (or the `404` the re-read says is true) rather than a status no client has a recovery for.
 - The row comes back whole, so the new `version` is available to return to the client without a second query
   (and no window between the two).
 - `version` is bumped **only** by a content write. `patchNote` and `patchFolder` — the one statement behind each
   `PATCH` — touch `name`/`folder_id`/`parent_id` and `updated_at` and leave `version` alone, so renaming or
   re-filing a row never invalidates an open editor.
 - Two writers that read the same version: exactly one wins, asserted concurrently in
-  `notes.repo.int.test.ts`. Nothing is merged and nothing is lost silently.
+  `notes.repo.int.test.ts`, and again one layer up (through the HTTP endpoint, with a request cancelled while it
+  waits on the row lock) in `notes.content-race.int.test.ts`. Nothing is merged and nothing is lost silently.
 - The key rotation (PR-06's `apps/server/src/scripts/rotate-note-key.ts`) is the only other writer of these
   columns, and it is deliberately **not** a content write:
 

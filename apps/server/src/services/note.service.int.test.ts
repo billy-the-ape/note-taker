@@ -13,6 +13,11 @@
  *
  * The name rules are asserted against exact strings, because `new-file-<msepoch>` and `plan-2` are the contract's
  * text (`packages/contracts/src/names.ts`), not this file's invention.
+ *
+ * PR-10 added the write side at the bottom of this file, where the two decisions that belong to the service rather
+ * than to the transport are measurable: what a failed conditional update *means* (`404` versus a
+ * `VERSION_CONFLICT` carrying the server's body), and what it means when the row it would have described cannot
+ * be decrypted.
  */
 import { NOTE_CONTENT_MAX_BYTES, type NoteWithContent } from '@note-taker/contracts';
 import { sql } from 'drizzle-orm';
@@ -21,7 +26,12 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { EnvelopeError } from '../crypto/envelope.js';
 import { getKeyring } from '../crypto/keys.js';
 import { listAllNotes, noteById } from '../db/repositories/notes.repo.js';
-import { ConflictError, NotFoundError, PayloadTooLargeError } from '../domain/errors.js';
+import {
+  ConflictError,
+  NotFoundError,
+  PayloadTooLargeError,
+  VersionConflictError,
+} from '../domain/errors.js';
 import { createUser } from '../test/fixtures.js';
 import { catalogRows, resetDb, testDb } from '../test/helpers/db.js';
 import { createFolderService } from './folder.service.js';
@@ -327,5 +337,175 @@ describe('ownership on body ids (§5.4)', () => {
       await expect(attempt()).rejects.toBeInstanceOf(NotFoundError);
     }
     expect((await notes.read({ userId: b.id, id: theirs.id })).content).toBe('not yours');
+  });
+});
+
+describe('PUT /api/notes/:id/content (§9.2 #18, PR-10 §5)', () => {
+  /** The service's answer to a failed write, captured instead of thrown, so the row can be read afterwards. */
+  async function failure(promise: Promise<unknown>): Promise<unknown> {
+    return promise.then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+  }
+
+  it('writes once, moves the statistics, and leaves the envelope whole', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'draft', content: 'one two three' });
+
+    const written = await notes.putContent({
+      userId: user.id,
+      id: created.id,
+      content: 'four five\n',
+      baseVersion: 1,
+    });
+
+    expect(written).toMatchObject({ id: created.id, version: 2, content: 'four five\n', wordCount: 2 });
+    expect(written.contentBytes).toBe(Buffer.byteLength('four five\n', 'utf8'));
+    // The columns a content write owns, from the row rather than from the response: the version moved exactly one
+    // (nothing else moved it), and the byte/word statistics belong to the *plaintext* that is now stored.
+    const row = await noteRow(created.id);
+    expect([row.version, row.content_bytes, row.word_count]).toEqual([2, 10, 2]);
+    expect(Number(row.cipher_bytes)).toBeGreaterThanOrEqual(16);
+    expect(Number(row.iv_bytes)).toBe(12);
+  });
+
+  it('answers a stale baseVersion with the server state, in the pair PR-14 compares', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'tabs', content: 'shared' });
+    // Tab A wins the same version twice; tab B is holding a snapshot from before either write.
+    await notes.putContent({ userId: user.id, id: created.id, content: 'the winner', baseVersion: 1 });
+
+    const stale = await failure(
+      notes.putContent({ userId: user.id, id: created.id, content: 'the loser', baseVersion: 1 }),
+    );
+
+    expect(stale).toBeInstanceOf(VersionConflictError);
+    const conflict = stale as VersionConflictError;
+    // Both halves, and in `data` — the shape `versionConflictErrorDataSchema` pins and the wire renders as the
+    // envelope's payload. The client compares `content` with the exact string it put on the wire: equal means its
+    // own write landed and only the reply went missing, so it adopts `version` instead of showing a collision.
+    expect([conflict.content, conflict.version]).toEqual(['the winner', 2]);
+    expect(conflict.data).toEqual({ content: 'the winner', version: 2 });
+    expect(conflict.code).toBe('VERSION_CONFLICT');
+
+    // The loser wrote nothing, in either direction: no second increment, and no trace of its body.
+    const row = await noteRow(created.id);
+    expect(row.version).toBe(2);
+    const current = await notes.read({ userId: user.id, id: created.id });
+    expect(current.content).toBe('the winner');
+  });
+
+  it("answers a note that is not the caller's with 404, never with the conflict that would confirm it", async () => {
+    const a = await createUser(db, { username: 'a', role: 'member' });
+    const b = await createUser(db, { username: 'b', role: 'member' });
+    const theirs = await notes.create({ userId: b.id, name: 'theirs', content: 'their text' });
+
+    // The conditional update filtered on `user_id` and matched nothing, which is the *same* zero rows a stale
+    // `baseVersion` produces. The scoped re-read is what makes this a `404`: a `409` would tell `a` that this uuid
+    // is a real note, and `data.content` would hand over a body — the whole point of §5's "never 409".
+    const stolen = await failure(
+      notes.putContent({ userId: a.id, id: theirs.id, content: 'mine now', baseVersion: 1 }),
+    );
+    expect(stolen).toBeInstanceOf(NotFoundError);
+
+    const missing = await failure(
+      notes.putContent({ userId: a.id, id: theirs.id, content: 'mine now', baseVersion: 99 }),
+    );
+    expect(missing).toBeInstanceOf(NotFoundError);
+    expect((await noteRow(theirs.id)).version).toBe(1);
+  });
+
+  it('refuses a violated If-Match before the write, and still says 404 for a note that is not there', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'precondition', content: 'server text' });
+
+    // `baseVersion: 1` matches the row, so the *statement* would have written. The caller's own precondition
+    // disagrees with its body, which is enough: the method may only be applied to the state its `If-Match`
+    // named, so this is answered from the re-read rather than from the update.
+    const violated = await failure(
+      notes.putContent({
+        userId: user.id,
+        id: created.id,
+        content: 'written anyway?',
+        baseVersion: 1,
+        ifMatchAdmitsBase: false,
+      }),
+    );
+    expect(violated).toBeInstanceOf(VersionConflictError);
+    expect((violated as VersionConflictError).data).toEqual({ content: 'server text', version: 1 });
+    expect((await noteRow(created.id)).version).toBe(1);
+
+    // The same violated precondition with no row behind it is still a `404`: whatever the header said, the
+    // existence of an id is decided by the scoped read and by nothing else.
+    await notes.remove({ userId: user.id, id: created.id });
+    const gone = await failure(
+      notes.putContent({
+        userId: user.id,
+        id: created.id,
+        content: 'nobody',
+        baseVersion: 1,
+        ifMatchAdmitsBase: false,
+      }),
+    );
+    expect(gone).toBeInstanceOf(NotFoundError);
+  });
+
+  it('refuses an oversized body before using a key, counting bytes rather than characters', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'cap', content: 'small' });
+
+    const tooLong = 'x'.repeat(NOTE_CONTENT_MAX_BYTES + 1);
+    const over = await failure(
+      notes.putContent({ userId: user.id, id: created.id, content: tooLong, baseVersion: 1 }),
+    );
+    expect(over).toBeInstanceOf(PayloadTooLargeError);
+
+    // The cap is a byte cap (`utf8ByteLength`), and a character count would let 1/3 of the note through as three
+    // times the storage: `content.length` here is under the cap while the UTF-8 body is not.
+    const multibyte = 'あ'.repeat(NOTE_CONTENT_MAX_BYTES / 3 + 1);
+    expect(multibyte.length).toBeLessThan(NOTE_CONTENT_MAX_BYTES);
+    const overAgain = await failure(
+      notes.putContent({ userId: user.id, id: created.id, content: multibyte, baseVersion: 1 }),
+    );
+    expect(overAgain).toBeInstanceOf(PayloadTooLargeError);
+
+    // Refused before the key was used, so the row still holds the body it had at the version it had it. A write
+    // that sealed first and measured second would have spent a round of AES on a body it then threw away, and — if
+    // it had also stored it — put a body past the cap in the database that the API then refuses to read back.
+    const row = await noteRow(created.id);
+    expect([row.version, row.content_bytes, row.word_count]).toEqual([1, 5, 1]);
+  });
+
+  it('lets an unreadable body fail rather than describe itself as the server state in a 409', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'fragile', content: 'the only copy' });
+    await catalogRows(sql`update notes set content_cipher = sha256(content_cipher) where id = ${created.id}`);
+
+    // The write cannot match (`baseVersion: 99` matches nothing), so the answer comes from re-reading the row — and
+    // the row no longer authenticates. `EnvelopeError` propagates, which `mapError()` renders as `500`: the
+    // alternative is a `409` whose `data.content` is `''`, i.e. a PR-14 that compares its snapshot, sees a
+    // difference, and offers to overwrite the one body it cannot currently read. Same rule as `GET` (§7).
+    await expect(
+      notes.putContent({ userId: user.id, id: created.id, content: 'overwrite?', baseVersion: 99 }),
+    ).rejects.toBeInstanceOf(EnvelopeError);
+  });
+
+  it('does not touch the version when the body is the same text again', async () => {
+    const user = await createUser(db, { username: 'a', role: 'member' });
+    const created = await notes.create({ userId: user.id, name: 'unchanged', content: 'same words' });
+
+    // There is no content hash and no "no-op" branch, deliberately: an editor saving identical text is still a new
+    // state of the note (its `content_updated_at` moves, and its recents position with it), and skipping the write
+    // would make `version` a content hash by the back door — which is exactly the equality `If-Match` cannot
+    // promise across a re-serialization.
+    const again = await notes.putContent({
+      userId: user.id,
+      id: created.id,
+      content: 'same words',
+      baseVersion: 1,
+    });
+    expect(again.version).toBe(2);
+    expect(again.contentBytes).toBe(10);
   });
 });

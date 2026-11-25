@@ -21,10 +21,11 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 | `pnpm test`         | Vitest unit suites (`src/**/*.test.{ts,tsx}`, `*.int.test.ts` excluded).                                                                |
 | `pnpm coverage`     | The same with v8 coverage — this is what the `unit` CI job (PR-03) runs, so keep its thresholds in the Vitest configs, not in CI flags. PR-06 armed its `apps/server/src/{crypto,domain}` glob thresholds at plan §14's 80/80/75/80. |
 | `pnpm test:integration` | The `*.int.test.ts` suite (`apps/server/vitest.integration.config.ts`, PR-04) — the only suite that touches a database, so `make db-up` first. `src/test/setup.ts` applies the committed migration, then `resetDb()` truncates between tests, and the files run one at a time. It boots the app under test, which imports `@note-taker/contracts` from its `dist`, so `pnpm build:packages` (PR-05) has to have run. |
-| `pnpm coverage:integration` | The same with `--coverage`. This is what the `integration` CI job (PR-04) runs, and the `apps/server/src/db` threshold lives in that config too. |
+| `pnpm coverage:integration` | The same with `--coverage`. This is what the `integration` CI job (PR-04) runs, and the `apps/server/src/{db,services,routes}` thresholds (plan §14's 80/80/75/80 — `db` armed by PR-04, `services`/`routes` by PR-09) live in that config too, never in a CI flag. |
 | `pnpm db:generate` / `pnpm db:migrate` | drizzle-kit (PR-04), run in `apps/server`: generate the SQL into the committed `apps/server/migrations/`, or apply it. Both need a running Postgres; neither needs a `.env`. There is **no `db:push`**, by design (plan §5): the migration history is what ships. |
+| `pnpm db:seed` | The demo tree, idempotently (PR-09 — `apps/server/src/scripts/seed-demo.ts`, run with `NODE_ENV=development tsx`): the owner, the nested folders and the notes, **sealed with the keyring of the process that runs it** rather than a test key, and readable by the app afterwards. Needs a running Postgres; refuses `NODE_ENV=production` before it builds a keyring or opens a pool. It never truncates and never reseeds — a run reports `created`/`kept` per folder and note, so a second run on edited content is a no-op — and the password it prints is stored only as its argon2 hash. `src/scripts/seed-demo.int.test.ts` proves both halves. |
 | `pnpm generate:key` | Prints a fresh 32-byte note-encryption key as base64 on stdout, for `NOTE_ENCRYPTION_KEY` (PR-06, dev/CI only — root `scripts/generate-keys.ts`, run through the server workspace's `tsx`). A production host generates its key with the `docker run --rm node:22-slim node -e '…randomBytes(32)…'` one-liner instead, which PR-18's runbook documents. |
-| `make db-up` / `db-down` / `db-reset` | Dev Postgres 16 in Docker (`docker/compose.dev.yml`, PR-02): start it (and wait for healthy), stop it, or recreate it with its volume. `make dev`/`build`/`test`/`coverage` are the `pnpm` equivalents behind one interface, and `make bootstrap-env` only creates `.env`. The database commands are `pnpm`-only (`pnpm db:generate`, `pnpm db:migrate`); `make` has no `db:*` target for them, and PR-09 owns `db:seed`. |
+| `make db-up` / `db-down` / `db-reset` | Dev Postgres 16 in Docker (`docker/compose.dev.yml`, PR-02): start it (and wait for healthy), stop it, or recreate it with its volume. `make dev`/`build`/`test`/`coverage` are the `pnpm` equivalents behind one interface, and `make bootstrap-env` only creates `.env`. The database commands are `pnpm`-only (`pnpm db:generate`, `pnpm db:migrate`); `make` has no `db:*` target for them, and `pnpm db:seed` (PR-09) is a pnpm script for the same reason. |
 
 - **Compose is always invoked with both flags, from the repo root**:
   `docker compose --env-file .env -f docker/compose.dev.yml <up|down|…>`. Compose resolves its project
@@ -60,8 +61,30 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   matches nothing, and **never bumps `notes.version`** — rotation is not a content edit. In integration tests it
   is driven as a `tsx` subprocess with `NOTE_ENCRYPTION_KEY_VERSION=2` and the old key in `_PREVIOUS`, because
   editing `.env` and restarting the app are operator steps a script cannot do to its own container.
-- **Scripts that do not exist yet stay that way**: `db:seed` (PR-09), `check:env`
+- **Scripts that do not exist yet stay that way**: `check:env`
   (PR-18), `test:e2e` (PR-19). Adding one before the files it runs is a plan violation.
+- **Folder mutations are serialized per user, and ids in bodies are checked before they are written** (PR-09):
+  every `create`/`rename`/`move`/`delete` in `services/folder.service.ts` runs in one transaction that starts with
+  `takeFolderMoveLock(userId)` — `pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — and
+  only then runs `isDescendantOrSelf()` plus the depth arithmetic. A new folder write that skips the lock is not
+  "the same thing minus a line": two moves of disjoint pairs commit a four-node cycle through it, which is asserted
+  both ways in `services/folder.service.int.test.ts`. Second half: a `folderId`/`parentId` that arrives in a **body**
+  is resolved with `folderById`/`noteById` scoped to the caller *before* the insert or update, and answered
+  `404 NOT_FOUND` — never a `500` from `23503`, and never a `403` that would confirm the id exists. The route
+  handlers stay thin: ownership, cycles, the 100-level cap and the envelope failures are decided in the service,
+  and `plugins/error-handler.ts`'s `mapError()` is the one place a status is chosen.
+- **A delete's emptiness gate locks the folder row, and a generated name never conflicts** (PR-09): the advisory
+  lock above serializes folder mutations against each other, but a note `INSERT` takes no such lock — it takes the
+  `KEY SHARE` on the folder row that every foreign-key insert takes. So `remove()` in `services/folder.service.ts`
+  calls `lockFolderRow()` (`SELECT … FOR UPDATE`, which answers the ownership question with `404` in the same
+  statement) **before** `countChildren()`/`countNotesInFolder()`. Count first and the gate can answer "empty" about
+  a folder someone is writing into; the `DELETE` then waits on that same `KEY SHARE` only after the gate opened, and
+  cascades over the row that won — a `204` for a delete that destroyed a note whose `POST` had returned `201`. Do
+  not "simplify" that read back into `folderById`. Both races are asserted in
+  `services/folder.service.int.test.ts`. Second half: a unique violation on a **generated** `new-file-<msepoch>`
+  name is re-picked with a fresh read (`GENERATED_NAME_ATTEMPTS` in `services/note.service.ts`) and never answered
+  `409` with a stranger's id, because a generated name is the one name the server may change (§5.5); a name the
+  client typed still clashes on purpose. Concurrent creates are asserted in `services/note.service.int.test.ts`.
 - **The schema lives in one file and the docs follow it.** `apps/server/src/db/schema.ts` is the source of truth;
   a new column ships with its generated SQL in `apps/server/migrations/` in the same PR, and
   `docs/DATA-MODEL.md` (created by PR-04) is rewritten in that same PR — it is what PR-06/07/09/10 read.

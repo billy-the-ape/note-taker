@@ -17,6 +17,7 @@
     "coverage:integration": "NODE_ENV=test vitest run --config vitest.integration.config.ts --coverage",
     "db:generate": "NODE_ENV=development drizzle-kit generate",
     "db:migrate": "NODE_ENV=development drizzle-kit migrate",
+    "db:seed": "NODE_ENV=development tsx src/scripts/seed-demo.ts",
     "coverage": "vitest run --coverage"
   },
   "dependencies": {

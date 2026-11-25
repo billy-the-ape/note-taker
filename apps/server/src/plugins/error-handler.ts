@@ -18,6 +18,12 @@
  *   `CONFLICT` rather than an unexplained `INTERNAL`; `23505` (unique violation) is the same class of
  *   "your write does not apply to the current state" and gets the same treatment when a repository
  *   lets it through instead of raising `ConflictError` with the winner's id.
+ * * **`23503` (foreign key) is `404`, not `500`** (PR-09, plan §9.2 #16/#19): the request named a parent row
+ *   that is not there — or not the caller's — and a `500` would be both an existence oracle and a lie about
+ *   who broke. A scoped lookup in the service is the first line of defence; this is the net.
+ * * **A note body that does not authenticate is `INTERNAL` with its id in the log** (PR-06's
+ *   `EnvelopeError`): `mapError()` names the class so the row reaches the operator, while the client still
+ *   gets the code's default message and *never* an empty `content` standing in for a failure.
  */
 import {
   API_ERROR_MESSAGES,
@@ -32,6 +38,7 @@ import {
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ZodError } from 'zod';
 
+import { EnvelopeError } from '../crypto/envelope.js';
 import { isDomainError } from '../domain/errors.js';
 
 /** A failure already translated into transport terms, with a message that is always safe to send. */
@@ -43,6 +50,15 @@ export interface MappedError {
   readonly data?: ErrorData;
   /** Whole seconds to put in `Retry-After`; only a domain error can ask for it (PR-07's two auth windows). */
   readonly retryAfterSeconds?: number;
+  /**
+   * Extra fields for the **server log line only**, never the body (§9.1: the client gets a code and a safe
+   * message, an operator gets the row).
+   *
+   * PR-09 added it for `EnvelopeError`: a note body whose GCM tag does not verify is `INTERNAL` — there is no
+   * honest way to tell the user otherwise — but "which note?" is exactly the question an operator has to answer,
+   * and the id is not sensitive. A mapping that needs it says so here rather than logging from inside the route.
+   */
+  readonly logContext?: Readonly<Record<string, string | number>>;
 }
 
 /**
@@ -58,6 +74,15 @@ const RETRYABLE_POSTGRES_CODES: ReadonlySet<string> = new Set([
 /** How far down the `cause` chain to look for a driver code (drizzle wraps, `postgres` wraps again). */
 const MAX_CAUSE_DEPTH = 4;
 
+/**
+ * `foreign_key_violation` (§9.2 #16/#19's "never an FK-violation `500`").
+ *
+ * A service scopes every body-supplied `folderId`/`parentId` before it writes, so this fires only when the row
+ * was deleted *between* that check and the statement — a folder deleted while its child note was being moved
+ * into it. The honest answer is still `404`: the parent you named is not there.
+ */
+const FOREIGN_KEY_CODES: ReadonlySet<string> = new Set(['23503']);
+
 interface MaybeCoded {
   readonly sqlstate?: unknown;
   readonly code?: unknown;
@@ -66,19 +91,19 @@ interface MaybeCoded {
 }
 
 /**
- * The Postgres status code carried by an error, if it carries one.
+ * The Postgres status code carried by an error, if it carries one of `codes`.
  *
  * Structural rather than `instanceof DrizzleError`: `drizzle-orm` is PR-04's dependency, this PR must
  * compile without it, and a driver code is a string on the error either way — a wrapper chain of
  * `Error`s whose `cause` is the driver error is as real as the driver error itself.
  */
-function postgresCodeOf(error: unknown, depth = 0): string | undefined {
+function postgresCodeOf(error: unknown, codes: ReadonlySet<string>, depth = 0): string | undefined {
   if (depth >= MAX_CAUSE_DEPTH || error === null || typeof error !== 'object') return undefined;
   const coded = error as MaybeCoded;
   for (const value of [coded.sqlstate, coded.code, coded.errno]) {
-    if (typeof value === 'string' && RETRYABLE_POSTGRES_CODES.has(value)) return value;
+    if (typeof value === 'string' && codes.has(value)) return value;
   }
-  return postgresCodeOf(coded.cause, depth + 1);
+  return postgresCodeOf(coded.cause, codes, depth + 1);
 }
 
 /**
@@ -148,6 +173,19 @@ export function mapError(error: unknown): MappedError {
     };
   }
 
+  // PR-06's envelope failure: `INTERNAL` is the only honest code (the row exists and belongs to the caller; what
+  // failed is the authentication of its body), and the reason must never reach the client — `EnvelopeError`'s
+  // text names key versions and fingerprints. The note id goes to the log line, which is what turns "one note in
+  // this install is unreadable" into an actionable report (MVP-06 §5, MVP-09 §7).
+  if (error instanceof EnvelopeError) {
+    return {
+      status: API_ERROR_STATUS.INTERNAL,
+      code: 'INTERNAL',
+      message: API_ERROR_MESSAGES.INTERNAL,
+      ...(error.noteId === undefined ? {} : { logContext: { noteId: error.noteId } }),
+    };
+  }
+
   if (isValidationError(error)) {
     const details = detailsFrom(error.issues as readonly unknown[]);
     return {
@@ -158,7 +196,19 @@ export function mapError(error: unknown): MappedError {
     };
   }
 
-  const postgresCode = postgresCodeOf(error);
+  const foreignKey = postgresCodeOf(error, FOREIGN_KEY_CODES);
+  if (foreignKey !== undefined) {
+    // `NOT_FOUND`, and not the `INTERNAL` it would otherwise be: the request named a parent row that the caller
+    // may not have, or that was deleted a moment ago. Same reasoning as a scoped lookup (§9.2 #16/#19), and the
+    // driver's text — which names the table, the column and the statement — stays in the log.
+    return {
+      status: API_ERROR_STATUS.NOT_FOUND,
+      code: 'NOT_FOUND',
+      message: API_ERROR_MESSAGES.NOT_FOUND,
+    };
+  }
+
+  const postgresCode = postgresCodeOf(error, RETRYABLE_POSTGRES_CODES);
   if (postgresCode !== undefined) {
     // Never the driver's text: it can name a table, a column, or the statement that failed.
     return {
@@ -212,11 +262,15 @@ export function registerErrorHandlers(app: FastifyInstance): void {
     const mapped = mapError(error);
     const requestId = requestIdOf(request);
 
+    // A mapping that knows something the client must not see (an envelope failure's note id) says so through
+    // `logContext`, so the row is in the same line as the `requestId` a support ticket already quotes.
+    const context = { err: error, code: mapped.code, requestId, ...(mapped.logContext ?? {}) };
+
     if (mapped.status >= 500) {
       // The only place the real failure is recorded; the client gets `internal error` and this id.
-      request.log.error({ err: error, code: mapped.code, requestId }, 'request failed');
+      request.log.error(context, 'request failed');
     } else {
-      request.log.debug({ err: error, code: mapped.code, requestId }, 'request rejected');
+      request.log.debug(context, 'request rejected');
     }
 
     // Split out of the chain because one header here is optional, and a conditional in the middle of a

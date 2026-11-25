@@ -24,8 +24,9 @@ import {
   isDescendantOrSelf,
   listAllFolders,
   listFolders,
-  moveFolder,
-  renameFolder,
+  listFolderTree,
+  lockFolderRow,
+  patchFolder,
 } from './folders.repo.js';
 
 async function pair(): Promise<UserPair> {
@@ -123,6 +124,43 @@ describe('folders.repo', () => {
     await expect(listAllFolders(db, { userId: member.id })).resolves.toHaveLength(1);
   });
 
+  it('walks the tree in one statement, and keeps the depth, the breadcrumb and the timestamps', async () => {
+    // The CTE is the one place PR-09 reads a raw statement for **application** data, and a raw statement hands
+    // back values with no column metadata attached. This is the assertion that would have caught the `500` every
+    // `GET /api/tree` returned on the first CI run: the mapping promised `Date`, the driver sent text, and
+    // `toFolderNode` called `.toISOString()` on it. Types cannot be trusted here, so the row is.
+    const { owner, member } = await pair();
+    const db = testDb();
+    const top = await createFolder(db, { userId: owner.id, name: 'Top' });
+    const mid = await createFolder(db, { userId: owner.id, name: 'Mid', parentId: top.id });
+    const leaf = await createFolder(db, { userId: owner.id, name: 'Leaf', parentId: mid.id });
+    await createFolder(db, { userId: member.id, name: 'Theirs' });
+
+    const rows = await listFolderTree(db, { userId: owner.id });
+
+    // Byte order on the name, and one row per level with its depth.
+    expect(rows.map((row) => [row.name, row.depth])).toStrictEqual([
+      ['Leaf', 2],
+      ['Mid', 1],
+      ['Top', 0],
+    ]);
+    expect(rows.map((row) => row.parentId)).toStrictEqual([mid.id, top.id, null]);
+    // Nobody else's rows, not even as a row this side would filter out later.
+    expect(new Set(rows.map((row) => row.userId))).toStrictEqual(new Set([owner.id]));
+
+    // The breadcrumb the CTE computes on the way down (§5.1), root-first.
+    expect(rows.map((row) => row.path)).toStrictEqual([['Top', 'Mid', 'Leaf'], ['Top', 'Mid'], ['Top']]);
+
+    // The timestamps: `Date`s, the same instants the rows carry, and not the epoch a failed parse would invent.
+    for (const row of rows) {
+      expect(row.createdAt).toBeInstanceOf(Date);
+      expect(Number.isNaN(row.createdAt.getTime())).toBe(false);
+    }
+    const walked = rows.find((row) => row.id === leaf.id);
+    expect(walked?.createdAt.getTime()).toBe(leaf.createdAt.getTime());
+    expect(walked?.updatedAt.getTime()).toBe(leaf.updatedAt.getTime());
+  });
+
   it('looks a sibling up by (user, parent, name), root included', async () => {
     const { owner } = await pair();
     const db = testDb();
@@ -182,12 +220,12 @@ describe('folders.repo', () => {
     const db = testDb();
     const created = await createFolder(db, { userId: owner.id, name: 'Before' });
 
-    const renamed = await renameFolder(db, { userId: owner.id, id: created.id, name: 'After' });
+    const renamed = await patchFolder(db, { userId: owner.id, id: created.id, name: 'After' });
     expect(renamed).toMatchObject({ name: 'After', id: created.id });
     expect(renamed?.updatedAt.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
 
     await expect(
-      renameFolder(db, { userId: member.id, id: created.id, name: 'Not yours' }),
+      patchFolder(db, { userId: member.id, id: created.id, name: 'Not yours' }),
     ).resolves.toBeUndefined();
     await expect(folderById(db, { userId: owner.id, id: created.id })).resolves.toMatchObject({
       name: 'After',
@@ -204,7 +242,7 @@ describe('folders.repo', () => {
     // The root already holds `Reports`, so this move is a duplicate sibling: the database says so, and PR-09
     // translates it into a 409. The row must be untouched afterwards.
     await expectSqlState(
-      moveFolder(db, { userId: owner.id, id: nested.id, parentId: null }),
+      patchFolder(db, { userId: owner.id, id: nested.id, parentId: null }),
       '23505',
       'folders_unique_sib',
     );
@@ -214,9 +252,32 @@ describe('folders.repo', () => {
 
     // A legal move: sideways into another folder.
     const sideways = await createFolder(db, { userId: owner.id, name: 'Side' });
-    const moved = await moveFolder(db, { userId: owner.id, id: nested.id, parentId: sideways.id });
+    const moved = await patchFolder(db, { userId: owner.id, id: nested.id, parentId: sideways.id });
     expect(moved).toMatchObject({ parentId: sideways.id });
     await expect(namesAt(owner.id, sideways.id)).resolves.toStrictEqual(['Reports']);
+  });
+
+  it('renames and moves in one statement, which is the pair the sibling index judges', async () => {
+    const { owner } = await pair();
+    const db = testDb();
+    const from = await createFolder(db, { userId: owner.id, name: 'from' });
+    const to = await createFolder(db, { userId: owner.id, name: 'to' });
+    const moving = await createFolder(db, { userId: owner.id, name: 'a', parentId: from.id });
+    // A sibling called `b` already hangs under `from`. Renaming first and moving afterwards — what
+    // `PATCH /api/folders/:id` used to do — hit `folders_unique_sib` in the parent the folder was leaving, so a
+    // request describing a perfectly legal `(to, b)` was refused for a clash it would not have had there.
+    await createFolder(db, { userId: owner.id, name: 'b', parentId: from.id });
+
+    const patched = await patchFolder(db, {
+      userId: owner.id,
+      id: moving.id,
+      name: 'b',
+      parentId: to.id,
+    });
+
+    expect(patched).toMatchObject({ name: 'b', parentId: to.id });
+    await expect(namesAt(owner.id, from.id)).resolves.toStrictEqual(['b']);
+    await expect(namesAt(owner.id, to.id)).resolves.toStrictEqual(['b']);
   });
 
   it('deletes a folder and its whole subtree, notes included (ON DELETE CASCADE)', async () => {
@@ -261,6 +322,49 @@ describe('folders.repo', () => {
     expect(await countFrom('sessions')).toBe(0);
     // …and it is the *other* user's settings row that survives, so the zeros above are about cascades.
     expect(await countFrom('settings')).toBe(1);
+  });
+
+  it('locks the folder row for the delete gate, for its owner only, and really blocks', async () => {
+    const { owner, member } = await pair();
+    const db = testDb();
+    const created = await createFolder(db, { userId: owner.id, name: 'Gate' });
+
+    // The ownership question and the row lock are one statement, so the delete answers "not yours" exactly the
+    // way it answers "not there" — and takes no lock on a stranger's row while doing it.
+    await db.transaction(async (tx) => {
+      await expect(lockFolderRow(tx, { userId: owner.id, id: created.id })).resolves.toBe(true);
+    });
+    await db.transaction(async (tx) => {
+      await expect(lockFolderRow(tx, { userId: member.id, id: created.id })).resolves.toBe(false);
+    });
+
+    // And the lock is a lock rather than a `SELECT` with `for update` written in it: a second caller has to wait
+    // for the first. This is the property `folder.service.ts`’s emptiness gate leans on (DATA-MODEL §3), and the
+    // waiting — not the return value — is what a unit test could not fake. The sleep runs in the database, so it
+    // is not a `setTimeout` hoping the machine is slow; only the lower bound is asserted, because a loaded CI box
+    // can only make the wait longer.
+    const holding = db.transaction(async (tx) => {
+      await lockFolderRow(tx, { userId: owner.id, id: created.id });
+      await tx.execute(sql`select pg_sleep(0.4)`);
+    });
+    // Listened to from the moment it starts, so a failure inside it is this test's own assertion rather than an
+    // unhandled rejection arriving half a second later (the reason `note.service.int.test.ts` has `settle()`).
+    const holdingSettled = holding.then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const startedAt = Date.now();
+    await db.transaction(async (tx) => {
+      await expect(lockFolderRow(tx, { userId: owner.id, id: created.id })).resolves.toBe(true);
+    });
+    const waitedMs = Date.now() - startedAt;
+    expect(await holdingSettled, 'the holding transaction should have committed').toBeUndefined();
+
+    expect(
+      waitedMs,
+      `the second lock took ${waitedMs}ms, so it did not queue behind the first`,
+    ).toBeGreaterThanOrEqual(250);
   });
 
   it('answers PR-09’s cycle question by walking ancestors (isDescendantOrSelf)', async () => {

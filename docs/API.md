@@ -21,8 +21,8 @@ describes.
 | | |
 | --- | --- |
 | Base path | `/api` (`API_BASE_PATH`). In development Vite proxies `/api` to the API process, so the SPA calls the same paths with no configuration. |
-| Content type | `application/json; charset=utf-8` both ways. Requests use `UTF-8` explicitly so the 1 MiB body cap is measured in bytes on the way in, not in characters. |
-| Auth | The `HttpOnly` `note_session` cookie (plan §10). "Auth: yes" below means a valid session is required; `GET /api/auth/session` answers with `{ user: null }` instead of failing. |
+| Content type | `application/json; charset=utf-8` both ways. Requests use `UTF-8` explicitly so the 1 MiB body cap is measured in bytes on the way in, not in characters. Two doors, and a client has to tell them apart: a body that is JSON but breaks the route's schema is `400 VALIDATION`, while a body the transport will not parse (any content type with no registered parser, e.g. a `text/plain` form post) is refused before routing with `415`, which keeps its status and carries `VALIDATION` because `apiErrorCodeForStatus(415)` is deliberately undefined (**PR-09**). Neither ever answers `INTERNAL`, and neither writes a row. |
+| Auth | The `HttpOnly` `note_session` cookie (plan §10). "Auth: yes" below means a valid session is required; `GET /api/auth/session` answers with `{ user: null }` instead of failing. Guards run in one order: the CSRF hook is an app-wide `onRequest`, so a mutation that has **neither** a session nor a valid `X-CSRF-Token` is refused `403 FORBIDDEN` and never reaches the session check — `401 UNAUTHORIZED` therefore means "the token half was fine; the session is not". A signed-out browser recovers from the `403` by refetching `GET /api/auth/status` for a fresh pair (which is not a credential and is handed to anybody), which is why `apps/web/src/lib/api.ts` treats `403` as refresh-and-replay-once and `401` as route-to-sign-in. |
 | CSRF | Every mutation (`POST`/`PUT`/`PATCH`/`DELETE`) carries `X-CSRF-Token`, echoing the non-`HttpOnly` `note_csrf` cookie (`Max-Age` 1 day, shorter than the session). `GET /api/auth/status` issues it, and every `setup`/`login`/`register`/`logout` response re-issues a fresh one, so it is never older than the browser session carrying it. `login`/`setup`/`register` are exempt (`CSRF_EXEMPT_ROUTES`) and guarded by `Origin`/`Sec-Fetch-Site` instead (**PR-07**). The pair is deliberately **not** bound to a `sessions` row: double-submit equality plus the origin check is what does the binding in a single-instance MVP. The origin a request is measured against is the API's own `protocol` + `Host`; with `TRUST_PROXY=true` the `X-Forwarded-Host`/`X-Forwarded-Proto` pair wins (its **last** value), because a proxy that rewrites `Host` — nginx's default `proxy_set_header Host $proxy_host`, and this repo's own dev proxy until PR-07's review — would otherwise answer every same-origin browser mutation with `403`. `apps/web/vite.config.ts` therefore pins `changeOrigin: false`, and a proxy in front of a deployed instance has to pass `Host` through or send both forwarded headers. Trusting the forwarded host is not a blanket pass: an `Origin` that differs from it is still refused. |
 | Payload cap | 1 MiB request body (Fastify `bodyLimit`) → `PAYLOAD_TOO_LARGE` (413). The UI warns at 900 KiB. |
 | Timestamps | ISO-8601 UTC strings (`isoDateTimeSchema`), i.e. what `JSON.stringify(new Date())` produces. |
@@ -67,6 +67,29 @@ Status is **not** the discriminator: `CONFLICT` and `VERSION_CONFLICT` share 409
 to `CONFLICT`/409 rather than an unexplained 500 — all three are retryable, and a client that saw 500
 would not retry.
 
+Three more mappings arrived with the tree endpoints, and each exists because the alternative would be a status
+code a client could act on wrongly (**PR-09**):
+
+* **`23503` (foreign-key violation) → `NOT_FOUND`/404.** Every id that arrives in a *body* — `folderId` on a note,
+  `parentId` on a folder — is looked up scoped to the caller before anything is written, so the constraint is
+  already unreachable through an ordinary request; what is left is the parent being deleted in the instant between
+  that check and the insert, which is exactly the state the same request would have described a moment later. A
+  `500` there would report the database's internals as the caller's emergency, and — worse — a `500` for someone
+  else's id next to a `404` for a made-up one is an existence oracle for other people's uuids.
+* **An `EnvelopeError` → `INTERNAL`/500 with the note id in the log line and the generic message on the wire.**
+  The stored ciphertext failed to authenticate, so the plaintext is unrecoverable; the failure text names key
+  versions and fingerprints (which a client cannot act on), and the one body a client might misread as success is
+  `content: ""` — an empty note it would then feel safe overwriting. The operator needs to know *which* row, so
+  the id is attached to the log, next to the `requestId` the envelope already carries.
+* **A folder create or move that would exceed 100 levels → `VALIDATION`/400**, with `details[].path` of `parentId`
+  — always that field, because it is the only field that can ask for more depth than the tree has — and a message
+  that states the cap and the depth it would have produced. Nothing is silently truncated: a tree that cannot be
+  built is refused, because a folder quietly dropped at level 101 is data the user can neither see nor delete.
+  **A note never produces this error**, in either direction: notes are leaves, so creating one or moving one cannot
+  deepen the tree, and the folder it lands in was already within the cap. A note whose `folderId` is unknown or
+  belongs to someone else is the `404` above. There is no depth `VALIDATION` carrying `details[].path` of
+  `folderId` for a client to write handling for.
+
 One number a client may act on is not in the body: a `429` from a rate limit carries `Retry-After` in whole
 seconds — the time the sliding window itself reports — and nothing else writes that header. The envelope above
 has nine codes and no retry shape, so the seconds stay a header instead of becoming a field only one endpoint
@@ -104,17 +127,17 @@ conflict (plan §11.4).
 | 9 | `POST /api/auth/password` | yes | `changePasswordSchema` | `204` | **PR-07** (`401 UNAUTHORIZED` when `currentPassword` is wrong or the acting session vanished; `400 VALIDATION` when the new secret breaks §10 — too short, over 512 bytes, or **equal to the account's own username** ignoring case, which the body schema refuses before argon2 runs, since the username it is checked against comes from the session and not from the body). The acting session is rotated and kept, every other session of that user is deleted, and the old password stops working — one transaction, so a failure at any of the three statements leaves the old password and every session exactly as they were) |
 | 10 | `POST /api/users` | owner | `createUserSchema` | `201 {user}` | **PR-07** (no `role` in the body, so this route can never mint a second owner; creates no session for the new account) |
 | 11 | `GET /api/users` | owner | — | `usersResponseSchema` (`{users: SessionUser[]}`) | **PR-07** (the whole list, oldest first, unpaginated) |
-| 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | PR-09 |
-| 13 | `POST /api/folders` | yes | `createFolderSchema` | `201 FolderNode` | PR-09 |
-| 14 | `PATCH /api/folders/:id` | yes | `patchFolderSchema` | `200 FolderNode` | PR-09 |
-| 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` (`folderDeletePath()`) | `204` | PR-09 |
-| 16 | `POST /api/notes` | yes | `createNoteSchema` | `201 NoteWithContent` | PR-09 |
-| 17 | `GET /api/notes/:id` | yes | — | `NoteWithContent` + `ETag: W/"v<version>"` | PR-09 |
+| 12 | `GET /api/tree` | yes | — | `treeResponseSchema` (metadata, **no content**) | **PR-09** (two flat lists, folders then notes, each ordered by `name collate "C"` then `id` so a `C` and an `en_US.utf8` cluster answer the same way; one recursive CTE for the folders and one flat select for the notes, so the payload is never an N+1; a note body never crosses this wire, and a 99-deep chain renders complete) |
+| 13 | `POST /api/folders` | yes | `createFolderSchema` | `201 FolderNode` | **PR-09** (the root is an explicit `parentId: null`, never `""`; a sibling already holding the name is `409 CONFLICT` with `data.id` of the winner; the 101st level is `400 VALIDATION` naming the 100-level cap rather than a silent truncation; takes the per-user advisory lock, as do 14 and 15) |
+| 14 | `PATCH /api/folders/:id` | yes | `patchFolderSchema` | `200 FolderNode` | **PR-09** (rename and/or move in one request, applied as **one** `UPDATE` so the sibling index judges the `(parent, name)` the caller asked for rather than a half-applied pair; a no-op rename, and a move to the parent it is already in, are success rather than a conflict; moving a folder under its own descendant is `409`, while a move whose subtree would land below the cap is `400 VALIDATION` with `details[].path` of `parentId` — which a destination-depth check alone cannot see; two concurrent moves of one user serialize, one commits and one answers `409`) |
+| 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` (`folderDeletePath()`) | `204` | **PR-09** (without `cascade`, a folder with child folders or notes answers `409 CONFLICT`; with it, one `DELETE` and `ON DELETE CASCADE` take the subtree and every note in it; the row is the caller's or the answer is `404`, and the same sentence answers a row that never existed) |
+| 16 | `POST /api/notes` | yes | `createNoteSchema` | `201 NoteWithContent` | **PR-09** (every field optional: no body is a valid note, so the server generates `new-file-<msepoch>` — stored extension-free — and seals the empty string, which is a real envelope and never empty cipher/iv columns; `folderId` is looked up scoped to the caller first, so another user's folder is `404`, not a `500` about a foreign key; a request with **no body at all** is that same request and is valid — the route defaults it, because Fastify hands the handler `undefined` when no `Content-Type` was announced — whereas a request that declares `application/json` and sends an empty body is refused by the transport itself, with the same `VALIDATION` code) |
+| 17 | `GET /api/notes/:id` | yes | — | `NoteWithContent` + `ETag: W/"v<version>"` | **PR-09** (the tag is weak on purpose — the validator is a version counter, not a hash of bytes a server that cannot read the plaintext could compute. A stored body whose GCM tag does not verify answers `500 INTERNAL` with the note id in the log, **never** `content: ""`, which a client would happily overwrite) |
 | 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) | PR-10 (the read side, #17, is PR-09) |
-| 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | PR-09 |
-| 20 | `DELETE /api/notes/:id` | yes | — | `204` | PR-09 |
+| 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | **PR-09** (rename and/or re-file in one request, applied as **one** `UPDATE` inside one transaction, so the sibling index judges the `(folder, name)` the request asked for and never a half-applied pair — and a move whose destination already holds the name is `409 CONFLICT` carrying that row's id; `folderId: null` moves to the root and a name that still ends in `.md` is stripped once on the way in; `version` is untouched, so renaming never invalidates an open editor) |
+| 20 | `DELETE /api/notes/:id` | yes | — | `204` | **PR-09** (hard delete of the row and its envelope; a second delete answers `404`) |
 | 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | — | `searchResponseSchema` | PR-11 |
-| 22 | `GET /api/settings`, `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | PR-09 |
+| 22 | `GET /api/settings`, `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | **PR-09** (get-or-create: a caller with no row reads the column defaults with `200` and leaves exactly one row behind, which the next `GET` reads back, so PR-16 has no "settings missing" state to render; `PATCH` ensures the same row, so it can never be a zero-row write reported as success, and it is partial but never empty) |
 
 ## Examples
 

@@ -16,7 +16,7 @@
  */
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 
-import type { Db } from '../client.js';
+import type { Db, DbOrTx } from '../client.js';
 import { newId } from '../ids.js';
 import { expectOne, firstOrNone } from '../rows.js';
 import { type Note, notes } from '../schema.js';
@@ -41,6 +41,13 @@ export interface CreateNoteInput {
   /** WITHOUT the `.md` suffix (`stripMd()` in `contracts/names.ts`, PR-05, applied by PR-09). */
   readonly name: string;
   readonly content: SealedContent;
+  /**
+   * The row's id. PR-09 passes one it generated **before** it sealed the body, because the envelope's AAD is
+   * `note:<uuid>` (plan §10): the id has to exist before the ciphertext does, and `sealNoteContent()` cannot be
+   * handed an id a later insert would invent. Omitted, `newId()` still mints one — which is what PR-04's
+   * fixture-path tests do, and the only thing they assert about the blob is that the exact bytes round-trip.
+   */
+  readonly id?: string;
 }
 
 export interface NoteKey {
@@ -61,12 +68,15 @@ function contentColumns(content: SealedContent) {
   };
 }
 
-/** Creates a note with its first sealed version. A sibling already holding `name` raises 23505. */
+/**
+ * Creates a note with its first sealed version. A sibling already holding `name` raises `notes_unique_sib`
+ * (SQLSTATE 23505), which is the answer to a name clash the caller checked and lost.
+ */
 export async function createNote(db: Db, input: CreateNoteInput): Promise<Note> {
   const inserted = await db
     .insert(notes)
     .values({
-      id: newId(),
+      id: input.id ?? newId(),
       userId: input.userId,
       folderId: input.folderId ?? null,
       name: input.name,
@@ -76,7 +86,11 @@ export async function createNote(db: Db, input: CreateNoteInput): Promise<Note> 
   return expectOne(inserted, 'insert into notes');
 }
 
-export async function noteById(db: Db, key: NoteKey): Promise<Note | undefined> {
+/**
+ * The note the caller owns, or nothing. `DbOrTx` because `services/note.service.ts` reads it inside the same
+ * transaction that then writes the row, so the check and the write cannot be separated by another writer.
+ */
+export async function noteById(db: DbOrTx, key: NoteKey): Promise<Note | undefined> {
   const found = await db
     .select()
     .from(notes)
@@ -85,9 +99,12 @@ export async function noteById(db: Db, key: NoteKey): Promise<Note | undefined> 
   return firstOrNone(found);
 }
 
-/** The sibling lookup behind "that file name is taken": the same comparison `notes_unique_sib` makes. */
+/**
+ * The sibling lookup behind "that file name is taken": the same comparison `notes_unique_sib` makes, over the
+ * folder the note is about to **land** in (see {@link patchNote}).
+ */
 export async function noteByFolderAndName(
-  db: Db,
+  db: DbOrTx,
   input: { readonly userId: string; readonly folderId: string | null; readonly name: string },
 ): Promise<Note | undefined> {
   const found = await db
@@ -143,27 +160,34 @@ export async function recentNotes(
     .limit(input.limit ?? 10);
 }
 
-/** Renames a note; `undefined` means it was not the caller's to rename. */
-export async function renameNote(
-  db: Db,
-  input: NoteKey & { readonly name: string },
+/**
+ * The one statement behind `PATCH /api/notes/:id`: rename, move, or **both at once**.
+ *
+ * Two separate updates were the bug this function exists to prevent. A rename followed by a move put the row in
+ * the position *half* of the request described at the moment `notes_unique_sib` was consulted, so a
+ * `PATCH {name, folderId}` naming a name that the note's **current** folder already held was refused with a
+ * `409` for a clash in the folder the note was on its way out of — and a move that failed after the rename had
+ * committed left exactly half of one request applied, with no way for the client to be told which half happened.
+ * Writing both columns in one UPDATE means the index judges the row by the `(folder_id, name)` the caller asked
+ * for, and there is no state in between for anyone to observe.
+ *
+ * Like every statement here it is scoped by `user_id`, so `undefined` means the note was not the caller's, and
+ * it takes {@link DbOrTx} because `services/note.service.ts` runs it inside the transaction that checked the
+ * destination. `version` is **not** touched: renaming and re-filing are not content edits (§8, DATA-MODEL §2),
+ * and PR-10's optimistic lock must not be disturbed by something the user did in the sidebar.
+ */
+export async function patchNote(
+  db: DbOrTx,
+  input: NoteKey & { readonly name?: string | undefined; readonly folderId?: string | null | undefined },
 ): Promise<Note | undefined> {
   const updated = await db
     .update(notes)
-    .set({ name: input.name, updatedAt: new Date() })
-    .where(and(eq(notes.id, input.id), eq(notes.userId, input.userId)))
-    .returning();
-  return firstOrNone(updated);
-}
-
-/** Moves a note between folders (`folderId: null` = the root). */
-export async function moveNote(
-  db: Db,
-  input: NoteKey & { readonly folderId: string | null },
-): Promise<Note | undefined> {
-  const updated = await db
-    .update(notes)
-    .set({ folderId: input.folderId, updatedAt: new Date() })
+    .set({
+      ...(input.name === undefined ? {} : { name: input.name }),
+      // Only an *absent* key means "leave it where it is"; `folderId: null` is the root, and it is a change.
+      ...(input.folderId === undefined ? {} : { folderId: input.folderId }),
+      updatedAt: new Date(),
+    })
     .where(and(eq(notes.id, input.id), eq(notes.userId, input.userId)))
     .returning();
   return firstOrNone(updated);
@@ -225,4 +249,64 @@ export async function deleteNote(db: Db, key: NoteKey): Promise<boolean> {
     .where(and(eq(notes.id, key.id), eq(notes.userId, key.userId)))
     .returning({ id: notes.id });
   return deleted.length > 0;
+}
+
+/**
+ * The names one folder already holds (`folderId: null` for the root).
+ *
+ * PR-09's service asks this **only for a generated name**, so `uniquify()` can pick `plan-2` instead of losing
+ * the insert: a client-sent name must clash rather than be renamed behind the caller's back, so this list is
+ * never consulted for one. Names only, deliberately — a folder listing for the same question would drag every
+ * note body in the folder through the driver as ciphertext nobody reads.
+ */
+export async function noteNamesInFolder(
+  db: Db,
+  input: { readonly userId: string; readonly folderId: string | null },
+): Promise<string[]> {
+  const found = await db
+    .select({ name: notes.name })
+    .from(notes)
+    .where(
+      and(
+        eq(notes.userId, input.userId),
+        input.folderId === null ? isNull(notes.folderId) : eq(notes.folderId, input.folderId),
+      ),
+    );
+  return found.map((row) => row.name);
+}
+
+/**
+ * How many notes sit **directly** in one folder (`folderId: null` for the root), the second half of PR-09's
+ * "is this folder empty?" test — a folder holding only notes is not empty just because it has no child folders.
+ */
+export async function countNotesInFolder(
+  db: Db,
+  input: { readonly userId: string; readonly folderId: string | null },
+): Promise<number> {
+  const found = await db
+    .select({ id: notes.id })
+    .from(notes)
+    .where(
+      and(
+        eq(notes.userId, input.userId),
+        input.folderId === null ? isNull(notes.folderId) : eq(notes.folderId, input.folderId),
+      ),
+    );
+  return found.length;
+}
+
+/**
+ * Every note the user has, for `GET /api/tree`, in the byte order the endpoint promises.
+ *
+ * Notes need no recursion — a note has one `folder_id` and no children — so the tree is this one flat select
+ * beside `folders.repo.ts`'s one recursive CTE, and neither is per-folder: no listing in this file is an N+1.
+ * `collate "C"` matches the folder half so the two lists the client joins are ordered the same way on every
+ * cluster (§4 #12).
+ */
+export async function listNotesForTree(db: Db, input: { readonly userId: string }): Promise<Note[]> {
+  return db
+    .select()
+    .from(notes)
+    .where(eq(notes.userId, input.userId))
+    .orderBy(sql`${notes.name} collate "C"`, asc(notes.id));
 }

@@ -201,6 +201,37 @@ jobs:
             echo '::error::the failure must name the POSTGRES_* trio as the other option'
             exit 1
           }
+
+          # 4. The promise in `scripts/check-env.ts`'s own header — "it never echoes a value that could be key
+          #    material" — asserted where it was actually broken once: a malformed line is reported by printing
+          #    the offending text, and the offending text here *is* the key (an inline `#` is a comment to
+          #    Compose and literal text to a sourced shell, so the line has to be named). Failure output is
+          #    pasted into tickets, so the rule is: report the shape, never the value. Grepping the key out of
+          #    the log is the whole test, and `cat` above/below is what a failure has to show.
+          if DOTENV_PATH=scripts/fixtures/prod-redaction.env pnpm check:env >"$report/redaction.log" 2>&1; then
+            echo '::error::a NOTE_ENCRYPTION_KEY line with an inline comment passed check:env; the readers disagree about its value'
+            exit 1
+          fi
+          grep -q 'inline' "$report/redaction.log" || {
+            echo '::error::the malformed-line rule was not reported, so there is nothing to check for leakage'
+            cat "$report/redaction.log"
+            exit 1
+          }
+          #    The grep uses a prefix, deliberately: the leak this guard exists for printed the *first 40
+          #    characters* of a 44-character key, so grepping for the whole value would have passed a real
+          #    leak. 20 characters is long enough to be distinctive about this fixture and short enough to
+          #    survive any truncation the reporter applies. A failure prints the log with the match masked,
+          #    because a CI log about a key leak must not itself leak the key.
+          if grep -qF "${FIXTURE_KEY:0:20}" "$report/redaction.log"; then
+            echo '::error::check:env printed the key it was reporting on — report shape and length, never the value'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/redaction.log"
+            exit 1
+          fi
+          grep -q 'not printed' "$report/redaction.log" || {
+            echo '::error::the redacted preview is missing its length-only form'
+            cat "$report/redaction.log"
+            exit 1
+          }
       # The same three properties the runbook's §2 preflight promises an operator, asserted where a runner
       # has Docker: `config` fails naming the variable, `config` succeeds once the key exists, and what it
       # composes is a DSN with host `db` on a pinned `PORT` with a `production` mode — with no `NODE_ENV` and

@@ -38,7 +38,11 @@
  *
  * It never contacts Docker, a database or a key server; it never reads the file `NOTE_ENCRYPTION_KEY_FILE`
  * names (that path exists inside the container); and it never echoes a value that could be key material —
- * base64 in a terminal is base64 in a ticket. Values are judged by shape and length only.
+ * base64 in a terminal is base64 in a ticket. Values are judged by shape and length only. That promise covers
+ * the *failure* paths too, which is where it was nearly broken: a malformed line, a duplicated key and a
+ * `NOTE_ENCRYPTION_KEY_PREVIOUS` map tag all print the offending text, and the offending text is routinely a
+ * key someone typed into the wrong place — so those three report length instead (`previewLine`,
+ * `previewValue`, `safeTag`).
  */
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -228,6 +232,31 @@ function previewValue(name: string, value: string): string {
   return preview(value);
 }
 
+/**
+ * The same rule for a line that never parsed into a name, so there is no `name` to hand to `previewValue()`.
+ * Malformed lines are where the leak was: the shape of the line is the problem, and the text that makes it a
+ * problem is exactly the text an operator typed as a key. A line is therefore judged by which documented
+ * variable it mentions — any of `SECRET_KEYS`, at a word boundary, and the line contributes its length.
+ */
+function previewLine(line: string): string {
+  const named = SECRET_KEYS.find((name) => new RegExp(`(^|[^A-Za-z0-9_])${name}(?![A-Za-z0-9_])`).test(line));
+  if (named !== undefined) return `<${line.trim().length} chars, mentions ${named}, not printed>`;
+  return preview(line);
+}
+
+/**
+ * How much of a `NOTE_ENCRYPTION_KEY_PREVIOUS` map key may be printed. A valid tag is a small integer, and a
+ * short typo like `v1` is worth showing; anything longer is reported by length alone, because an operator who
+ * pasted the base64 into the *wrong half* of the pair would otherwise have the key printed inside a label.
+ * `crypto/keys.ts` reports that case by length for the same reason.
+ */
+function safeTag(tag: string): string {
+  const version = Number(tag);
+  const valid = /^\d+$/.test(tag) && version >= 1 && version <= MAX_KEY_VERSION;
+  if (valid || /^[A-Za-z0-9._-]{1,8}$/.test(tag)) return tag;
+  return `<${tag.length} chars, not printed>`;
+}
+
 const EXPORT_LINE = /^export\s+[A-Za-z_][A-Za-z0-9_]*=/;
 const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
 const OPENING_QUOTE = /^['"]/;
@@ -278,7 +307,7 @@ export function parseDotenv(text: string): ParsedDotenv {
         reason:
           '"export" is shell syntax that Compose does not understand, and the runbook sources this very ' +
           'file with `set -a; . ./.env; set +a`, which already exports every line: drop the "export "',
-        found: preview(trimmed),
+        found: previewLine(trimmed),
       });
       return;
     }
@@ -288,7 +317,7 @@ export function parseDotenv(text: string): ParsedDotenv {
       malformed.push({
         line,
         reason: 'not a KEY=value line (a comment needs "#" at the start of the line)',
-        found: preview(trimmed),
+        found: previewLine(trimmed),
       });
       return;
     }
@@ -304,7 +333,7 @@ export function parseDotenv(text: string): ParsedDotenv {
         reason:
           'an inline "#" is a comment to Compose and literal text to a sourced shell; put the comment on ' +
           'its own line',
-        found: preview(rawValue),
+        found: previewValue(key, rawValue),
       });
       return;
     }
@@ -316,7 +345,7 @@ export function parseDotenv(text: string): ParsedDotenv {
         reason:
           'the value opens a quote it never closes: Compose hands the container the quote mark itself, and ' +
           'a sourcing shell waits for the closing quote',
-        found: preview(rawValue),
+        found: previewValue(key, rawValue),
       });
       return;
     }
@@ -327,7 +356,7 @@ export function parseDotenv(text: string): ParsedDotenv {
       duplicates.push({
         line,
         reason: `${key} is assigned twice (line ${previous} and line ${line}): one of the two values is ignored`,
-        found: preview(value),
+        found: previewValue(key, value),
       });
       return;
     }
@@ -572,15 +601,15 @@ function checkNoteKey(report: Report): void {
     if (!/^\d+$/.test(tag) || Number(tag) < 1 || Number(tag) > MAX_KEY_VERSION) {
       report.fail(
         `${KEY_PREVIOUS} keys must be positive integer versions within notes.key_version (got ` +
-          `${preview(tag)}): the key is moved here as \`{"<old version>": "<old base64>"}\``,
+          `${safeTag(tag)}): the key is moved here as \`{"<old version>": "<old base64>"}\``,
       );
       continue;
     }
     if (typeof material !== 'string') {
-      report.fail(`${KEY_PREVIOUS}[${tag}] must be a base64 string`);
+      report.fail(`${KEY_PREVIOUS}[${safeTag(tag)}] must be a base64 string`);
       continue;
     }
-    const problem = keyProblem(`${KEY_PREVIOUS}[${tag}]`, material);
+    const problem = keyProblem(`${KEY_PREVIOUS}[${safeTag(tag)}]`, material);
     if (problem !== undefined) report.fail(problem);
     if (version !== undefined && Number(tag) === version) {
       report.fail(

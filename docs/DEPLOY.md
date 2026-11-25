@@ -111,8 +111,12 @@ travels through a chat message — see §5 for why losing it is unrecoverable.)
 container and the app's DSN, and the runbook's shell reads them for `pg_dump` (§5).
 `POSTGRES_PASSWORD` **must be URL-safe** — generate it with `openssl rand -hex 32`: both DSN compositions
 embed it **raw** and nothing percent-encodes on the way, so `@ : / + % ? #` silently corrupts the URL and
-the app connects somewhere else, or nowhere. `env.ts` refuses those characters in every mode, and
-`pnpm check:env` refuses them in the file. Add `HOST_PORT=8080` too if you do not want `:3000` (see step 5).
+the app connects somewhere else, or nowhere. **`pnpm check:env` is the only thing that checks this**, and it is
+optional: `env.ts` refuses those characters where it *derives* a DSN (`dsnComponent()`, i.e. development and
+test), while inside this stack Compose hands it a composed one and it is used verbatim — nothing at boot
+re-inspects a password that has already become a URL. So run the preflight in step 2b; the alternative is
+discovering a bad password as a connection failure (§9). Add `HOST_PORT=8080` too if you do not want `:3000`
+(see step 5).
 
 **2b. Preflight, with Docker alone** (this host may still have no Node):
 
@@ -162,9 +166,12 @@ docker inspect --format '{{.State.Health.Status}}' "$(docker compose --env-file 
 **4. Create the owner.** Open `http://<host>:<HOST_PORT>` → `/setup` → create the first owner. That is the
 only door: `ALLOW_REGISTRATION` is `false` by default, and `/setup` closes behind its first owner.
 
-**5. Verify what this file claims.** Each of these is the acceptance check for a paragraph above it.
+**5. Verify what this file claims.** Each of these is the acceptance check for a paragraph above it. Source the
+file first (§1): step 2 may have written `HOST_PORT=8080`, and an unsourced `${HOST_PORT:-3000}` curls `:3000`
+and reports a failure that does not exist.
 
 ```bash
+set -a; . ./.env; set +a                    # §1: --env-file fills Compose's interpolation, not this shell
 curl -fsS "http://localhost:${HOST_PORT:-3000}/api/healthz"                     # ok from the host
 docker compose --env-file .env -f docker/compose.yml exec app \
   node -e "console.log(process.env.NODE_ENV)"                                   # production
@@ -197,10 +204,25 @@ docker compose --env-file .env -f docker/compose.yml exec app \
 By default the key lives in `.env`. The alternative is `NOTE_ENCRYPTION_KEY_FILE`, which the keyring reads at
 boot through `readNoteEncryptionKey()` in `apps/server/src/env.ts`, so the key never appears in a shell, in
 `docker inspect`, or in a file someone might commit.
-Compose interpolation cannot express "either this variable or that one", so this variant is an explicit edit
-to `docker/compose.yml` — four pieces, all required:
 
-1. in the `app` service, mount the volume: `volumes: [- notes-keys:/run/secrets]`;
+**0. Take the key into this shell before anything else**, because piece 3 deletes it from `.env` and the writer
+below reads it from stdin:
+
+```bash
+set -a; . ./.env; set +a
+: "${NOTE_ENCRYPTION_KEY:?the §2 key is still required in .env until this section is finished}"
+```
+
+That is §1's convention, applied here where it matters most: `--env-file .env` populates Compose's interpolation
+and the containers' environment, never the shell you are typing in. Skip it and `$NOTE_ENCRYPTION_KEY` is empty
+when the writer runs, which fails safe — `the value on stdin is not base64 of 32 bytes; nothing was written` —
+but reads like a broken key generator.
+
+Then the edit itself: Compose interpolation cannot express "either this variable or that one", so this variant is
+an explicit edit to `docker/compose.yml` — four pieces, all required:
+
+1. in the `app` service, mount the volume: `volumes: [notes-keys:/run/secrets]` — block style
+   (`- notes-keys:/run/secrets`) is fine too; what is not valid is `- ` *inside* `[ … ]`;
 2. in `app.environment:`, add `NOTE_ENCRYPTION_KEY_FILE: /run/secrets/note_key`;
 3. **delete** the `NOTE_ENCRYPTION_KEY: ${NOTE_ENCRYPTION_KEY:?…}` line (otherwise `config` still demands a
    variable you have decided not to use), and keep `NOTE_ENCRYPTION_KEY` **out** of `.env`;
@@ -273,9 +295,11 @@ Four details in that block are load-bearing.
 The write is `mode: 0600` for the reason it is written at all: a key file another user of the host can read
 is a key file that user has — `0644` would be the sloppy way to make the same file world-readable.
 
-To move an *existing* installation onto a mounted key, `set -a; . ./.env; set +a` first (§1) so
-`$NOTE_ENCRYPTION_KEY` is the key the database was already written with, and pipe that value in: the command
-above refuses anything that is not base64 of 32 bytes, so a mistyped paste writes nothing.
+To move an *existing* installation onto a mounted key, step 0 is the whole preparation: `$NOTE_ENCRYPTION_KEY`
+has to be the key the database was already written with, and on a running install that is the line still in
+`.env` — so source it before piece 3 deletes it. The writer refuses anything that is not base64 of 32 bytes, so
+a mistyped paste writes nothing; what it cannot tell is a *valid but different* key, which is why a key change is
+§7 and this section is only about where the same key is stored.
 
 A trailing newline is fine — that is what `echo` writes, and `readNoteEncryptionKey()` tolerates it. Changing
 which key the rows are sealed with is §7; this section only changes **where the same key is stored**, and a
@@ -300,7 +324,7 @@ reports shape and length, not content.
 | `PORT` | `3000` | — | port the **container** listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping — the operator-facing port knob |
 | `POSTGRES_USER` | `notetaker` | ✔ **in `.env` whenever compose is used** | role created by the `db` service; the runbook's shell commands read it, so it must be written into `.env` (Compose's `${VAR:-notetaker}` covers Compose interpolation only) |
-| `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the only secret the `db` container needs. **Must be URL-safe** — generate with `openssl rand -hex 32`: both DSN compositions embed it **raw** and nothing percent-encodes, so `@ : / + % ? #` silently corrupt the URL |
+| `POSTGRES_PASSWORD` | `notetaker` | ✔ for the compose stack | the only secret the `db` container needs. **Must be URL-safe** — generate with `openssl rand -hex 32`: both DSN compositions embed it **raw** and nothing percent-encodes, so `@ : / + % ? #` silently corrupt the URL. `pnpm check:env` is the only thing that checks it (§2 step 2) |
 | `POSTGRES_DB` | `notetaker` | ✔ **in `.env` whenever compose is used** | db created on first init; interpolated into the app's DSN; also the base for the restore drill's `<db>_restore` |
 | `POSTGRES_PORT` | `5432` | — | **dev-only** — appears solely in `docker/compose.dev.yml`; the prod `db` publishes nothing (`check:env` warns about it in a production file) |
 | `DATABASE_URL` | **unset ⇒ derived** (`postgres://<user>:<pw>@localhost:<port>/<db>` on the host); **set ⇒ verbatim** | ✔ **required in `production`** (in the process) | do **not** set it in the compose stack: `compose.yml` derives it in the `app` service `environment:` block (which beats `env_file:`) with host `db`. `.env.example` ships **no** `DATABASE_URL` line. The one place a runbook sets it explicitly is the restore drill (`run -e DATABASE_URL=…`) |
@@ -606,7 +630,8 @@ existed a moment ago.
 | `no note-encryption key: set NOTE_ENCRYPTION_KEY …` in `app` logs | The key reached the container empty (a `KEY=` line with nothing after the `=` is an empty value, not the default). `pnpm check:env` names that shape; production never generates a key, and never falls back to plaintext. |
 | `NOTE_ENCRYPTION_KEY_FILE (/run/secrets/note_key) could not be read: EACCES`, and `app` restarts forever without reaching `healthy` | The key file exists but its owner is not the user the app runs as — the §3 writer ran as root and did not chown, so a `0600` file is readable only by a user that is not this one. Re-run the §3 writer with the `app_uid`/`app_gid` it reads from the app image, and check with `exec app sh -c 'head -c 0 "$NOTE_ENCRYPTION_KEY_FILE"'`, which opens the file and prints nothing. |
 | `DATABASE_URL is required in production` | `DATABASE_URL` reached the process unset — the `environment:` block in `compose.yml` composes it from the trio, so check the trio is complete in `.env` (§4), and that you did not set `DATABASE_URL=` (empty) in the file. |
-| `POSTGRES_PASSWORD must match [A-Za-z0-9]+` | The password has a reserved URL character and would have built a DSN pointing elsewhere. `openssl rand -hex 32`, and note that changing the *role's* password in the database is a separate statement (`ALTER ROLE`) the runbook does not do for you. |
+| `POSTGRES_PASSWORD must match [A-Za-z0-9]+` | From `pnpm check:env` — the container never prints this, because by the time a container runs the password is already inside a DSN it did not build. The character that did it is in `docs/DEPLOY.md` §2 step 2. `openssl rand -hex 32`, and note that changing the *role's* password in the database is a separate statement (`ALTER ROLE`) the runbook does not do for you. |
+| `app` logs a Postgres connection or authentication failure, while `db` is `healthy` and `pg_isready` passes | The DSN Compose composed is not the DSN anyone means: usually a `POSTGRES_PASSWORD` containing `@ : / + % ? #`, since nothing percent-encodes the interpolation (§2 step 2 — `check:env` is the only check, and skipping it lands here), sometimes the role's password being changed with `ALTER ROLE` without `.env` following it. `pnpm check:env` names the shape; `docker compose … exec -T db pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"` proves the database side. |
 | `app` never becomes `healthy` | The healthcheck probes `http://127.0.0.1:3000/api/healthz` and a `503` counts as failing, so an app that cannot reach `db` is *unhealthy*, not healthy-with-a-problem. `logs app` first, then `ps` to see whether `db` is `healthy`; a fresh volume needs `initdb`, and `depends_on: service_healthy` waits for it. |
 | `SESSION_TTL_DAYS must be <= 365 in production` | Production invariant, on purpose. §4. |
 | `SECURE_COOKIES must be true when TRUST_PROXY is true` | §8's TLS section. If you are not behind TLS, set `TRUST_PROXY=false`; if you are, set `SECURE_COOKIES=true`. |

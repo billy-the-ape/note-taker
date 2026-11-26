@@ -304,8 +304,15 @@ export interface Autosaver {
   readonly flushOnHide: () => 'keepalive' | 'ordinary';
   readonly snapshot: () => AutosaveSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
+  /** The text the editor renders — not the published snapshot, which is the screen's window (§4). */
   readonly getBuffer: () => string;
   readonly isDirty: () => boolean;
+  /**
+   * How much **prose** is unsaved, in UTF-8 bytes of the buffer — a human-facing quantity, and *not* the
+   * number the `keepalive` cap applies to. That one is {@link contentWriteBytes}, because the request
+   * body is bigger than its text once anything needs escaping; comparing one with the other is how the
+   * unload path used to promise a save it could not make (§6).
+   */
   readonly getUnsavedBytes: () => number;
 }
 

@@ -10,11 +10,10 @@ response body against the schema it names. Nothing generates this file and no CI
 routes: it is maintained by hand, and `AGENTS.md` requires it to change in the same PR as the contract it
 describes.
 
-> **Status.** Only `GET /api/health` and `GET /api/healthz` are implemented today (by `apps/server`).
-> Everything else below is the contract this PR pins, which the route PRs (**PR-07**, **PR-09**,
-> **PR-10**, **PR-11**) implement; the "Lands in" column says which one, and the UI PRs (**PR-08**,
-> **PR-12…PR-17**) only consume it. Until then an unknown path answers the envelope with
-> `NOT_FOUND`, which is the shape every later route keeps.
+> **Status.** Everything below is implemented except `GET /api/search` (**PR-11**): `apps/server` serves rows 1–20
+> and 22 today, and the "Lands in" column says which PR put each one there. The UI PRs (**PR-08**,
+> **PR-12…PR-17**) only consume it. An unknown path answers the envelope with `NOT_FOUND`, which is the shape every
+> route keeps.
 
 ## Conventions
 
@@ -24,7 +23,8 @@ describes.
 | Content type | `application/json; charset=utf-8` both ways. Requests use `UTF-8` explicitly so the 1 MiB body cap is measured in bytes on the way in, not in characters. Two doors, and a client has to tell them apart: a body that is JSON but breaks the route's schema is `400 VALIDATION`, while a body the transport will not parse (any content type with no registered parser, e.g. a `text/plain` form post) is refused before routing with `415`, which keeps its status and carries `VALIDATION` because `apiErrorCodeForStatus(415)` is deliberately undefined (**PR-09**). Neither ever answers `INTERNAL`, and neither writes a row. |
 | Auth | The `HttpOnly` `note_session` cookie (plan §10). "Auth: yes" below means a valid session is required; `GET /api/auth/session` answers with `{ user: null }` instead of failing. Guards run in one order: the CSRF hook is an app-wide `onRequest`, so a mutation that has **neither** a session nor a valid `X-CSRF-Token` is refused `403 FORBIDDEN` and never reaches the session check — `401 UNAUTHORIZED` therefore means "the token half was fine; the session is not". A signed-out browser recovers from the `403` by refetching `GET /api/auth/status` for a fresh pair (which is not a credential and is handed to anybody), which is why `apps/web/src/lib/api.ts` treats `403` as refresh-and-replay-once and `401` as route-to-sign-in. |
 | CSRF | Every mutation (`POST`/`PUT`/`PATCH`/`DELETE`) carries `X-CSRF-Token`, echoing the non-`HttpOnly` `note_csrf` cookie (`Max-Age` 1 day, shorter than the session). `GET /api/auth/status` issues it, and every `setup`/`login`/`register`/`logout` response re-issues a fresh one, so it is never older than the browser session carrying it. `login`/`setup`/`register` are exempt (`CSRF_EXEMPT_ROUTES`) and guarded by `Origin`/`Sec-Fetch-Site` instead (**PR-07**). The pair is deliberately **not** bound to a `sessions` row: double-submit equality plus the origin check is what does the binding in a single-instance MVP. The origin a request is measured against is the API's own `protocol` + `Host`; with `TRUST_PROXY=true` the `X-Forwarded-Host`/`X-Forwarded-Proto` pair wins (its **last** value), because a proxy that rewrites `Host` — nginx's default `proxy_set_header Host $proxy_host`, and this repo's own dev proxy until PR-07's review — would otherwise answer every same-origin browser mutation with `403`. `apps/web/vite.config.ts` therefore pins `changeOrigin: false`, and a proxy in front of a deployed instance has to pass `Host` through or send both forwarded headers. Trusting the forwarded host is not a blanket pass: an `Origin` that differs from it is still refused. |
-| Payload cap | 1 MiB request body (Fastify `bodyLimit`) → `PAYLOAD_TOO_LARGE` (413). The UI warns at 900 KiB. |
+| Payload cap | 1 MiB request body (Fastify `bodyLimit`) → `PAYLOAD_TOO_LARGE` (413). The UI warns at 900 KiB. It is one app-level cap (`MAX_NOTE_BYTES`, `apps/server/src/app.ts`) rather than a per-route one, so a note cannot be written past it by any route; the schema refuses an over-cap `content` too, which is the door an internal caller — one that reaches the service without a transport — meets instead (**PR-10**). |
+| Concurrency | `GET /api/notes/:id` answers `ETag: W/"v<version>"`, and `PUT /api/notes/:id/content` answers the new one with its `200`. `If-Match` on that write is **optional**: absent means the body's `baseVersion` decides on its own, `*` means "whatever is there", and a tag naming a version other than the one being written against refuses the request without writing — as `VERSION_CONFLICT` (or `404`), never as a `412` this API has no code for. Both halves of that precondition are bounded by the same `int4` ceiling (`MAX_NOTE_VERSION`), so neither can carry a number the version column could never hold (**PR-10**). |
 | Timestamps | ISO-8601 UTC strings (`isoDateTimeSchema`), i.e. what `JSON.stringify(new Date())` produces. |
 | Ids | UUIDv7 strings. |
 | Lists | `{ items, total, limit, offset }` (`paginatedSchema()`), `limit` ≤ 100, default 50 — except the tree and search, which have their own shapes below. |
@@ -133,7 +133,7 @@ conflict (plan §11.4).
 | 15 | `DELETE /api/folders/:id` | yes | query `cascade=true` (`folderDeletePath()`) | `204` | **PR-09** (without `cascade`, a folder with child folders or notes answers `409 CONFLICT`; with it, one `DELETE` and `ON DELETE CASCADE` take the subtree and every note in it; the row is the caller's or the answer is `404`, and the same sentence answers a row that never existed) |
 | 16 | `POST /api/notes` | yes | `createNoteSchema` | `201 NoteWithContent` | **PR-09** (every field optional: no body is a valid note, so the server generates `new-file-<msepoch>` — stored extension-free — and seals the empty string, which is a real envelope and never empty cipher/iv columns; `folderId` is looked up scoped to the caller first, so another user's folder is `404`, not a `500` about a foreign key; a request with **no body at all** is that same request and is valid — the route defaults it, because Fastify hands the handler `undefined` when no `Content-Type` was announced — whereas a request that declares `application/json` and sends an empty body is refused by the transport itself, with the same `VALIDATION` code) |
 | 17 | `GET /api/notes/:id` | yes | — | `NoteWithContent` + `ETag: W/"v<version>"` | **PR-09** (the tag is weak on purpose — the validator is a version counter, not a hash of bytes a server that cannot read the plaintext could compute. A stored body whose GCM tag does not verify answers `500 INTERNAL` with the note id in the log, **never** `content: ""`, which a client would happily overwrite) |
-| 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) | PR-10 (the read side, #17, is PR-09) |
+| 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) + `ETag: W/"v<new version>"` | **PR-10** (the versioned write, and the read side #17 is PR-09: `baseVersion` is compared, never trusted, and `version + 1` happens in the **same** `UPDATE` as the new envelope, so two tabs holding one version cannot both win and a request killed mid-flight leaves no half-written note. A stale `baseVersion` is `VERSION_CONFLICT` carrying `data.content` and `data.version` — the server's current body and version, which PR-14's autosave compares with the exact snapshot it sent before it calls anything a conflict. The write filters on `user_id` too, so a note that is missing **or** somebody else's is re-read scoped and answered `404`, never the `409` that would confirm the row (and its content) exists. `If-Match` is optional and honoured when present (see Concurrency above); an empty `content` is legal and still stores a real envelope, and `content_bytes`/`word_count`/`content_updated_at` move with the body — the only endpoint that moves `version` at all. `baseVersion` is bounded by `MAX_NOTE_VERSION`, the `int4` ceiling of the column it is compared against: a body naming a version past it is `400 VALIDATION` on `baseVersion`, not a Postgres `22003` that `mapError()` can only report as `500`) |
 | 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | **PR-09** (rename and/or re-file in one request, applied as **one** `UPDATE` inside one transaction, so the sibling index judges the `(folder, name)` the request asked for and never a half-applied pair — and a move whose destination already holds the name is `409 CONFLICT` carrying that row's id; `folderId: null` moves to the root and a name that still ends in `.md` is stripped once on the way in; `version` is untouched, so renaming never invalidates an open editor) |
 | 20 | `DELETE /api/notes/:id` | yes | — | `204` | **PR-09** (hard delete of the row and its envelope; a second delete answers `404`) |
 | 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | — | `searchResponseSchema` | PR-11 |
@@ -178,6 +178,24 @@ means an empty sealed note, never empty cipher/iv columns.
 ```
 
 Same status as a name clash, different `code`: one is retried, the other needs a merge (§11.4).
+
+The success side of the same endpoint, which is the half the editor lives on:
+
+```jsonc
+// → PUT /api/notes/0198…/content      If-Match: W/"v6"   (optional; must agree with baseVersion)
+// → { "content": "my new text", "baseVersion": 6 }
+// ← 200                                ETag: W/"v7"
+{
+  "id": "0198…", "name": "Draft", "folderId": null, "version": 7,
+  "contentBytes": 11, "wordCount": 3, "content": "my new text",
+  "contentUpdatedAt": "2026-11-19T09:04:11.000Z",
+  "createdAt": "2026-11-19T09:00:00.000Z", "updatedAt": "2026-11-19T09:04:11.000Z"
+}
+```
+
+`version` moved by exactly one, `content_updated_at` moved with the body, and the `ETag` is the validator for the
+state the client just created — the next write may send it straight back as `If-Match`. A `PATCH` (rename or move)
+would have left `version` where it was (**PR-10**).
 
 ### `PATCH /api/notes/:id` — 400 validation
 

@@ -34,6 +34,7 @@ import {
 import {
   contentUpdateSchema,
   createNoteSchema,
+  MAX_NOTE_VERSION,
   NOTE_CONTENT_MAX_BYTES,
   NOTE_CONTENT_WARN_BYTES,
   noteIdParamsSchema,
@@ -357,6 +358,20 @@ describe('the note endpoints', () => {
     // `version` starts at 1, so a base of 0 is not a stale read, it is a bug.
     expect(contentUpdateSchema.safeParse({ content: 'text', baseVersion: 0 }).success).toBe(false);
     expect(contentUpdateSchema.safeParse({ content: 'text', baseVersion: 1.5 }).success).toBe(false);
+
+    // …and the field is bounded above too, because `notes.version` is an `int4`: past the ceiling the value is not
+    // a stale read but one the database cannot even compare (`22003`), so it is refused here rather than allowed
+    // to come back as a server error. Both the field and the response shape are bounded by the same constant,
+    // which is the number `crypto/keys.ts` uses for `notes.key_version`.
+    expect(contentUpdateSchema.safeParse({ content: 'text', baseVersion: MAX_NOTE_VERSION }).success).toBe(
+      true,
+    );
+    expect(noteSchema.shape.version.safeParse(MAX_NOTE_VERSION).success).toBe(true);
+    for (const baseVersion of [MAX_NOTE_VERSION + 1, 3_000_000_000, 99_999_999_999]) {
+      const over = contentUpdateSchema.safeParse({ content: 'text', baseVersion });
+      expect(over.success, String(baseVersion)).toBe(false);
+      if (!over.success) expect(over.error.issues[0]?.path).toEqual(['baseVersion']);
+    }
   });
 
   it('renames and moves, including to the root, but never both nothing', () => {

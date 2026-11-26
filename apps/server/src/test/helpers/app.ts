@@ -7,6 +7,7 @@
 import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 
 import { buildApp } from '../../app.js';
+import type { Keyring } from '../../crypto/keys.js';
 import type { Db } from '../../db/client.js';
 import { parseEnv } from '../../env.js';
 import { createTestLogger } from '../../logger.js';
@@ -25,6 +26,16 @@ export interface WithAppOptions {
    * an integration test's configuration is named in the test.
    */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * The keyring the note routes seal and open content with (PR-09/PR-10). Omitted, `buildApp()` takes
+   * {@link getKeyring} — the one process-wide ring, which is what nearly every suite wants.
+   *
+   * It is here for the two suites that need a row written under one key and read under another: a key rotation is
+   * not one process, it is the app restarted with a bumped `NOTE_ENCRYPTION_KEY_VERSION`, so a test that races a
+   * rotation has to be able to hold two rings at once. `getKeyring()` caches per process, so the alternative —
+   * pointing the env at the new key half way through a file — would leak into every later test in it.
+   */
+  readonly keyring?: Keyring;
   /**
    * A logger that is not the silent default (PR-09), for the one class of assertion the envelope makes
    * untestable from the response alone: a 500 whose useful half — which row failed — exists **only** in the log.

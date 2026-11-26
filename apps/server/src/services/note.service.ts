@@ -1,7 +1,8 @@
 /**
- * The note service: create, read, rename/move, delete (docs/plans/mvp/MVP-09.md §5.5–§5.6, plan §9.2 #16–#20).
+ * The note service: create, read, write content, rename/move, delete (docs/plans/mvp/MVP-09.md §5.5–§5.6,
+ * docs/plans/mvp/MVP-10.md §4–§5, plan §9.2 #16–#20).
  *
- * Four things about this file are the design, not incidental:
+ * Five things about this file are the design, not incidental:
  *
  * * **The id exists before the ciphertext does.** The envelope's AAD is `note:<uuid>` (plan §10), so
  *   `sealNoteContent()` needs the id the row will have; the service mints it with `newId()` and hands it to
@@ -23,11 +24,20 @@
  *   a clash in the folder the note was leaving, and a half-applied request when the second one failed. The
  *   whole of {@link NoteService.patch} therefore runs in one transaction, and the loser-of-a-race re-read runs
  *   outside it, because Postgres rejects every statement after a unique violation until the rollback.
+ * * **A content write is one conditional statement, and its zero rows are re-read before they are answered.**
+ *   `putContent` never reads the row it is about to overwrite: it seals the body and writes
+ *   `UPDATE … WHERE id AND user_id AND version = baseVersion RETURNING *` (plan Appendix A.2), so two tabs holding
+ *   the same version cannot both win and nothing between the two halves of a write can be observed half-done.
+ *   Zero rows back is *two* answers — a stale `baseVersion`, or a note that is not the caller's — and only a
+ *   scoped re-read tells them apart: {@link staleWrite} below is what keeps #18 answering `404` for somebody
+ *   else's id instead of `409`, and what hands the loser of the race the current server body to compare its own
+ *   buffer against (§9.2 #18, PR-14's engine).
  *
  * The name rules themselves are the contract's; this file only calls {@link storedNoteName} once, on the way
  * in. `domain/name.ts` explains why stripping twice is a bug rather than a redundancy.
  */
 import {
+  MAX_NOTE_VERSION,
   NOTE_CONTENT_MAX_BYTES,
   type NoteNode,
   type NoteWithContent,
@@ -47,9 +57,16 @@ import {
   noteById,
   noteNamesInFolder,
   patchNote,
+  writeNoteContent,
 } from '../db/repositories/notes.repo.js';
 import type { Note } from '../db/schema.js';
-import { ConflictError, NotFoundError, PayloadTooLargeError } from '../domain/errors.js';
+import {
+  ConflictError,
+  type DomainError,
+  NotFoundError,
+  PayloadTooLargeError,
+  VersionConflictError,
+} from '../domain/errors.js';
 import { generatedNoteName, nameClash, storedNoteName, uniqueNoteName } from '../domain/name.js';
 
 export interface NoteService {
@@ -59,6 +76,11 @@ export interface NoteService {
   readonly read: (input: NoteKey) => Promise<NoteWithContent>;
   /** `PATCH /api/notes/:id`: rename and/or move; returns metadata only, because nothing was decrypted. */
   readonly patch: (input: PatchNote) => Promise<NoteNode>;
+  /**
+   * `PUT /api/notes/:id/content` (§9.2 #18): the whole new body, applied only if `baseVersion` is still current.
+   * Returns the metadata row plus the new plaintext, with `version` moved by exactly one.
+   */
+  readonly putContent: (input: PutNoteContent) => Promise<NoteWithContent>;
   /** `DELETE /api/notes/:id`: the row and its ciphertext go together. */
   readonly remove: (input: NoteKey) => Promise<void>;
 }
@@ -76,6 +98,33 @@ export interface CreateNote {
   readonly folderId?: string | null;
   /** Absent means the empty string, sealed. */
   readonly content?: string | undefined;
+}
+
+/**
+ * The input of {@link NoteService.putContent}: `PUT /api/notes/:id/content` (§9.2 #18).
+ *
+ * `content` is the **whole** new body. There is no partial write of a note body on purpose: a patch of an
+ * encrypted body has nothing to patch against client-side and no conflict for a server that cannot read the
+ * plaintext to merge (§7: the merge UI is PR-25, not this API).
+ */
+export interface PutNoteContent {
+  readonly userId: string;
+  readonly id: string;
+  readonly content: string;
+  /** The `notes.version` the caller read that body at. */
+  readonly baseVersion: number;
+  /**
+   * Whether the request's `If-Match` admits `baseVersion`, as decided by `ifMatchAdmits()` in
+   * `routes/notes.routes.ts`. That file owns the header's syntax (`W/"v7"`, `"v7"`, `*`, a comma list); this
+   * layer owns what a violated precondition *means*, and it means the same answer a stale `baseVersion` gets.
+   *
+   * It arrives reduced to yes/no instead of as a version, because the two are not the same question: the
+   * precondition is about the version the body names, and a header naming a different one has contradicted the
+   * request carrying it whatever the row says. `true` — and absent, which is the same thing — leaves the
+   * conditional write to decide everything by itself; `false` writes nothing and is answered by the same scoped
+   * re-read the zero-row case gets.
+   */
+  readonly ifMatchAdmitsBase?: boolean | undefined;
 }
 
 /**
@@ -208,6 +257,31 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
       : nameClash(clash.id, 'note');
   }
 
+  /**
+   * The answer to "your content write did not happen", after the scoped re-read plan Appendix A.2 asks for.
+   *
+   * The conditional `UPDATE` filtered on `id` **and** `user_id`, so zero rows back means one of two things and
+   * the statement cannot say which: the caller's `baseVersion` is stale, or the note is not the caller's (or is
+   * gone). Re-reading scoped to the caller separates them, and it is the only thing standing between a client
+   * probing random uuids and a `409` that would confirm a foreign row exists — #18 answers `404`, never `409`,
+   * for an id it does not own (§5).
+   *
+   * The conflict half carries the **current server plaintext and version**, because that pair is what lets
+   * PR-14's autosave engine tell its own committed-but-unacknowledged write from a real collision: the client
+   * compares the returned body byte for byte with the snapshot it put on the wire (§9.2 #18). Producing it means
+   * decrypting the row we just declined to overwrite, so an `EnvelopeError` can surface here too — and it is
+   * mapped, not swallowed: `500 INTERNAL` beats a `409` quoting a body this process cannot read, which a client
+   * would then treat as the server's honest current state and overwrite.
+   *
+   * Returns rather than throws, exactly like {@link lostNameRace} above: the caller is one `throw await` away
+   * either way, and the two answers stay in one place.
+   */
+  async function staleWrite(userId: string, id: string): Promise<DomainError> {
+    const current = await noteById(db, { userId, id });
+    if (current === undefined) return new NotFoundError('note');
+    return new VersionConflictError(openNoteContent(current, keyring), current.version);
+  }
+
   return {
     async create({ userId, name, folderId = null, content }): Promise<NoteWithContent> {
       await assertFolderIsMine(db, userId, folderId);
@@ -279,6 +353,63 @@ export function createNoteService(options: NoteServiceOptions): NoteService {
       // `EnvelopeError` deliberately propagates: mapping it is `error-handler.ts`'s job, and catching it here to
       // return an empty body would turn a server fault into a note that looks empty.
       return toNoteWithContent(row, openNoteContent(row, keyring));
+    },
+
+    /**
+     * §9.2 #18 — the versioned write, as one statement (docs/plans/mvp/MVP-10.md §4, plan Appendix A.2).
+     *
+     * Three orders in this method are the point, and none of them is decoration:
+     *
+     * 1. **The cap is checked before the key is used**, exactly as `create` does it. Fastify's `bodyLimit` is
+     *    the door a request meets first (`MAX_NOTE_BYTES`, default 1 MiB → `413`), and the contract's own
+     *    `contentUpdateSchema` refuses an over-cap `content` on the way in; this is the net under a caller that
+     *    reached the service past both, and it has to come before the sealing because storing a body the API
+     *    calls illegal is worse than spending a round of AES on it.
+     * 2. **A precondition this request itself contradicts is settled before anything is written.** The
+     *    conditional update can only speak for `baseVersion`; if the caller's `If-Match` named a different
+     *    version then the write it asked for is the one the RFC forbids — "the method is applied only to a state
+     *    the precondition matches" — so nothing is written and the scoped re-read gives the honest answer (§5).
+     *    **A `baseVersion` the column cannot hold is settled the same way, for the same reason:** `notes.version`
+     *    is an `int4`, so comparing `3_000_000_000` in the `WHERE` is not "zero rows" but Postgres `22003` (value
+     *    out of range), which `mapError()` has no case for and would report as `500 INTERNAL` on the strength of a
+     *    number the caller invented. `noteVersionSchema` refuses such a body on the wire (**PR-10** review); the
+     *    check below is the net under a caller that reached the service past the schema, which is also where the
+     *    cap in 1 lives.
+     * 3. **Sealing comes after both, and the write is the only statement.** No read precedes the `UPDATE`: the
+     *    version is *compared*, never trusted, and `version + 1` happens in the same statement as the new
+     *    envelope, so two tabs that read the same version cannot both win and there is no intermediate state for
+     *    a crash — or a `pg_cancel_backend` — to land in. The empty string is a legal body and still stores a
+     *    12-byte IV and a 16-byte tag; `version` moves exactly once here and nowhere else (§5's rule, which is
+     *    also why `patch` above refuses to touch it and why PR-06's rotation never bumps it).
+     */
+    async putContent({
+      userId,
+      id,
+      content,
+      baseVersion,
+      ifMatchAdmitsBase,
+    }: PutNoteContent): Promise<NoteWithContent> {
+      if (utf8ByteLength(content) > NOTE_CONTENT_MAX_BYTES) {
+        throw new PayloadTooLargeError(NOTE_CONTENT_MAX_BYTES);
+      }
+      if (ifMatchAdmitsBase === false) throw await staleWrite(userId, id);
+      // A version outside the column cannot match any row, so it is the same fact as a stale one — and it must not
+      // reach the statement, where comparing it is a `22003` rather than an empty result set. `MAX_NOTE_VERSION`
+      // is the contract's own bound, the one `noteVersionSchema` applies to this field, so the wire and this net
+      // cannot disagree about what the domain is.
+      if (baseVersion < 1 || baseVersion > MAX_NOTE_VERSION) throw await staleWrite(userId, id);
+
+      // The AAD is the row's id, so the body is sealed against the id it will be stored under — the same id the
+      // write filters on, which is what makes a ciphertext copied from another note fail to authenticate.
+      const sealed = sealNoteContent(content, id, keyring);
+      const updated = await writeNoteContent(db, { userId, noteId: id, baseVersion, content: sealed });
+      if (updated !== undefined) {
+        // The row comes back whole from the `RETURNING`, so the new `version` needs no second query and cannot
+        // describe a state that has since moved; the plaintext is already in hand, and returning it is the
+        // absence of a needless decryption rather than a shortcut around one.
+        return toNoteWithContent(updated, content);
+      }
+      throw await staleWrite(userId, id);
     },
 
     async patch({ userId, id, name, folderId }): Promise<NoteNode> {

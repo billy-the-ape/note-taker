@@ -133,3 +133,32 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   assert on `textContent`/`getAttribute`/`.value`. Server state is TanStack Query, routing is the router, and
   `src/lib/uiStore.ts` is the tiny persisted-UI box (`nt.`-prefixed `localStorage`); there is no global client
   store, and PR-12/13 add their keys to that store rather than inventing a fifth.
+- **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
+  cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`
+  `names.ts`, and `apps/web/src/lib/name.ts` is the app's single import site for them (it re-exports the contract API
+  and adds exactly three compositions: the field's error sentence, the prefill, and the request body's name). A
+  component that restates a rule is the second authority PR-05 exists to prevent. In the new-note dialog the `.md`
+  is a **sibling element, never a character**: the input's value is the editable name, so "the suffix cannot be
+  edited or deleted" needs no `keydown` guard enumerating every way a character leaves a field — and the submitted
+  name is `stripMd`'d anyway, because a pasted `report.md` is the one thing that can still get an extension into the
+  value (`notes.name` is extension-free). Uniqueness is a **debounced read of `['tree', userId]`, with no extra
+  endpoint**: a tab that has not fetched the tree simply has no opinion, which is why the `409 CONFLICT` — dialog
+  stays open, text intact, the server's own sentence inline — is part of the feature. The created row enters the tree
+  cache **on confirmation**, not on submit: `POST /api/notes` mints the UUIDv7, and an optimistic row with a
+  client-invented id would put a `/app/note/<id>` link in the sidebar that 404s until the response lands.
+  `NewNoteDialog.tsx` is driven by `useNewNoteDialog()` (`{ openFor, close, dialog }`), which is what PR-12's
+  `TopBar`/`StatusBar`/tree-context-menu buttons call — those files are PR-12's, so PR-15 shipped the affordance and
+  the three trigger shapes in `src/test/new-note-harness.tsx` rather than an app shell.
+- **`Ctrl/Cmd+N` is bound by nothing, and a test proves it** (PR-15): Chromium opens a window/tab before any page
+  handler sees the chord (Firefox/Edge reserve it likewise), so binding it would ship a shortcut that works in
+  Firefox and silently does nothing in Chrome. `new-note-dialog.test.tsx` greps every non-test `.ts`/`.tsx` under
+  `apps/web/src` for the chord and drives the key combination to show it opens, closes, and submits nothing.
+  Keyboard users reach the dialog through its focusable buttons; a chord for it belongs with the palette backlog.
+- **The caret after a create crosses the router through the cache** (PR-15): `openNoteInEditor()` marks
+  `queryKeys.editorFocus` (`['editor-focus']`, holding the id this tab just created) and navigates, and
+  PR-13's `routes/app/note/$noteId.tsx` asks `takesEditorFocus(client, noteId)` on mount. It is a **read, not a
+  consume** — a one-shot take is eaten by the first pass of `main.tsx`'s `StrictMode` double mount, and a caret that
+  only appears in production is the worse bug — and it is not a query parameter, because "created seconds ago" is a
+  fact about the visit rather than about the note. Until PR-13's route exists the navigation is
+  `navigate({ href: noteEditorHref(id) })`, because `to` is typed against a generated tree with no `/app/*` in it;
+  `NOTE_EDITOR_PATH` is exported for the one-line swap when that file lands.

@@ -333,6 +333,8 @@ note-taker/
             ├── features/auth/{session.tsx, auth.api.ts, useSession.ts}   PR-08
             ├── features/tree/{tree.queries.ts, tree.selectors.ts, tree.mutations.ts}  PR-12
             ├── features/notes/{note.queries.ts, note.mutations.ts}       PR-13/14
+            ├── features/notes/{new-note.ts, open-note.ts}  PR-15 the create path (tree-cache uniqueness,
+            │                                            cache bookkeeping) and the editor-caret handoff
             └── components/
                 ├── ui/{Button,Input,Field,Dialog,Menu,Toast,Spinner}.tsx  PR-08 (grown by later PRs)
                 ├── layout/{AppShell,Sidebar,TopBar,StatusBar}.tsx         PR-12
@@ -664,7 +666,7 @@ PR-08's acceptance testable on its own.
 | Kind | Where |
 | --- | --- |
 | Server state (tree, note content, settings, session) | TanStack Query, cache keys `['tree',userId]`, `['note',id]`, `['settings']` |
-| Mutations | TanStack Query mutations with optimistic tree updates + rollback on error |
+| Mutations | TanStack Query mutations with optimistic tree updates + rollback on error (a **create** has no id to insert optimistically — `POST /api/notes` mints it, so the row enters the tree on confirmation; PR-15 §9) |
 | Editor buffer (uncommitted text) | local component state + autosave engine ref; mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
 | Transient UI (dialogs, preview mode, sidebar width) | local state + a tiny `ui` store for sidebar/preview mode persisted in `localStorage` |
 
@@ -742,6 +744,20 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   to the selected folder/root, "Create" is disabled while the name is invalid or collides (debounced
   uniqueness check against the tree cache, no extra endpoint).
 - Rename dialogs reuse the same component with the current name and the same fixed `.md` suffix for notes.
+
+**Three things PR-15 only settled in code, recorded because PR-12/13/19 read this section as behaviour:**
+
+- **The suffix is a sibling element, not a character.** The input's value is the editable name; `.md` is a node after
+  it. A `keydown` guard for "cannot be deleted" has to enumerate every way a character leaves a field (backspace,
+  delete, cut, drag-out, drop, autofill, IME and screen-reader replacements); the markup rule has no cases. The one
+  route that still gets `.md` into the value is a paste, and `stripMd` removes it from the request body.
+- **The uniqueness check is a debounced read of `['tree', userId]`, never a request.** The tree already lists every
+  sibling, so a "is this free?" endpoint re-learns a list this tab is holding. The consequence is deliberate: a tab
+  that has not fetched the tree has no opinion, so the `409 CONFLICT` (with the winner's id) is a first-class branch
+  of the dialog, not an error page.
+- **Creating hands the caret over through the cache, not the URL.** `['editor-focus']` holds the id this tab just
+  created; PR-13's editor page asks `takesEditorFocus(client, id)` on mount. A `?focus=1` would be bookmarked and
+  re-opened, and a one-shot consume would be eaten by `StrictMode`'s double mount (PR-15 §9).
 - Everything reachable by keyboard: tree arrow-key navigation, `Enter` to open, `F2` rename, `Delete` delete,
   `Ctrl/Cmd+K` (search *page* link in MVP, palette is backlog). Two chord rules keep this collision-free:
   **`Ctrl/Cmd+K` is editor-scoped against shell-scoped** — while the CodeMirror editor has focus, its keymap owns the

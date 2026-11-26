@@ -36,7 +36,7 @@ import {
   createAutosaver,
   type FlushOutcome,
 } from '../../lib/autosave';
-import { clearDraft, createDraftMirror, draftNeedsRestore, readDraft } from '../../lib/draft';
+import { clearDraftIf, createDraftMirror, draftNeedsRestore, readDraft } from '../../lib/draft';
 import { TREE_KEY_PREFIX } from '../../lib/queryClient';
 import { autosaveFlag, settingsOptions } from '../settings/settings.api';
 import { createContentSaver, createNoteFromBuffer, syncSavedNote } from './note.mutations';
@@ -191,18 +191,21 @@ export function useAutosave(options: UseAutosaveOptions): UseAutosaveResult {
       machine.flushAutomatic();
     };
     const onVisibilityChange = (): void => {
-      // `hidden` is the moment a phone tab may stop being a tab at all. `visible` gets nothing: §6 gives
-      // no reason to re-read or re-write a note when somebody comes back to it.
-      if (document.visibilityState === 'hidden') machine.flushAutomatic();
+      // `visible` gets nothing: §6 gives no reason to re-read or re-write a note when somebody comes back
+      // to it. `hidden` is §11.4's unload-adjacent trigger and goes through the machine's own decision,
+      // because a closing tab hides *before* `pagehide` and an ordinary `PUT` started here would occupy
+      // rule 1 and then be aborted by the unload — the keepalive write would never start at all.
+      if (document.visibilityState === 'hidden') machine.flushOnHide();
     };
     const onPageHide = (): void => {
       machine.flushOnUnload();
     };
     const onBeforeUnload = (event: BeforeUnloadEvent): void => {
-      // The prompt is the *only* thing standing between a buffer the unload path cannot write (§6's
-      // budget) and the browser's memory, so it is armed by exactly the negation of that predicate —
-      // and never on top of a save that is already on its way out.
-      if (machine.canFlushOnUnload() || !machine.isDirty()) return;
+      // The prompt is the *only* thing standing between a buffer the unload cannot keep (§6's budget, an
+      // autosave-off buffer, an ordinary request the unload is about to abort) and the browser's memory,
+      // so it is armed by exactly the negation of "the unload carries this" — and never on top of a save
+      // already leaving on a transport that survives the unload.
+      if (machine.unloadCarriesBuffer()) return;
       event.preventDefault();
       event.returnValue = '';
     };
@@ -248,10 +251,14 @@ export function useAutosave(options: UseAutosaveOptions): UseAutosaveResult {
   const retryNow = useCallback(() => machine.retry(), [machine]);
 
   const saveAsNewNote = useCallback(async (): Promise<NoteWithContent> => {
-    const created = await createNoteFromBuffer(machine.getBuffer(), folderId);
+    // The text the new row is about to hold, captured *before* the request: a keystroke after this point
+    // is text the new row will not have, and the mirror has to keep it.
+    const saved = machine.getBuffer();
+    const created = await createNoteFromBuffer(saved, folderId);
     // The text is on the server now, under an id this machine never had, so the mirror under the dead
-    // id is a stale copy rather than a fallback: it goes with the note that died.
-    clearDraft(id);
+    // id is a stale copy rather than a fallback: it goes with the note that died — but only while it
+    // still holds exactly the text that got saved (§6's rule for this key).
+    clearDraftIf(id, saved);
     syncSavedNote(client, created.id, created);
     // A new row belongs in the sidebar, so this invalidation is a real refetch and not a `refetchType:
     // 'none'` marking.
@@ -269,7 +276,11 @@ export function useAutosave(options: UseAutosaveOptions): UseAutosaveResult {
       setStaleDraft(undefined);
     },
     discard: () => {
-      clearDraft(id);
+      // "Throw it away" is an answer about the text the prompt *showed*. The editor stayed usable under
+      // the prompt, so `onEdit` may have rewritten the key with something newer by now, and deleting that
+      // would break the one rule §6 gives this key — cleared only while it still holds the text being
+      // discarded — and lose the crash fallback for text nobody has saved.
+      if (staleDraft !== undefined) clearDraftIf(id, staleDraft);
       setStaleDraft(undefined);
     },
   };

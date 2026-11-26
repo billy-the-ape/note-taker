@@ -15,7 +15,7 @@
  *   left in the queue throws — so "exactly one `PUT`" is a fact about the queue, not a hope;
  * * `tick(ms)` moves the fake clock and `flush()` drains the microtasks a settled promise needs.
  */
-import { API_ERROR_MESSAGES, type ApiErrorCode } from '@note-taker/contracts';
+import { API_ERROR_MESSAGES, type ApiErrorCode, utf8ByteLength } from '@note-taker/contracts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from './api';
@@ -27,6 +27,7 @@ import {
   AUTOSAVE_UNLOAD_BUDGET_BYTES,
   type AutosaveSettings,
   classifyWriteFailure,
+  contentWriteBytes,
   createAutosaver,
   type SaveCall,
   type SavedNote,
@@ -950,6 +951,101 @@ describe('the unload path (§6)', () => {
     expect(h.machine.flushOnUnload()).toBe('in-flight');
     expect(h.calls).toHaveLength(1);
     expect(h.peak()).toBe(1);
+  });
+
+  // §6's budget is a budget on the **request body**. `lib/api.ts` sends `JSON.stringify({content,
+  // baseVersion})`, and escaping is not free: a `"` or a `\n` costs two bytes and a control character
+  // six. Measuring the buffer instead would send a body over the browser's ~64 KiB `keepalive` cap,
+  // where `fetch` rejects with a `TypeError` before anything leaves — after `canFlushOnUnload()` had
+  // already answered "within budget", which is what left the dirty-guard prompt unarmed as well.
+  it('measures the JSON body, not the buffer, because that is what the browser caps', () => {
+    expect(contentWriteBytes('a\nb', 1)).toBe(34); // {"content":"a\nb","baseVersion":1}
+
+    // 58 KiB of quotes: comfortably inside the 60 KiB budget as text, and nearly double it as a body.
+    const quoted = '"'.repeat(58 * 1024);
+    expect(utf8ByteLength(quoted)).toBeLessThan(AUTOSAVE_UNLOAD_BUDGET_BYTES);
+    expect(contentWriteBytes(quoted, 1)).toBeGreaterThan(64 * 1024);
+
+    const h = start({ content: 'body', version: 1 });
+    h.machine.onEdit(quoted);
+    expect(h.machine.canFlushOnUnload()).toBe(false);
+    expect(h.machine.flushOnUnload()).toBe('too-large');
+    expect(h.calls).toEqual([]); // nothing attempted, rather than a request the browser would refuse
+    expect(h.machine.isDirty()).toBe(true); // …and the pill still says `Unsaved changes`
+
+    // The same text is inside a budget big enough for its body, which is the proof the predicate moved
+    // to the right quantity rather than merely becoming stricter.
+    const wide = start({ content: 'body', version: 1, unloadBudgetBytes: 128 * 1024 });
+    wide.reply(hang());
+    wide.machine.onEdit(quoted);
+    expect(wide.machine.canFlushOnUnload()).toBe(true);
+    expect(wide.machine.flushOnUnload()).toBe('sent');
+    expect(wide.calls).toHaveLength(1);
+  });
+
+  it('refuses to call an ordinary in-flight request one that survives the unload', async () => {
+    const h = start({ content: 'body', version: 1 });
+    h.reply(hang());
+
+    h.machine.onEdit('a');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.calls[0]).toMatchObject({ via: 'put' });
+    // The unload aborts this one, so the prompt still has a job.
+    expect(h.machine.unloadCarriesBuffer()).toBe(false);
+
+    // A keepalive request carrying *this* buffer is a different answer…
+    const kept = start({ content: 'body', version: 1 });
+    kept.reply(hang());
+    kept.machine.onEdit('typed before the close');
+    expect(kept.machine.flushOnUnload()).toBe('sent');
+    expect(kept.machine.unloadCarriesBuffer()).toBe(true);
+
+    // …unless the buffer has moved past what that request carries, which is text nobody is saving.
+    kept.machine.onEdit('typed after the request left');
+    expect(kept.machine.unloadCarriesBuffer()).toBe(false);
+  });
+
+  it('sends the keepalive request on `hidden`, because a closing tab hides before pagehide', () => {
+    const h = start({ content: 'body', version: 6 });
+    h.reply(hang());
+
+    h.machine.onEdit('typed before the close');
+    expect(h.machine.flushOnHide()).toBe('keepalive');
+    expect(h.calls).toEqual([{ content: 'typed before the close', baseVersion: 6, via: 'keepalive' }]);
+
+    // …and `pagehide` then adds nothing, which is the whole point: the one request that left is the one
+    // that outlives the page, instead of an ordinary `PUT` the unload aborts with nothing to follow it.
+    expect(h.machine.flushOnUnload()).toBe('in-flight');
+    expect(h.calls).toHaveLength(1);
+    expect(h.peak()).toBe(1);
+    expect(h.machine.unloadCarriesBuffer()).toBe(true); // so `beforeunload` does not prompt
+  });
+
+  it('takes the ordinary flush on `hidden` when the body is over the unload budget', () => {
+    const h = start({ content: 'body', version: 6 });
+    h.reply(hang(), hang());
+
+    // Over budget: on a tab switch (which is most of what `hidden` means) the page survives and an
+    // ordinary `PUT` is the better request — retryable, and its reply can be read.
+    h.machine.onEdit(textOf(200 * 1024));
+    expect(h.machine.flushOnHide()).toBe('ordinary');
+    expect(h.calls[0]).toMatchObject({ via: 'put', content: textOf(200 * 1024) });
+    // But this request will not survive a close, so the guard stays armed for `beforeunload`.
+    expect(h.machine.unloadCarriesBuffer()).toBe(false);
+    expect(h.machine.flushOnHide()).toBe('ordinary'); // rule 1: nothing new may start behind it
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it('does not write on `hidden` for the reasons §6 already gives', () => {
+    const off = start({ content: 'body', version: 1, autosave: false });
+    off.machine.onEdit('typed while off');
+    expect(off.machine.flushOnHide()).toBe('ordinary');
+    expect(off.calls).toEqual([]);
+
+    const clean = start({ content: 'body', version: 1 });
+    expect(clean.machine.flushOnHide()).toBe('ordinary');
+    expect(clean.calls).toEqual([]);
   });
 });
 

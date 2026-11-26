@@ -67,11 +67,29 @@ export const AUTOSAVE_MAX_UNFLUSHED_MS = 10_000;
  */
 export const AUTOSAVE_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 30_000];
 /**
- * §6's unload budget: 60 KiB, a margin under the ~64 KiB cap a browser puts on a `keepalive` body.
- * Over it the unload path attempts nothing — the force-flush, the dirty-guard prompt and the
- * `localStorage` draft mirror are the data plan, and the pill never says `Saved`.
+ * §6's unload budget: **60 KiB of request body**, a margin under the ~64 KiB cap a browser puts on a
+ * `keepalive` body. Over it the unload path attempts nothing — the force-flush, the dirty-guard prompt
+ * and the `localStorage` draft mirror are the data plan, and the pill never says `Saved`. It is a body
+ * budget and not a text budget, which is {@link contentWriteBytes}'s business.
  */
 export const AUTOSAVE_UNLOAD_BUDGET_BYTES = 60 * 1024;
+
+/**
+ * The bytes a content write costs on the wire, which is **more than the bytes of the buffer**.
+ *
+ * `features/notes/note.mutations.ts` sends `JSON.stringify({content, baseVersion})`, and JSON escaping
+ * is not free: every `\n` and every `"` costs two bytes, and a control character costs six (`\u0001`).
+ * So a 58 KiB body of indented prose is over the `keepalive` cap while `utf8ByteLength(buffer)` is
+ * under it, and the browser rejects the request with a `TypeError` before it leaves — after
+ * `canFlushOnUnload()` had already promised the dirty-guard prompt it did not need.
+ *
+ * The shape is duplicated on purpose: the machine does not know `lib/api.ts` exists, so it measures the
+ * body the client is documented to send. `note.mutations.test.ts` asserts that documentation — the body
+ * has exactly these two keys, and no more — so the measure cannot quietly drift out of date.
+ */
+export function contentWriteBytes(content: string, baseVersion: number): number {
+  return utf8ByteLength(JSON.stringify({ content, baseVersion }));
+}
 
 /** §4's six states. */
 export type AutosaveState = 'clean' | 'dirty' | 'saving' | 'retrying' | 'conflict' | 'error';
@@ -260,7 +278,10 @@ export interface Autosaver {
   readonly adopt: (content: string, version: number) => void;
   /** An explicit user save: `Ctrl/Cmd+S` or the Save button. Works with autosave off (§6). */
   readonly flush: () => FlushOutcome;
-  /** An automatic flush: debounce, deadline, `blur`, `hidden`, note switch, unmount. Honors the flag. */
+  /**
+   * An automatic flush: debounce, deadline, `blur`, note switch, unmount. Honors the flag. The
+   * `visibilitychange → hidden` trigger is {@link Autosaver#flushOnHide}, which picks a transport.
+   */
   readonly flushAutomatic: () => FlushOutcome;
   /** The `pagehide` path: `fetch(…, {keepalive:true})`, and only inside the unload budget (§6). */
   readonly flushOnUnload: () => UnloadOutcome;
@@ -274,6 +295,13 @@ export interface Autosaver {
   readonly retry: () => FlushOutcome;
   /** True when a `pagehide` would be able to write this buffer (§6's budget, rule 1, the flag). */
   readonly canFlushOnUnload: () => boolean;
+  /**
+   * True when the unload can be let to happen quietly: clean, or the buffer is leaving on `keepalive`,
+   * or `pagehide` can still start it. The dirty-guard prompt is the exact negation of this (§6).
+   */
+  readonly unloadCarriesBuffer: () => boolean;
+  /** The `visibilitychange → hidden` trigger, on the unload transport whenever the buffer fits (§6). */
+  readonly flushOnHide: () => 'keepalive' | 'ordinary';
   readonly snapshot: () => AutosaveSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
   readonly getBuffer: () => string;
@@ -733,12 +761,54 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     return writeNow();
   }
 
+  /**
+   * Whether a `pagehide` would be able to **start** an unload write for the current buffer. A `keepalive`
+   * request already in flight counts as "not able", because pagehide will not queue a second one behind
+   * it — which is why {@link unloadCarriesBuffer} exists next to this, and is what the prompt reads.
+   */
   function canFlushOnUnload(): boolean {
     if (stopped || conflict !== undefined) return false;
     if (!readAutosave(options.settings)) return false;
     if (inFlight !== undefined) return false;
-    if (buffer === savedContent) return false;
-    return utf8ByteLength(buffer) <= unloadBudgetBytes;
+    if (!dirty()) return false;
+    return contentWriteBytes(buffer, lastVersion) <= unloadBudgetBytes;
+  }
+
+  /**
+   * Whether the unload may safely be let to happen quietly: either there is nothing to carry (clean), or
+   * the buffer is on its way out on the one transport that survives an unload, or `pagehide` will be able
+   * to start it. §6's dirty-guard prompt is armed by exactly the negation of this.
+   *
+   * An **ordinary** in-flight `PUT` is deliberately not enough to answer true while the buffer is dirty:
+   * the unload aborts that request, so a buffer riding on one still needs the prompt. Before this
+   * predicate existed the prompt's rule was "the negation of the budget" alone, which is right about the
+   * size and silent about the transport.
+   */
+  function unloadCarriesBuffer(): boolean {
+    if (!dirty()) return true; // nothing to lose, so nothing to warn about
+    if (inFlight !== undefined && inFlight.via === 'keepalive' && inFlight.content === buffer) return true;
+    return canFlushOnUnload();
+  }
+
+  /**
+   * The `visibilitychange → hidden` trigger (§6, §11.4).
+   *
+   * A closing tab hides **first**: the unload steps are hide → `beforeunload` → `pagehide`. An ordinary
+   * `PUT` started here is therefore the quiet way to lose the unload write — it occupies rule 1, the
+   * unload aborts it, and `pagehide` then has nothing it is allowed to start, so the keepalive path is
+   * never reached on the ordinary close sequence at all. When the buffer fits the unload budget the
+   * hidden flush goes out on the keepalive transport instead, which is also a correct choice for a mere
+   * tab switch: the page survives, and a `keepalive` request answers normally while it is alive.
+   */
+  function flushOnHide(): 'keepalive' | 'ordinary' {
+    if (canFlushOnUnload()) {
+      flushOnUnload();
+      return 'keepalive';
+    }
+    // Over budget, autosave off, a conflict or a stopped machine, or a request already on the wire:
+    // none of those is an unload problem, so this is the same flush any other trigger would ask for.
+    flushAutomatic();
+    return 'ordinary';
   }
 
   function flushOnUnload(): UnloadOutcome {
@@ -748,7 +818,7 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
       if (!readAutosave(options.settings)) return 'autosave-off';
       if (buffer === savedContent) return 'clean';
       if (inFlight !== undefined) return 'in-flight';
-      if (utf8ByteLength(buffer) > unloadBudgetBytes) return 'too-large';
+      if (contentWriteBytes(buffer, lastVersion) > unloadBudgetBytes) return 'too-large';
       return 'sent';
     })();
 
@@ -850,6 +920,8 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     flush,
     flushAutomatic,
     flushOnUnload,
+    unloadCarriesBuffer,
+    flushOnHide,
     resume,
     keepMine,
     useServer,

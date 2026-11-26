@@ -169,6 +169,27 @@ function dispatch(name: 'pagehide' | 'beforeunload'): Event {
   return event;
 }
 
+/**
+ * Put the document in the state a tab switch or a closing tab puts it in. jsdom ships no way to leave
+ * the tab, so the one property the listener reads is replaced for the duration of the event and given
+ * back to the prototype afterwards.
+ *
+ * The browser's own order on the way out is `visibilitychange → beforeunload → pagehide`, so a test that
+ * means "the user closed the tab" has to fire them in that order: a `hidden` handler that starts a
+ * request of its own decides what `pagehide` is left able to do.
+ */
+function hideTab(then?: () => void): void {
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+  try {
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    then?.();
+  } finally {
+    delete (document as unknown as { visibilityState?: unknown }).visibilityState;
+  }
+}
+
 let sendBeacon: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
@@ -319,6 +340,10 @@ describe('the debounce, mounted', () => {
     expect(fetch.sent).toHaveLength(2);
     expect(document.visibilityState).toBe('visible');
     expect(bodyOf(fetch.sent, 1).content).toBe('typed, then left the tab');
+    // §11.4 puts `visibilitychange → hidden` and `pagehide` on the same transport, and it has to be the
+    // `keepalive` one: a closing tab hides before `pagehide`, so an ordinary `PUT` started here is
+    // aborted by the unload and `pagehide` is left with nothing it may start.
+    expect(fetch.sent[1]).toMatchObject({ keepalive: true });
   });
 
   it('flushes for a folder rename or move, which is the trigger only a caller knows about', () => {
@@ -471,6 +496,55 @@ describe('the unload budget (§6, §8)', () => {
     expect(guard.defaultPrevented).toBe(true);
     expect(fetch.sent).toEqual([]);
     expect(saveStatusText(result.current.snapshot, result.current.autosave)).toBe(AUTOSAVE_OFF_COPY);
+  });
+
+  it('takes the close sequence in the browser’s order — hidden, beforeunload, pagehide — as one keepalive PUT', () => {
+    const fetch = installFetch({
+      [`PUT ${CONTENT_PATH}`]: () => ({ status: 200, body: noteBody(NOTE_ID, { content: SMALL }) }),
+    });
+    const { result } = boot({ autosave: true });
+
+    act(() => {
+      result.current.edit(SMALL);
+    });
+    hideTab();
+    const guard = dispatch('beforeunload');
+    dispatch('pagehide');
+
+    const writes = fetch.sent.filter((entry) => entry.method === 'PUT');
+    expect(writes).toHaveLength(1);
+    // The single request that left is the one the browser carries through the unload — not an ordinary
+    // `PUT` that the unload aborts while `pagehide` stands there refused by the one-request rule.
+    expect(writes[0]).toMatchObject({ path: CONTENT_PATH, keepalive: true, csrf: 'token-abc' });
+    expect(bodyOf(writes, 0).content).toBe(SMALL);
+    // Nothing to warn about: the buffer is on its way out on the transport that survives the unload.
+    expect(guard.defaultPrevented).toBe(false);
+    expect(sendBeacon).not.toHaveBeenCalled();
+  });
+
+  it('writes ordinarily on `hidden` for a buffer over the budget, and keeps the prompt armed', () => {
+    const fetch = installFetch({
+      [`PUT ${CONTENT_PATH}`]: () => ({ status: 200, body: noteBody(NOTE_ID, { content: LARGE }) }),
+    });
+    const { result } = boot({ autosave: true });
+
+    act(() => {
+      result.current.edit(LARGE);
+    });
+    hideTab();
+    const guard = dispatch('beforeunload');
+    dispatch('pagehide');
+
+    const writes = fetch.sent.filter((entry) => entry.method === 'PUT');
+    expect(writes).toHaveLength(1);
+    // Over budget there is no keepalive write to make, and most `hidden` events are a tab switch, where
+    // the page survives and an ordinary `PUT` is the better request: retryable, and readable.
+    expect(writes[0]).toMatchObject({ keepalive: undefined });
+    // That request will not outlive a close, so the guard is the only thing left protecting the text —
+    // and the pill is honest about a buffer that is dirty *and* riding on a doomed request.
+    expect(guard.defaultPrevented).toBe(true);
+    expect(result.current.snapshot).toMatchObject({ state: 'saving', dirty: true });
+    expect(saveStatusText(result.current.snapshot, result.current.autosave)).toBe('Saving…');
   });
 
   it('does not prompt when there is nothing unsaved', () => {
@@ -666,6 +740,29 @@ describe('the draft mirror as a prompt (§6)', () => {
     expect(readDraft(NOTE_ID)).toBeUndefined();
     expect(result.current.draft.content).toBeUndefined();
     expect(result.current.snapshot.buffer).toBe('server text'); // the note was never touched
+    expect(fetch.sent).toEqual([]);
+  });
+
+  it('keeps the text typed after the prompt appeared, which is what Discard was never about', () => {
+    writeDraft(NOTE_ID, 'what the crash kept');
+    const fetch = installFetch({});
+    const { result } = boot({ autosave: true });
+
+    expect(result.current.draft.content).toBe('what the crash kept');
+
+    // The prompt does not lock the editor, and `onEdit` mirrors every keystroke, so by the time
+    // "Discard" is clicked the key holds text the prompt never mentioned.
+    act(() => {
+      result.current.edit('typed over the prompt');
+    });
+    act(() => {
+      result.current.draft.discard();
+    });
+
+    // "Throw away the old draft" cannot mean "and the new one too": the key is cleared only while it
+    // still holds the text being discarded, or a crash before the next write loses a paragraph.
+    expect(readDraft(NOTE_ID)).toBe('typed over the prompt');
+    expect(result.current.draft.content).toBeUndefined();
     expect(fetch.sent).toEqual([]);
   });
 

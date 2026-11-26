@@ -269,12 +269,21 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   note switch runs the *outgoing* machine's cleanup and flushes the right buffer — and it installs `blur`,
   `visibilitychange`, `pagehide`, `beforeunload` and `Ctrl/Cmd+S`; `saveNow()` (the flag is a preference, not a
   disable-switch for saving) writes even with `settings.autosave === false`. The unload flush is
-  `fetch(…, { keepalive: true })` with the ordinary CSRF header and **only** for a buffer ≤ 60 KiB; over that nothing
-  is attempted and the `beforeunload` guard — armed by exactly the negation of that predicate — is what protects the
-  text. **Never add `navigator.sendBeacon`:** it cannot set `X-CSRF-Token` (§6). The crash mirror is
+  `fetch(…, { keepalive: true })` with the ordinary CSRF header, and **`visibilitychange → hidden` uses that
+  transport too** whenever the body fits: a closing tab hides *before* `pagehide`, so an ordinary `PUT` started on
+  `hidden` would occupy rule 1, get aborted by the unload, and leave `pagehide` with nothing it may start — the
+  keepalive path would then never run on a normal close. §6's 60 KiB is a budget on the **request body**, measured
+  with `contentWriteBytes` (`JSON.stringify({content, baseVersion})`), because escaping turns a 58 KiB buffer of
+  quotes into a ~116 KiB body that `fetch` rejects before it leaves; `note.mutations.test.ts` pins the two-key shape
+  that measure assumes. Over the budget nothing is attempted and the `beforeunload` guard — armed by exactly the
+  negation of `unloadCarriesBuffer()`: clean, or the buffer leaving on `keepalive`, or `pagehide` still able to start
+  it — is what protects the text, and an **ordinary** in-flight `PUT` never counts as carried, because the unload
+  aborts it. **Never add `navigator.sendBeacon`:** it cannot set `X-CSRF-Token` (§6). The crash mirror is
   `lib/draft.ts` under `localStorage['note-draft:<id>']` — deliberately *not* a `uiStore` key, since it is a note body
   rather than a preference — and it is cleared only when it still holds the text being discarded, because the key is
-  per-browser and tabs share it. `SaveStatus`/`ConflictBanner`/`DraftPrompt` in `components/editor` are allowed to say
+  per-browser and tabs share it. That rule covers the *discard* button and the `404` "save as a new note" path too:
+  the prompt does not lock the editor, so by the time either acts the mirror may hold a newer paragraph than the one
+  being discarded or saved, and clearing it unconditionally would delete a crash fallback nobody has saved. `SaveStatus`/`ConflictBanner`/`DraftPrompt` in `components/editor` are allowed to say
   only what the machine knows: never `Saved` for a buffer that could not be flushed, and never a silent overwrite.
 - **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
   cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`

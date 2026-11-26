@@ -13,6 +13,7 @@ import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, type NoteWithContent, ROUTES } from
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { setUnauthorizedHandler } from '../../lib/api';
+import { contentWriteBytes } from '../../lib/autosave';
 import { createQueryClient, queryKeys } from '../../lib/queryClient';
 import {
   createContentSaver,
@@ -189,6 +190,28 @@ describe('putNoteContentKeepalive (§6’s unload write)', () => {
   it('reports “no note in the answer” instead of inventing one, which the saver then reasons about', async () => {
     installFetch({ [`PUT ${CONTENT_PATH}`]: () => ({ status: 204 }) });
     await expect(putNoteContentKeepalive(NOTE_ID, { content: 'x', baseVersion: 7 })).resolves.toBeUndefined();
+  });
+
+  // The premise of §6's unload budget. `lib/autosave.ts` refuses to import `lib/api.ts`, so it measures
+  // the body it is *documented* to be given: `JSON.stringify({content, baseVersion})`. Add a third field
+  // to this request and that measure silently starts under-reporting — the exact way to send a body over
+  // the browser's `keepalive` cap, where `fetch` rejects before anything leaves and the save is lost
+  // after the machine promised the buffer fit.
+  it('sends exactly the two keys the unload budget measures, on both transports', async () => {
+    const fetch = installFetch({
+      [`PUT ${CONTENT_PATH}`]: () => ({ status: 200, body: noteBody() }),
+    });
+
+    await putNoteContent(NOTE_ID, { content: 'plain', baseVersion: 7 });
+    await putNoteContentKeepalive(NOTE_ID, { content: 'keepalive', baseVersion: 7 });
+
+    for (const entry of fetch.sent) {
+      expect(Object.keys(entry.body as Record<string, unknown>).sort()).toEqual(['baseVersion', 'content']);
+    }
+    // …and the machine's measure is the byte length of that body, not of the text inside it.
+    expect(contentWriteBytes('on the way out', 7)).toBe(
+      new TextEncoder().encode(JSON.stringify({ content: 'on the way out', baseVersion: 7 })).byteLength,
+    );
   });
 });
 

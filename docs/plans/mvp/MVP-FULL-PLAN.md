@@ -742,7 +742,7 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
   reacts to the latter.
 
-**Five things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
+**Six things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
 
 - **Nothing leaves while a reply is owed.** A request that went out and never came back is an answer the client has
   not read. So every flush that arrives during a backoff — the debounce, the 10 s cap, `blur`,
@@ -765,10 +765,20 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   states where the text has to stay visible. `onEdit` publishes on every path, and `dirty` means "newer than the row"
   everywhere: undoing back to the saved text is `clean`, not a pill reading "Unsaved changes" over a write that will
   never start.
-- **The unload guard is the negation of the unload budget.** `beforeunload` is armed when the buffer is dirty *and*
-  `pagehide` would not be able to write it — autosave off, over 60 KiB, or a request already in flight, because a
-  browser will not queue a second `keepalive` behind one. So the prompt never covers a save that is already leaving,
-  and never skips a buffer that cannot be flushed.
+- **The unload guard is the negation of "the unload carries this", not of the budget alone.** `beforeunload` is armed
+  only when the buffer is dirty *and* nothing is carrying it: clean, or a `keepalive` request already leaving with
+  exactly that text, or `pagehide` still able to start one — those need no prompt. An **ordinary** in-flight `PUT`
+  never counts as carried, because the unload aborts it, and an autosave-off or over-budget buffer is never carried
+  either. A prompt over a save already leaving is noise; a missing prompt over a buffer that cannot leave is data loss.
+- **`visibilitychange → hidden` goes out on the unload transport, and the budget measures the body.** A closing tab
+  hides *before* `pagehide` (the unload steps are hide → `beforeunload` → `pagehide`), so the ordinary `PUT` a `hidden`
+  handler used to start occupied rule 1, was aborted by the unload, and left `pagehide` with nothing it may start —
+  the `keepalive` path never ran on a normal close. Within the budget `hidden` now sends `fetch(…, {keepalive: true})`,
+  and a mere tab switch is unharmed, because a live page reads a `keepalive` reply normally. That ~64 KiB cap is a cap
+  on the **request body**, which `lib/api.ts` builds with `JSON.stringify({content, baseVersion})`, and escaping is not
+  free: a `"` or a `\n` costs two bytes and a control character six, so 58 KiB of quotes is a ~116 KiB body that
+  `fetch` rejects before it leaves — *after* the predicate had promised the buffer fitted. `contentWriteBytes` is that
+  measure, and the two-key body it assumes is pinned by `note.mutations.test.ts`.
 - **The draft mirror clears only on a match.** `localStorage` is per-browser and the key is per-note, so a write
   confirmed in one tab must not delete another tab's unsaved text: `clear(text)` removes the key when it still holds
   exactly `text` and leaves it alone otherwise. The mirror is not an `nt.` `uiStore` preference and does not go through

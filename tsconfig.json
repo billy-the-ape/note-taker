@@ -1,0 +1,19 @@
+{
+  // The root `scripts/` are not a workspace package, so nothing typechecked them — until PR-18 put a
+  // production preflight in there. `check-env.ts` runs in CI and in an operator's terminal, where a type
+  // error would otherwise surface only as a confusing exit code, so `pnpm typecheck` (and therefore the
+  // `quality` CI job, unchanged) compiles it with the same strict flags as the apps: see
+  // docs/plans/mvp/MVP-18.md.
+  //
+  // `module`/`moduleResolution` are overridden because these files are *run* by tsx, not emitted by tsc:
+  // `NodeNext` would read `scripts/` as CommonJS (the root manifest has no `"type": "module"`) and reject
+  // the ESM syntax tsx is perfectly happy to execute. `noEmit` because there is nothing to emit.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["scripts"]
+}

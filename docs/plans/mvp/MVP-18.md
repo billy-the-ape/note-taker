@@ -46,7 +46,7 @@ they list them).
 
 | Var | Default | Prod required | Meaning |
 | --- | --- | --- | --- |
-| `NODE_ENV` | **none — required**: `development`/`test`/`production` | ✔ `production` | selects the invariant set enforced by the compiled `env.ts`; unset fails everywhere. **Nobody hand-sets it in production:** the image bakes `ENV NODE_ENV=production` into stage 2 and `compose.yml` repeats it in the `app` service `environment:` block. Locally/in CI it comes from the **script line**, never from the shell or from reading the file |
+| `NODE_ENV` | **none — required**: `development`/`test`/`production` | ✔ `production` | selects the invariant set enforced by the compiled `env.ts`; unset fails everywhere. **Nobody hand-sets it in production:** the image bakes `ENV NODE_ENV=production` into its runtime stage (stage 4 of the four it now has — `deps`, `build`, `prune`, `runtime`) and `compose.yml` repeats it in the `app` service `environment:` block. Locally/in CI it comes from the **script line**, never from the shell or from reading the file |
 | `HOST` | `0.0.0.0` | — | bind address |
 | `PORT` | `3000` | — | port the **container** listens on; `compose.yml` pins it to 3000 so `EXPOSE`/`HEALTHCHECK` stay valid |
 | `HOST_PORT` | `3000` | — | host side of the single published mapping — the operator-facing port knob |
@@ -80,7 +80,9 @@ they list them).
   `packages/contracts`** (its `package.json` + `dist/`, reached through `exports`) so the server's
   `@note-taker/contracts` import resolves to JS and never to `src/*.ts`.
 - Copy `dist` (including `dist/scripts/` — how the operator scripts ship) and `migrations`; copy `apps/web/dist` into the
-  server's static path. `USER node`, `EXPOSE 3000`, no build toolchain in the runtime layer.
+  server's static path. `USER node`, `EXPOSE 3000`, no build toolchain in the runtime layer, and nothing under
+  `/app` owned by the app user — no `--chown` on application code, because the process must not be able to rewrite
+  what it runs; `find /app -user node` being empty is asserted inside the image build.
 - `ENTRYPOINT` → `docker/entrypoint.sh`, which is **only** `exec node apps/server/dist/index.js`. No `pnpm`, no `tsx`, no
   `.ts` execution in the runtime layer. **Env checks and migrations run inside the compiled Node bootstrap**
   (`env.ts` + `db/migrate.ts`). `scripts/check-env.ts` stays a dev/CI convenience whose rules are enforced at boot by the
@@ -222,7 +224,7 @@ release** (a documented rule).
       real run → `--verify` exits 0, and a note written **before** the rotation still opens in the browser); and
       `reset-password.js <username>` letting that user log in again with their folders, notes and settings untouched.
 - [ ] **If either script needs something the image lacks** (pnpm, `tsx`, a `.ts` entry, a published DB port), the fix is
-      to move it under `apps/server/src/scripts/` and re-run — **not** to add dev tooling to stage 2.
+      to move it under `apps/server/src/scripts/` and re-run — **not** to add dev tooling to the runtime stage.
 - [ ] CI: `docker build` **step** added to the `build` job (never pushes an image — no registry in the MVP).
 
 ## 8. Out of scope
@@ -244,8 +246,19 @@ CI docker build step.
 ## Acceptance evidence (clean VM)
 - up -d → healthy → curl :3000/api/healthz → HOST_PORT=8080 honored
 - compose config with a key-less .env → non-zero naming the var, no containers created
-- pnpm check:env against the two DOTENV_PATH fixtures (fail → fill key → pass; trio-only file passes; neither-form file fails)
+- pnpm check:env against the DOTENV_PATH fixtures — four of them now: the two this brief asked for (fail → fill key
+  → pass; trio-only file passes; neither-form file fails), plus the two that assert the *failure output* prints no
+  key material (`prod-redaction.env`, `prod-wrong-variable.env`: the run must still fail, must still name the rule,
+  and must not contain the fixture key or even its first 20 characters)
 - transcripts: backup → createdb → psql restore → run -d restore-drill → read note at :3100 → docker stop → dropdb
 - transcripts: rotation --dry-run → run → --verify 0 → pre-rotation note opens; reset-password restores login
-- docker history (no dev deps, no curl) + uid != 0
+- the runtime image adds no build or download tool, proven the way it can be proven: a container of the image is
+  asked to walk `/app` — no tool by name; no `.ts` source of ours, scoped to the payload paths the image ships
+  (dependencies ship hundreds of their own, and that is not this image's problem); nothing under `/app` owned by
+  the app user —
+  **not** `docker history | grep curl`, which reports LEAK on a correct image because the base image's own layer
+  *commands* install curl either way, and not a `command -v` loop either, because `$PATH` contains nothing under
+  `/app` so that check prints `clean` whatever the image contains.
+  uid != 0 as before. (Wording corrected while reviewing PR-16: the original line said `docker history (no dev
+  deps, no curl)`, and that check cannot pass.)
 ```

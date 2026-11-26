@@ -25,13 +25,17 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 | `pnpm db:generate` / `pnpm db:migrate` | drizzle-kit (PR-04), run in `apps/server`: generate the SQL into the committed `apps/server/migrations/`, or apply it. Both need a running Postgres; neither needs a `.env`. There is **no `db:push`**, by design (plan §5): the migration history is what ships. |
 | `pnpm db:seed` | The demo tree, idempotently (PR-09 — `apps/server/src/scripts/seed-demo.ts`, run with `NODE_ENV=development tsx`): the owner, the nested folders and the notes, **sealed with the keyring of the process that runs it** rather than a test key, and readable by the app afterwards. Needs a running Postgres; refuses `NODE_ENV=production` before it builds a keyring or opens a pool. It never truncates and never reseeds — a run reports `created`/`kept` per folder and note, so a second run on edited content is a no-op — and the password it prints is stored only as its argon2 hash. `src/scripts/seed-demo.int.test.ts` proves both halves. |
 | `pnpm generate:key` | Prints a fresh 32-byte note-encryption key as base64 on stdout, for `NOTE_ENCRYPTION_KEY` (PR-06, dev/CI only — root `scripts/generate-keys.ts`, run through the server workspace's `tsx`). A production host generates its key with the `docker run --rm node:22-slim node -e '…randomBytes(32)…'` one-liner instead, which PR-18's runbook documents. |
+| `pnpm check:env` | The production `.env` preflight (PR-18 — root `scripts/check-env.ts`, `NODE_ENV=production tsx`, which reads `DOTENV_PATH ?? <repo root>/.env` **as text with its own parser**). It is a linter, not a boot path: `loadDevEnvFile()` is a no-op in `production` by design and it would judge the shell rather than the file, so the preflight could not tell an operator anything about the file they were deploying. Its rules are `env.ts`'s production invariants plus the DSN carve-out (`check-env.ts`'s header): the file may carry `DATABASE_URL` **or** the `POSTGRES_*` trio, fails only with neither, warns when both disagree. Exit 1 on any problem. Nothing it reports is a secret: every value is reported by shape and length (`previewValue`, `previewLine`, `safeName`, `safeTag`, behind `looksLikeMaterial`), **whatever variable the value was typed into** — a key pasted into `SECURE_COOKIES`, or left on a line of its own (which parses as a variable *named* after the key), is still a key, and the failure output is pasted into tickets. `docs/DEPLOY.md` §4 is the table it enforces, and CI asserts all four fixtures, including that the two redaction ones still *fail* while printing neither the fixture key nor its first 20 characters. Because it reads only `.env`, an installation on §3's mounted-key variant is reported as keyless **by design**; §3 states the two ways to reconcile that, and which one you are on. |
+| `make prod-up` / `prod-down` / `prod-ps` / `prod-logs` / `prod-build` / `prod-config` | The production stack (`docker/compose.yml` + `docker/Dockerfile`, PR-18): `db` + `app`, **one** published port (`${HOST_PORT:-3000}:3000`), database unpublished, migrations run inside the app before `listen()`. `prod-config` is the parse-time preflight that fails naming `NOTE_ENCRYPTION_KEY` without contacting the daemon. `docs/DEPLOY.md` is the runbook and pins the same invocation; these targets are that command behind `make`, and unlike `db-*` they do **not** depend on `bootstrap-env`, because a production `.env` is generated (§2) and a copied `.env.example` has no key. |
 | `make db-up` / `db-down` / `db-reset` | Dev Postgres 16 in Docker (`docker/compose.dev.yml`, PR-02): start it (and wait for healthy), stop it, or recreate it with its volume. `make dev`/`build`/`test`/`coverage` are the `pnpm` equivalents behind one interface, and `make bootstrap-env` only creates `.env`. The database commands are `pnpm`-only (`pnpm db:generate`, `pnpm db:migrate`); `make` has no `db:*` target for them, and `pnpm db:seed` (PR-09) is a pnpm script for the same reason. |
 
 - **Compose is always invoked with both flags, from the repo root**:
-  `docker compose --env-file .env -f docker/compose.dev.yml <up|down|…>`. Compose resolves its project
-  directory from the compose file's location, so `-f docker/compose.dev.yml` alone would load `.env` from
-  `docker/` instead of the repo root, and a missing `--env-file` path is a hard error. The `Makefile` pins the
-  invocation so nobody has to remember it; **PR-18 copies this exact rule** for `docker/compose.yml`.
+  `docker compose --env-file .env -f docker/compose.dev.yml <up|down|…>` (and, since PR-18,
+  `… -f docker/compose.yml <up|ps|exec|run|config|…>`). Compose resolves its project directory from the
+  compose file's location, so `-f docker/compose.dev.yml` alone would load `.env` from `docker/` instead of
+  the repo root, and a missing `--env-file` path is a hard error. The `Makefile` pins the invocation so nobody
+  has to remember it, and PR-18 copies the rule verbatim: `docker/compose.yml`'s header, `docs/DEPLOY.md` and
+  `make prod-*` all spell the same command, so a runbook cannot quietly grow a one-flag version of it.
 - **`.env` is bootstrapped, never assumed**: `make bootstrap-env` runs `test -f .env || cp .env.example .env`,
   and every target that passes `--env-file .env` (`db-up`, `db-down`, `db-reset`, `dev`) depends on it. Only
   `.env.example` is committed — dev defaults (`POSTGRES_*`, `HOST_PORT`) and, deliberately, **no
@@ -61,8 +65,8 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   matches nothing, and **never bumps `notes.version`** — rotation is not a content edit. In integration tests it
   is driven as a `tsx` subprocess with `NOTE_ENCRYPTION_KEY_VERSION=2` and the old key in `_PREVIOUS`, because
   editing `.env` and restarting the app are operator steps a script cannot do to its own container.
-- **Scripts that do not exist yet stay that way**: `check:env`
-  (PR-18), `test:e2e` (PR-19). Adding one before the files it runs is a plan violation.
+- **Scripts that do not exist yet stay that way**: `test:e2e` (PR-19). Adding one before the files it runs is
+  a plan violation (`check:env` arrived with PR-18, and `db:seed` with PR-09).
 - **Folder mutations are serialized per user, and ids in bodies are checked before they are written** (PR-09):
   every `create`/`rename`/`move`/`delete` in `services/folder.service.ts` runs in one transaction that starts with
   `takeFolderMoveLock(userId)` — `pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — and
@@ -85,6 +89,41 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   name is re-picked with a fresh read (`GENERATED_NAME_ATTEMPTS` in `services/note.service.ts`) and never answered
   `409` with a stranger's id, because a generated name is the one name the server may change (§5.5); a name the
   client typed still clashes on purpose. Concurrent creates are asserted in `services/note.service.int.test.ts`.
+- **The production image is four stages and the last one runs `node` and nothing else** (PR-18):
+  `docker/Dockerfile` installs (dev deps included), builds **inside the image** (`rm -rf` the copied `dist`
+  dirs, then the root `pnpm build`), prunes with `pnpm --filter @note-taker/server deploy --prod`, and the
+  runtime stage copies only `node_modules`, `apps/server/{package.json,dist,migrations}` and `apps/web/dist`.
+  It bakes `ENV NODE_ENV=production` (so the `env.ts` guard is always armed and nobody hand-sets a mode),
+  runs as `USER node`, `EXPOSE 3000`, and healthchecks with a **Node `fetch`** — this image installs no download
+  tool of its own, and the base's own layers are not knowable from `docker history` (whose layer *commands*
+  mention `curl` because `node:22-slim`'s ancestors installed it), so "no toolchain in the runtime layer" is
+  verified by walking `/app` inside a container (`docs/DEPLOY.md` §2 step 5: no tool by name anywhere; no `.ts`—
+  source of ours, scoped to the payload paths the image ships, because third-party packages legitimately
+  ship hundreds of their own; nothing under `/app` owned by the app user). A `command -v` loop is the tempting wrong version — it searches
+  `$PATH`, which contains nothing under `/app`, so it prints `clean` whatever the image contains. **No `COPY` in
+  the runtime stage takes `--chown=node:node`**: application code arrives root-owned and world-readable, so the
+  process cannot rewrite the code it executes, and the runtime stage asserts `find /app -user node` is empty —
+  which CI's `docker build` therefore checks, while §2 step 5 of the runbook is the same three checks for a
+  human with a daemon. `docker/entrypoint.sh` is `exec node apps/server/dist/index.js` and nothing else: no pnpm,
+  no tsx, no `.ts`. Env checking and migrations therefore happen **inside** the compiled bootstrap, before the
+  port is bound. The pruned install must carry the **compiled** `@note-taker/contracts`
+  (`package.json` + `dist/`, reached through `exports`) and the stage asserts that with Node's own resolver.
+  `docker/compose.yml` publishes exactly one port (`${HOST_PORT:-3000}:3000`), pins `PORT=3000` and
+  `NODE_ENV=production` in the app's `environment:` (which beats `env_file:`), composes
+  `DATABASE_URL` with host `db`, and **the database publishes nothing** — `pg_dump`, `createdb` and `psql`
+  all run through `docker compose exec -T db`. Operator scripts run as
+  `exec app node apps/server/dist/scripts/rotate-note-key.js`; if one ever needs pnpm, tsx, a `.ts` entry or
+  a published DB port, the fix is to move it under `apps/server/src/scripts/` and rebuild, never to add dev
+  tooling to the runtime stage. **`.dockerignore` patterns are anchored at the context root** (learned in
+  PR-16's review): unlike `.gitignore` they do *not* repeat at every level, so plain `node_modules` and `dist`
+  matched only the root's while a workspace's real ones live under `apps/*/`, and `COPY . .` poured them over
+  the image's own install — hence `**/node_modules`, `**/dist`, `**/*.tsbuildinfo`, with the Dockerfile's
+  `rm -rf` of the dists demoted to the second line of defence. `docs/DEPLOY.md` is the runbook PR-18 owns: backups (with the key), the
+  restore drill, rotation, password recovery, and the troubleshooting table. Its own commands are review
+  targets, not decoration: they source `.env` before using `$VARS` (`--env-file` fills Compose's interpolation,
+  never your shell), they print whole pino lines (pino writes `msg` last, so `grep -o 'keyring ready.*'` throws
+  away `keyVersion` and `keyFingerprint`, the fields the text then tells you to compare), and §3 says up front
+  what the section does to `pnpm check:env`.
 - **The schema lives in one file and the docs follow it.** `apps/server/src/db/schema.ts` is the source of truth;
   a new column ships with its generated SQL in `apps/server/migrations/` in the same PR, and
   `docs/DATA-MODEL.md` (created by PR-04) is rewritten in that same PR — it is what PR-06/07/09/10 read.
@@ -179,3 +218,33 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   store, and PR-12 added its keys there (`theme`, `sidebarCollapsed`, `treeCollapsed` — the last a **sparse**
   `Set<folderId>` where a collapsed folder is a member and the root is always expanded, so a new folder is open
   and no empty folder costs a stored id) rather than inventing a fifth.
+  store, and PR-12/13 add their keys to that store rather than inventing a fifth.
+- **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
+  cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`
+  `names.ts`, and `apps/web/src/lib/name.ts` is the app's single import site for them (it re-exports the contract API
+  and adds exactly three compositions: the field's error sentence, the prefill, and the request body's name). A
+  component that restates a rule is the second authority PR-05 exists to prevent. In the new-note dialog the `.md`
+  is a **sibling element, never a character**: the input's value is the editable name, so "the suffix cannot be
+  edited or deleted" needs no `keydown` guard enumerating every way a character leaves a field — and the submitted
+  name is `stripMd`'d anyway, because a pasted `report.md` is the one thing that can still get an extension into the
+  value (`notes.name` is extension-free). Uniqueness is a **debounced read of `['tree', userId]`, with no extra
+  endpoint**: a tab that has not fetched the tree simply has no opinion, which is why the `409 CONFLICT` — dialog
+  stays open, text intact, the server's own sentence inline — is part of the feature. The created row enters the tree
+  cache **on confirmation**, not on submit: `POST /api/notes` mints the UUIDv7, and an optimistic row with a
+  client-invented id would put a `/app/note/<id>` link in the sidebar that 404s until the response lands.
+  `NewNoteDialog.tsx` is driven by `useNewNoteDialog()` (`{ openFor, close, dialog }`), which is what PR-12's
+  `TopBar`/`StatusBar`/tree-context-menu buttons call — those files are PR-12's, so PR-15 shipped the affordance and
+  the three trigger shapes in `src/test/new-note-harness.tsx` rather than an app shell.
+- **`Ctrl/Cmd+N` is bound by nothing, and a test proves it** (PR-15): Chromium opens a window/tab before any page
+  handler sees the chord (Firefox/Edge reserve it likewise), so binding it would ship a shortcut that works in
+  Firefox and silently does nothing in Chrome. `new-note-dialog.test.tsx` greps every non-test `.ts`/`.tsx` under
+  `apps/web/src` for the chord and drives the key combination to show it opens, closes, and submits nothing.
+  Keyboard users reach the dialog through its focusable buttons; a chord for it belongs with the palette backlog.
+- **The caret after a create crosses the router through the cache** (PR-15): `openNoteInEditor()` marks
+  `queryKeys.editorFocus` (`['editor-focus']`, holding the id this tab just created) and navigates, and
+  PR-13's `routes/app/note/$noteId.tsx` asks `takesEditorFocus(client, noteId)` on mount. It is a **read, not a
+  consume** — a one-shot take is eaten by the first pass of `main.tsx`'s `StrictMode` double mount, and a caret that
+  only appears in production is the worse bug — and it is not a query parameter, because "created seconds ago" is a
+  fact about the visit rather than about the note. Until PR-13's route exists the navigation is
+  `navigate({ href: noteEditorHref(id) })`, because `to` is typed against a generated tree with no `/app/*` in it;
+  `NOTE_EDITOR_PATH` is exported for the one-line swap when that file lands.

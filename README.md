@@ -31,6 +31,7 @@ reachable from the LAN; host tools dial `localhost`, which falls back to IPv4 wh
 | `make db-reset`                          | `down -v` (destroys `pgdata-dev`) and start a fresh one                         |
 | `make dev`                               | run both apps on the host (`pnpm dev`)                                          |
 | `make build` / `test` / `coverage`       | the `pnpm` equivalents, so the repo root has a single interface                 |
+| `make check-env`                         | `pnpm check:env` — lint the repo-root `.env` against the production rules (PR-18) |
 | `make bootstrap-env`                     | `test -f .env \|\| cp .env.example .env` — every `db-*`/`dev` target runs it first |
 
 **`.env` is created for you and is never required.** `make bootstrap-env` copies `.env.example` when no
@@ -39,6 +40,31 @@ all. That copy is where the optional dev overrides go — `POSTGRES_PORT` to pub
 somewhere else, `HOST_PORT` for the production stack (PR-18). The file deliberately carries **no
 `DATABASE_URL`**: `apps/server/src/env.ts` composes the DSN from the same `POSTGRES_*` values, so one
 `POSTGRES_PORT` edit moves the container and every host tool together. Never commit a real `.env`.
+
+## Production (one published port)
+
+`docker compose --env-file .env -f docker/compose.yml up -d` is the whole deploy: Postgres 16 plus the app,
+migrations applied inside the app before it listens, the SPA served from the same port, and **one** port
+published (`${HOST_PORT:-3000}:3000`) — the database publishes nothing. [`docs/DEPLOY.md`](docs/DEPLOY.md)
+is the operator runbook (first deploy, the preflight, backups and the key, the restore drill, key rotation,
+TLS in front, password recovery, troubleshooting); the Compose-level commands in it are asserted by CI's
+`build` job against `docker/compose.yml` itself. The short version, from the repo
+root:
+
+```bash
+git clone https://github.com/billy-the-ape/note-taker && cd note-taker
+printf 'NOTE_ENCRYPTION_KEY=%s\n' "$(docker run --rm node:22-slim node -e \
+  'console.log(require("crypto").randomBytes(32).toString("base64"))')" > .env
+# then append POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD (openssl rand -hex 32) — docs/DEPLOY.md §2
+docker compose --env-file .env -f docker/compose.yml config    # fails naming NOTE_ENCRYPTION_KEY, no containers
+docker compose --env-file .env -f docker/compose.yml up -d     # http://<host>:${HOST_PORT:-3000} → /setup
+```
+
+Same two flags as the dev stack, same reason (`docs/DEPLOY.md` §1), and `make prod-up`/`prod-ps`/`prod-logs`
+behind them. `pnpm check:env` lints a production `.env` — the file, not your shell — against the rules
+`env.ts` enforces at boot, and CI asserts it against four fixtures
+(`scripts/fixtures/`: `prod-missing-key.env`, `prod-no-dsn.env` for the rules; `prod-redaction.env`,
+`prod-wrong-variable.env` for the promise that a failure report never prints the key it is reporting on).
 
 **Why the Makefile spells Docker out.** Compose resolves its project directory from the compose file's
 location, so `docker compose -f docker/compose.dev.yml …` alone would load `.env` from `docker/` instead

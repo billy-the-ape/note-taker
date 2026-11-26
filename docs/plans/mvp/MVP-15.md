@@ -98,3 +98,66 @@ target-folder defaulting, open-in-editor-after-create, lib/name.ts wrapper. No C
 - vitest run: prefill + caret, suffix immutability, disabled Create (invalid + collision), root vs folder target,
   same-millisecond uniquify, 409 keeps dialog open
 ```
+
+## 9. What landed (record, written by the PR that did the work)
+
+**Neither `Depends on` UI PR was in this tree.** `main` was at **PR-10**: no PR-12 (`/app` shell, `TopBar`,
+`StatusBar`, tree context menu, `features/tree/*`, the shared `RenameDialog`/`MoveDialog`/`DeleteConfirm`), no
+PR-13 (`routes/app/note.$noteId.tsx`, `features/notes/note.queries.ts`). §2's "you can assume" therefore had to be
+substituted in three places, each recorded below, and each substitution is a file the owning PR has to absorb
+rather than a decision it can re-make.
+
+| §6 criterion | Where it is asserted |
+| --- | --- |
+| Prefill `new-file-<Date.now()>.md`, caret before the `.md` | `components/notes/new-note-dialog.test.tsx` → "opens on new-file-\<ms\>.md…": value is extension-free, the suffix is the input's next sibling, `selectionStart === value.length` |
+| The `.md` cannot be edited or deleted, and never reaches the body | "survives everything the keyboard can do…": clear, `Backspace`, `Delete`, then typing a name that carries `.md`; the body still says `quarterly report` |
+| Live invalid-name message for empty, `a/b`, `foo.md.md`, 121 chars, trailing space | `it.each` over the five §6 values, asserting `aria-invalid`, the disabled button, and that the sentence is `NAME_REJECTION_MESSAGES[…]` verbatim |
+| A tree-cache collision disables Create with "name already used in this folder" | "calls a name that is already a sibling…", which also proves the check is debounced (`queryByText` is null synchronously, `NAME_CHECK_DEBOUNCE_MS > 0`) and sent no request |
+| Selected folder ⇒ its `folderId`; nothing selected ⇒ `null` | "creates in the selected folder…" / "creates in the root…", asserted on the recorded request body, plus the context-menu row as a third target |
+| After create the note is open in the editor, focused, at the new URL | "leaves the dialog, opens the note in the editor…": URL, `document.activeElement`, `data-wants-focus`, the name read back from `['note', id]`, and the metadata-only row in `['tree', userId]` |
+| A second dialog in the same millisecond still gets a unique name | "gives a second dialog opened in the same millisecond…", with `Date.now` frozen at `HARNESS_MS`; the second prefill is `new-file-1700000000000-2` |
+| A server `409` keeps the dialog open, inline, with the text preserved | "keeps the dialog open, says the server's sentence…": the envelope's own `message` under `new-note-server-error`, the box still holding `shared name`, one request sent |
+| No `Ctrl/Cmd+N` binding (grep + the chord does nothing) | "is bound by nothing in this app…" (closed ⇒ opens nothing; open ⇒ no close, no submit, no create, no focus move) and "appears in no source file…" which greps every non-test `.ts`/`.tsx` under `apps/web/src` |
+| `apps/web/src` ≥ 55/55/50/55 | `vitest run --coverage`: 98.17 statements / 93.89 branches / 98.02 functions / 99.3 lines, with `src/lib/**` at 98.44/94.05/96.77/99.09 |
+
+- **The three "New note" buttons are not wired, because they do not exist** (§4). `components/layout/TopBar.tsx`,
+  `StatusBar.tsx` and `components/tree/TreeContextMenu.tsx` are PR-12's files, listed in the plan's own
+  merge-conflict hotspots, and this PR has no business creating an app shell. What it ships instead is the
+  affordance PR-12 calls: `useNewNoteDialog()` returns `{ open, target, openFor, close, dialog }`, so `TopBar`
+  and `StatusBar` are `<Button onClick={() => newNote.openFor()}>New note</Button>` and a context-menu row is
+  `onSelect={() => newNote.openFor({ folderId: folder.id, folderName: folder.name })}`, with `{newNote.dialog}`
+  rendered once per host. `test/new-note-harness.tsx` renders all three shapes — plain button, folder-targeted
+  button, `role="menuitem"` — which is where §4's wiring is actually proven today.
+- **"Uniqueness against the tree cache" reads `['tree', userId]` and nothing else** (`readTreeCache`), with no
+  endpoint added. Until PR-12's query writes that key the cache is empty and every name looks free; that is the
+  honest reading of "the tab that has not fetched the tree has no opinion", and it is why the `409` branch is
+  part of the feature rather than an error path.
+- **A created note enters the cache when the server confirms it, not on submit.** §5 asks for "optimistic tree
+  update via the existing mutations"; there were no existing mutations, and the one thing this PR cannot fake is
+  the id — `POST /api/notes` mints the note's UUIDv7, so an optimistically inserted row would carry a
+  client-invented id into `/app/note/<id>`, i.e. a sidebar link that 404s until the response lands. So
+  `addNoteToTreeCache` runs in `onSuccess` (metadata only, `noteSchema.parse`, never plaintext in a tree entry)
+  alongside `setQueryData(['note', id])`, and the tree is invalidated with `refetchType: 'none'`. Create is
+  `disabled`/`loading` while the request is in flight, which is the double-submit guard the optimistic row would
+  otherwise have had to be.
+- **The editor handoff is `queryKeys.editorFocus`.** PR-15 writes it, PR-13 reads it: `openNoteInEditor()` marks
+  `['editor-focus'] = noteId` and navigates, `takesEditorFocus(client, noteId)` is what
+  `routes/app/note.$noteId.tsx` asks on mount. It is deliberately *not* consumed — a one-shot read is eaten by
+  the first pass of `main.tsx`'s `StrictMode` double-mount, and a caret that only appears in production is a
+  worse bug than a sticky one. It is also not a query parameter: "created seconds ago" is not a property of the
+  note, and a `?focus=1` would be bookmarked and re-opened.
+- **`navigate({ href })`, not `to`.** `/app/note/$noteId` is not in `routeTree.gen.ts` until PR-13 creates the
+  file, and `to` is typed against that tree — `NOTE_EDITOR_PATH` is exported so the swap to
+  `navigate({ to: NOTE_EDITOR_PATH, params: { noteId } })` is one line, in the same call, with the marking
+  unchanged.
+- **`apps/web/src/test/new-note-harness.tsx` is a stand-in for PR-12's chrome and PR-13's editor page, and is
+  documented as one.** Its `EditorPage` is exactly PR-13's contract (`getQueryData(['note', id])`, focus when
+  `takesEditorFocus`); its chrome is exactly the three triggers PR-12 wires. When either PR lands it moves those
+  lines into its own files and keeps this harness's assertions — the focus handoff, the URL, and the three
+  affordance shapes are PR-15's acceptance evidence, not scaffolding to delete.
+- **`data-testid`s this PR adds, in PR-12's naming style, for PR-19:** `new-note-dialog`, `new-note-title`,
+  `new-note-target` (the "created in your home folder / in Ideas" sentence), `new-note-name` (the input, also its
+  `id`), `new-note-suffix` (the fixed `.md`), `new-note-create`, `new-note-cancel`, `new-note-server-error`
+  (the `409`/network line), `new-note-form`. `new-note-name` and `new-note-suffix` are the pair an e2e check needs:
+  the assertion "the suffix survived typing" is `suffix.textContent === '.md'` next to
+  `input.value === 'quarterly report.md'`.

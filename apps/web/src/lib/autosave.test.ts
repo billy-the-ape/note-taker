@@ -364,7 +364,11 @@ describe('a flush that arrives mid-backoff (§5: the replay comes first)', () =>
   // newer text: a fresh capture written against the old `baseVersion` is exactly how a lost reply
   // becomes a phantom conflict, and it also handed the spent retry budget back. So a flush during a
   // backoff sends **the request the backoff owes**, sooner, and the newer buffer goes in the window
-  // after that request settles — which is what §5 already promises for a keystroke.
+  // after that request settles — which is what §5 already promises for a keystroke. `pagehide` is the
+  // one trigger allowed to supersede the owed request (§6: a dying page cannot settle a conflict, and
+  // losing the buffer is the worse loss), which is why `flushOnHide` applies this rule *before* it picks
+  // its transport — a tab switch is the ordinary `hidden` case, and a surviving page must not be shown a
+  // conflict caused by its own lost reply.
   it('replays the owed request when leaving the tab asks for a flush, and never shows a phantom conflict', async () => {
     const h = start({ content: 'body', version: 1 });
     // The lost response itself: `PUT(bodyX, base 1)` lands, its reply does not.
@@ -423,6 +427,112 @@ describe('a flush that arrives mid-backoff (§5: the replay comes first)', () =>
     await tick(1);
     await flushed();
     expect(h.calls).toHaveLength(3);
+  });
+
+  it('does not take the keepalive transport on a tab switch while a replay is owed', async () => {
+    // The hidden trigger goes through the unload transport, because a closing tab hides before it
+    // unloads — and that transport sends the *newest* buffer, which is the request this group forbids.
+    // Worse, the ordinary case for `hidden` is a tab switch: a page that survives, to display a conflict
+    // banner about its own lost reply, with the backoff that would have resolved it thrown away.
+    const h = start({ content: 'server text' });
+    h.reply(dropped(), versionConflict('bodyX', 2), ok(3));
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'retrying', attempt: 1 });
+    h.machine.onEdit('bodyXY typed during the backoff');
+
+    expect(h.machine.flushOnHide()).toBe('ordinary');
+    expect(h.calls.map(({ content, baseVersion, via }) => ({ content, baseVersion, via }))).toEqual([
+      { content: 'bodyX', baseVersion: 1, via: 'put' },
+      { content: 'bodyX', baseVersion: 1, via: 'put' },
+    ]);
+
+    await tick(1);
+    expect(h.machine.snapshot()).toMatchObject({ state: 'dirty', version: 2 });
+    expect(h.machine.snapshot().conflict).toBeUndefined(); // no banner for the only writer there is
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.calls[2]).toMatchObject({
+      content: 'bodyXY typed during the backoff',
+      baseVersion: 2,
+      via: 'put',
+    });
+    expect(h.peak()).toBe(1);
+  });
+
+  it('re-funds the retry schedule when a person asks again from the spent-budget error state', async () => {
+    // A flush during a backoff keeps the spent budget — but `Ctrl/Cmd+S` is a person deciding to try
+    // again, which is §4's `error` row, and the replay branch used to bypass the reset `retry()` does.
+    // Two consequences, both real: `attempt` stayed at 6, so the next failure was terminal instead of
+    // opening a fresh 1 s window; and `failure` stayed set, and `saveStatusText` reads `failure` before
+    // it reads the state, so the pill said "Not saved — …" with `data-state="error"` over a request that
+    // was on its way out.
+    const h = start({ content: 'body' });
+    h.reply(
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      ok(9),
+    );
+    h.machine.onEdit('body under the outage');
+    for (const ms of [AUTOSAVE_DEBOUNCE_MS, ...AUTOSAVE_BACKOFF_MS]) {
+      await tick(ms);
+      await flushed();
+    }
+    expect(h.machine.snapshot()).toMatchObject({
+      state: 'error',
+      attempt: AUTOSAVE_BACKOFF_MS.length + 1,
+    });
+    expect(h.machine.snapshot().failure).toBeDefined();
+
+    expect(h.machine.flush()).toBe('written');
+    expect(h.machine.snapshot()).toMatchObject({ state: 'saving', attempt: 0 });
+    expect(h.machine.snapshot().failure).toBeUndefined();
+
+    await tick(1);
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'retrying', attempt: 1 });
+    await tick(1_000); // the schedule's first window again, which only a person bought
+    await flushed();
+    expect(h.calls).toHaveLength(8);
+    expect(h.machine.snapshot()).toMatchObject({ state: 'clean', version: 9 });
+  });
+
+  it('lets an automatic flush ask for the owed request without buying a schedule it was not owed', async () => {
+    // The other side of the same line: a `blur` is not a person asking for another cycle. It clears the
+    // stale message, because the pill must not describe a failed cycle while a request is in flight, but
+    // the spent budget stays spent — one more try, and `error` again if that fails.
+    const h = start({ content: 'body' });
+    h.reply(
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+      serverError(),
+    );
+    h.machine.onEdit('body under the outage');
+    for (const ms of [AUTOSAVE_DEBOUNCE_MS, ...AUTOSAVE_BACKOFF_MS]) {
+      await tick(ms);
+      await flushed();
+    }
+    expect(h.machine.snapshot().state).toBe('error');
+
+    expect(h.machine.flushAutomatic()).toBe('written');
+    expect(h.machine.snapshot().state).toBe('saving');
+    expect(h.machine.snapshot().failure).toBeUndefined();
+
+    await tick(1);
+    await flushed();
+    expect(h.machine.snapshot().state).toBe('error');
+    await tick(1_000); // the schedule's first window again, which only a person bought
+    expect(h.calls).toHaveLength(7);
   });
 
   it('takes Ctrl+S mid-backoff as "send it now", which is the owed request now', async () => {

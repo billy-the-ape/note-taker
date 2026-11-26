@@ -547,6 +547,52 @@ describe('the unload budget (§6, §8)', () => {
     expect(saveStatusText(result.current.snapshot, result.current.autosave)).toBe('Saving…');
   });
 
+  it('replays the owed request, not the newest buffer, when `hidden` arrives during a backoff', async () => {
+    // The seam between last round's rule and this round's transport. `hidden` now prefers the keepalive
+    // path, and the keepalive path sends the *newest* buffer — so on a tab switch, where the page
+    // survives to display whatever comes back, it used to write the new text against a version a lost
+    // reply had already left behind and take a `VERSION_CONFLICT` carrying its own earlier write.
+    let puts = 0;
+    const fetch = installFetch({
+      [`PUT ${CONTENT_PATH}`]: () => {
+        puts += 1;
+        if (puts === 1) return { status: 500, body: { error: { code: 'INTERNAL', message: 'boom' } } };
+        // The row holds the bytes that were never acknowledged, at the version they moved it to.
+        if (puts === 2) return { status: 409, body: versionConflictBody('x', 8) };
+        return { status: 200, body: noteBody(NOTE_ID, { content: 'xy', version: 9 }) };
+      },
+    });
+    const { result } = boot({ autosave: true });
+
+    act(() => {
+      result.current.edit('x');
+    });
+    await advance(1_200);
+    expect(result.current.snapshot).toMatchObject({ state: 'retrying', attempt: 1 });
+
+    act(() => {
+      result.current.edit('xy');
+    });
+    hideTab();
+
+    const during = fetch.sent.filter((entry) => entry.method === 'PUT');
+    expect(during).toHaveLength(2);
+    // What left is the request the backoff owes, on the ordinary transport — rule 1 and the owed replay
+    // outrank the unload transport, because this is the one `hidden` that is only a tab switch.
+    expect(during[1]).toMatchObject({ keepalive: undefined });
+    expect(bodyOf(during, 1).content).toBe('x');
+
+    await advance(1_200);
+    const after = fetch.sent.filter((entry) => entry.method === 'PUT');
+    expect(after).toHaveLength(3);
+    // Equal payload: the write had landed, so no banner, the version is adopted, and the newer text goes
+    // out behind it against the row it is actually newer than.
+    expect(bodyOf(after, 2).content).toBe('xy');
+    expect(after[2]).toMatchObject({ keepalive: undefined });
+    expect(result.current.snapshot).toMatchObject({ state: 'clean', version: 9 });
+    expect(result.current.snapshot.conflict).toBeUndefined();
+  });
+
   it('does not prompt when there is nothing unsaved', () => {
     installFetch({});
     const { result } = boot({ autosave: true });

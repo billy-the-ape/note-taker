@@ -10,7 +10,7 @@
  *   intact rather than flattening it into a message.
  * * `putNoteContentKeepalive` — the same `PUT` on the way out of the browser (§6). Normal
  *   `X-CSRF-Token` headers, `keepalive: true`, and no expectation that anybody reads the answer.
- * * `createNote` — the `404` escape hatch: the note was deleted elsewhere, and the honest way out is a
+ * * `createNoteFromBuffer` — the `404` escape hatch: the note was deleted elsewhere, and the honest way out is a
  *   **new** note, offered as a button, never done by the machine on its own.
  *
  * Everything goes through the `api` singleton, so the CSRF header, the one-shot refresh-and-replay and

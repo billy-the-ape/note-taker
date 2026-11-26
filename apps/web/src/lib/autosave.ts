@@ -722,7 +722,7 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     notify();
   }
 
-  function writeNow(): FlushOutcome {
+  function writeNow(manual = false): FlushOutcome {
     if (stopped) return 'stopped';
     if (conflict !== undefined) return 'conflict';
     if (inFlight !== undefined) return 'in-flight';
@@ -731,10 +731,18 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
       // `baseVersion`, would be answered by a `VERSION_CONFLICT` carrying **our own** earlier write —
       // and §5 would read that as a second writer, which is the phantom conflict this file exists to
       // prevent. So the owed request goes first, and a flush arriving mid-backoff (a `blur`, a note
-      // switch, an unmount, the 10 s deadline, Ctrl+S) only moves that replay earlier: the spent
-      // budget stays spent, and anything typed since goes out in the window after it settles.
+      // switch, an unmount, the 10 s deadline, `visibilitychange → hidden`, Ctrl+S) only moves that
+      // replay earlier: anything typed since goes out in the window after it settles.
+      //
+      // The message a failed cycle left has to go, whatever asked for this: `replayNow` moves the state
+      // to `saving`, and the pill reads `failure` before it reads the state, so it would keep saying
+      // "Not saved — …" with `data-state="error"` over a request that is on its way out. Only a person
+      // re-funds the schedule, though. §4's `error` row makes the next attempt the user's decision, so a
+      // `blur` that lands here gets exactly one more try and the spent budget buys nothing.
+      failure = undefined;
+      if (manual) attempt = 0;
       const started = replayNow();
-      notify(); // the pill is describing a request again, so the stale `attempt`/message must go
+      notify();
       return started ? 'written' : 'nothing-to-write';
     }
     if (!dirty()) {
@@ -745,8 +753,8 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
       notify();
       return 'nothing-to-write';
     }
-    // A user-initiated write with nothing owed: a fresh failure cycle, so the spent budget and any
-    // stale message are dropped with it.
+    // A write with nothing owed: a fresh failure cycle, so the spent budget and any stale message are
+    // dropped with it — the same two lines the replay branch above performs for a manual flush.
     attempt = 0;
     failure = undefined;
     clearTimer('retry');
@@ -757,8 +765,9 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
 
   function flush(): FlushOutcome {
     // Explicit intent: `Ctrl/Cmd+S` and the Save button work with autosave off (§6), which is the
-    // only reason the flag is a preference rather than an on/off switch for saving itself.
-    return writeNow();
+    // only reason the flag is a preference rather than an on/off switch for saving itself. `manual`
+    // because a person pressing it re-funds a spent retry schedule (§4's `error` row).
+    return writeNow(true);
   }
 
   function flushAutomatic(): FlushOutcome {
@@ -803,11 +812,23 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
    * A closing tab hides **first**: the unload steps are hide → `beforeunload` → `pagehide`. An ordinary
    * `PUT` started here is therefore the quiet way to lose the unload write — it occupies rule 1, the
    * unload aborts it, and `pagehide` then has nothing it is allowed to start, so the keepalive path is
-   * never reached on the ordinary close sequence at all. When the buffer fits the unload budget the
-   * hidden flush goes out on the keepalive transport instead, which is also a correct choice for a mere
-   * tab switch: the page survives, and a `keepalive` request answers normally while it is alive.
+   * never reached on the ordinary close sequence at all. When the buffer fits the unload budget **and
+   * nothing is owed** the hidden flush goes out on the keepalive transport, which is also a correct
+   * choice for a mere tab switch: the page survives, and a `keepalive` request answers normally while it
+   * is alive. With a replay owed it defers to {@link writeNow}, because a surviving page must not be
+   * told about a second writer that is its own lost reply.
    */
   function flushOnHide(): 'keepalive' | 'ordinary' {
+    // **A replay is owed.** Hidden is a trigger, not an unload: most of the time the page survives the
+    // tab switch, and a keepalive write of the newest buffer would be answered by a `VERSION_CONFLICT`
+    // carrying our own lost write — a conflict banner shown to the person who caused it, on a page that
+    // is still open and can retry. So the owed request goes first here as it does for every other
+    // trigger; `pagehide` alone keeps the right to supersede it, because a dying page cannot settle a
+    // conflict, and losing the buffer is the worse loss.
+    if (pendingReplay !== undefined || retryTimer !== undefined) {
+      flushAutomatic();
+      return 'ordinary';
+    }
     if (canFlushOnUnload()) {
       flushOnUnload();
       return 'keepalive';
@@ -870,7 +891,7 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     // whose reply went missing would overwrite the stranger this resolution is choosing to step over.
     pendingReplay = undefined;
     notify();
-    return writeNow();
+    return writeNow(true);
   }
 
   function useServer(): void {
@@ -894,13 +915,14 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
 
   function retry(): FlushOutcome {
     // §4's "manual retry". From `error` it is also the way back: the budget and the message both
-    // belong to the failed cycle, so both are dropped before the write starts.
+    // belong to the failed cycle, so both are dropped before the write starts — which is what the
+    // `manual` flag below would do anyway, kept here too because the timers go with them.
     if (current === 'error') {
       attempt = 0;
       failure = undefined;
       clearAllTimers();
     }
-    return writeNow();
+    return writeNow(true);
   }
 
   function snapshot(): AutosaveSnapshot {

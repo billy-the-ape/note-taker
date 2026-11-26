@@ -258,7 +258,11 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `blur`, a note switch, an unmount, `Ctrl/Cmd+S` — re-sends that same request rather than capturing the buffer again,
   because newer text written against the abandoned `baseVersion` comes back as a `VERSION_CONFLICT` carrying *our own*
   earlier write (the phantom conflict this file exists to prevent) and would hand the spent retry budget back; such a
-  flush only moves the replay earlier. `adopt`/`keepMine`/`useServer` drop the owed replay, since each has just
+  flush only moves the replay earlier; a `Ctrl/Cmd+S` or `Retry` from the spent-budget `error` state is the
+  one exception, because that row of §4 *is* a person deciding to try again — it re-funds the schedule and
+  drops the stale failure, while a `blur` that lands there gets one more try and nothing else, and either
+  way the message goes, since `saveStatusText` reads `failure` before `state` and would otherwise keep
+  saying "Not saved — …" over a request that is on its way out. `adopt`/`keepMine`/`useServer` drop the owed replay, since each has just
   answered what the row holds. No second debounce window and no 10 s deadline is armed beside a scheduled replay,
   either, or §4's `1s,2s,4s,8s,30s` schedule stops being exact. And because `snapshot()` is cached with `notify()` the
   only thing that republishes it, **every** path that changes the buffer publishes — including the `stopped` and
@@ -270,9 +274,12 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `visibilitychange`, `pagehide`, `beforeunload` and `Ctrl/Cmd+S`; `saveNow()` (the flag is a preference, not a
   disable-switch for saving) writes even with `settings.autosave === false`. The unload flush is
   `fetch(…, { keepalive: true })` with the ordinary CSRF header, and **`visibilitychange → hidden` uses that
-  transport too** whenever the body fits: a closing tab hides *before* `pagehide`, so an ordinary `PUT` started on
-  `hidden` would occupy rule 1, get aborted by the unload, and leave `pagehide` with nothing it may start — the
-  keepalive path would then never run on a normal close. §6's 60 KiB is a budget on the **request body**, measured
+  transport too** whenever the body fits **and nothing is owed** (a hidden trigger whose page survives the
+  tab switch must not be the one that pre-empts a replay: the newest buffer on the old `baseVersion` comes
+  back as a conflict about our own lost reply, on a page that is still open to show it). A closing tab hides
+  *before* `pagehide`, so an ordinary `PUT` started on `hidden` would occupy rule 1, get aborted by the
+  unload, and leave `pagehide` with nothing it may start — the keepalive path would then never run on a
+  normal close, which is why the transport exists at all. §6's 60 KiB is a budget on the **request body**, measured
   with `contentWriteBytes` (`JSON.stringify({content, baseVersion})`), because escaping turns a 58 KiB buffer of
   quotes into a ~116 KiB body that `fetch` rejects before it leaves; `note.mutations.test.ts` pins the two-key shape
   that measure assumes. Over the budget nothing is attempted and the `beforeunload` guard — armed by exactly the

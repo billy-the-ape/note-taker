@@ -742,7 +742,7 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
   reacts to the latter.
 
-**Six things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
+**Seven things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
 
 - **Nothing leaves while a reply is owed.** A request that went out and never came back is an answer the client has
   not read. So every flush that arrives during a backoff — the debounce, the 10 s cap, `blur`,
@@ -754,6 +754,14 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   above rather than a second interpretation of it. The 10 s cap opens no second window beside a scheduled replay, and
   no 10 s deadline is armed next to a 30 s backoff, because "the backoff is exactly 1 s, 2 s, 4 s, 8 s, 30 s" is a
   promise this section makes.
+- **A person re-funds the retry schedule; a trigger does not, and neither keeps the old failure.** A flush during a
+  backoff buys nothing, but `Ctrl/Cmd+S` and *Retry* arriving from the spent-budget `error` state are §4's own "manual
+  retry" row, so they clear `attempt` and the message before the replay — without that, the spent `attempt` made the
+  next failure terminal instead of opening a fresh 1 s window, and the pill read `failure` before it read the state
+  (`saveStatusText`'s precedence), so it said "Not saved — …" with `data-state="error"` over a request that was on its
+  way out. A `blur`, a note switch or a `hidden` that lands in the same state sends the owed request and clears the
+  message, because a pill must never describe a failed cycle while a request is in flight, but it does not buy a new
+  schedule: §4 makes the next cycle the user's decision.
 - **An explicit resolution supersedes the owed replay.** *Keep mine*, *Use server* and a re-read of the note each say
   what the row holds and at which version, which is the only question a replay exists to ask, so each drops it. The
   unload `keepalive` write is the one place that sends newer text while a reply is owed: only one request can leave an
@@ -770,12 +778,18 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   exactly that text, or `pagehide` still able to start one — those need no prompt. An **ordinary** in-flight `PUT`
   never counts as carried, because the unload aborts it, and an autosave-off or over-budget buffer is never carried
   either. A prompt over a save already leaving is noise; a missing prompt over a buffer that cannot leave is data loss.
-- **`visibilitychange → hidden` goes out on the unload transport, and the budget measures the body.** A closing tab
-  hides *before* `pagehide` (the unload steps are hide → `beforeunload` → `pagehide`), so the ordinary `PUT` a `hidden`
-  handler used to start occupied rule 1, was aborted by the unload, and left `pagehide` with nothing it may start —
-  the `keepalive` path never ran on a normal close. Within the budget `hidden` now sends `fetch(…, {keepalive: true})`,
-  and a mere tab switch is unharmed, because a live page reads a `keepalive` reply normally. That ~64 KiB cap is a cap
-  on the **request body**, which `lib/api.ts` builds with `JSON.stringify({content, baseVersion})`, and escaping is not
+- **`visibilitychange → hidden` goes out on the unload transport — but only when nothing is owed — and the budget
+  measures the body.** A closing tab hides *before* `pagehide` (the unload steps are hide → `beforeunload` →
+  `pagehide`), so the ordinary `PUT` a `hidden` handler used to start occupied rule 1, was aborted by the unload, and
+  left `pagehide` with nothing it may start — the `keepalive` path never ran on a normal close. Within the budget
+  `hidden` now sends `fetch(…, {keepalive: true})`, and a mere tab switch is unharmed, because a live page reads a
+  `keepalive` reply normally. **The first bullet outranks that transport:** with a replay owed, `hidden` behaves like
+  every other trigger and sends the owed request, because the ordinary `hidden` is a tab switch whose page survives,
+  and a keepalive write of the newest buffer against the abandoned `baseVersion` is answered by a `VERSION_CONFLICT`
+  carrying *our own* lost write — a conflict fork about the reader's own edit, on a page that is still open and could
+  have retried. `pagehide` alone keeps the right to supersede the owed request (the bullet above). That ~64 KiB cap is
+  a cap on the **request body**, which `lib/api.ts` builds with `JSON.stringify({content, baseVersion})`, and escaping
+  is not
   free: a `"` or a `\n` costs two bytes and a control character six, so 58 KiB of quotes is a ~116 KiB body that
   `fetch` rejects before it leaves — *after* the predicate had promised the buffer fitted. `contentWriteBytes` is that
   measure, and the two-key body it assumes is pinned by `note.mutations.test.ts`.

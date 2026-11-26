@@ -166,6 +166,12 @@ jobs:
           # *filling the line in* is what turns the preflight green, and the two redaction fixtures reuse the
           # same value so one prefix grep covers all of them.
           FIXTURE_KEY: cHIxOC1maXh0dXJlLWtleS1ub3QtYS1zZWNyZXR4eCE=
+          # A second key for the wrong-variable fixture: base64 of 32 bytes beginning `0xfc 0xfd`, so its base64
+          # **starts with `/`**. Base64's alphabet contains `/`, so about one key in 64 does — and the exemption
+          # that keeps `NOTE_ENCRYPTION_KEY_FILE=/run/secrets/note_key` diagnosable used to exempt any token
+          # starting with `/`. Every earlier fixture began `cHIx…`, so CI was asserting the redaction rule with
+          # keys that could not reach the branch; this is the prefix that keeps `looksLikePath` honest.
+          SLASH_KEY: /P1wcjE4LXNsYXNoLWtleS1ub3QtYS1zZWNyZXQhISE=
         run: |
           set -euo pipefail
           report=$(mktemp -d)
@@ -251,6 +257,13 @@ jobs:
           if grep -qF "${FIXTURE_KEY:0:20}" "$report/wrongvar.log"; then
             echo '::error::check:env printed a key it was only reporting the shape of — length only, whatever variable it was typed into'
             sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
+            exit 1
+          fi
+          #    The same log, the leading-`/` key: this is the assertion that fails against the code before this
+          #    commit, and the reason the exemption cannot widen again without CI noticing.
+          if grep -qF "${SLASH_KEY:0:20}" "$report/wrongvar.log"; then
+            echo '::error::check:env printed the leading-slash key — the path exemption must not swallow base64 that merely happens to start with /'
+            sed -e "s|${SLASH_KEY}|${SLASH_KEY:0:4}<REDACTED>|" "$report/wrongvar.log"
             exit 1
           fi
           grep -q 'not printed' "$report/wrongvar.log" || {

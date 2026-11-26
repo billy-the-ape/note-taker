@@ -241,16 +241,36 @@ function preview(value: string): string {
 const MATERIAL_RUN = /[A-Za-z0-9+/]{20,}/;
 
 /**
+ * Is this token a filesystem path rather than a secret? Narrow on purpose, because `/` is **in** base64's
+ * alphabet: roughly one key in 64 begins with one, and a key waved through as "a path" is 40 characters of key
+ * in a terminal — the exact leak this file exists to prevent, so `startsWith('/')` alone was not a rule, it was
+ * a hole (docs/DEPLOY.md §3's rule about `NOTE_ENCRYPTION_KEY_FILE` is a rule about a *path* and printing it
+ * is the diagnostic, which is why the exemption exists at all). A token is a path only if it also cannot be
+ * mistaken for a key by any test a path fails: at least two separators, no `=` (base64 padding — and every
+ * base64 of a 32-byte key ends in `=`), no `+`, and no uppercase letter (paths are lowercase by convention;
+ * base64 of 32 random bytes is mixed-case with probability 1 - 2^-43). A genuinely exotic path that breaks
+ * those conventions is reported by length, which is the safe direction for a mistake.
+ */
+function looksLikePath(token: string): boolean {
+  return (
+    token.startsWith('/') &&
+    token.split('/').length >= 3 &&
+    !token.includes('=') &&
+    !token.includes('+') &&
+    !/[A-Z]/.test(token)
+  );
+}
+
+/**
  * Would a report about this text hand a reader a key? A token holding a 20+ character run of base64 counts,
  * unless the token is shaped like something a human typed as a *setting* rather than pasted as a secret: `.`,
- * `_`, `:`, `-` and a leading `/` mark a path, a URL or a name, and none of them occur in base64. That
- * exemption is not cosmetic — §3's rule about `NOTE_ENCRYPTION_KEY_FILE` is a rule about a *path*, and
- * `/var/lib/postgresql/data` is 24 characters of the wrong alphabet to be redacted while being diagnosed.
+ * `_`, `:` and `-` never occur in base64 at all, and `looksLikePath` is the deliberate, narrow carve-out for
+ * real paths.
  *
- * Checked per whitespace-separated token, so `APP_NAME="<key> <key>"` is still recognised, and `20` is the
- * floor: shorter than that, a value cannot be a note-encryption key, and `preview()`'s 40-character cut
- * would print a *prefix* of one, which is the part that matters to an attacker and the part that mattered in
- * the leak this function exists for.
+ * Checked per whitespace-separated token, so `APP_NAME="<key> <key>"` and a key with `\n` glued to it are still
+ * recognised, and `20` is the floor: shorter than that a value cannot be a note-encryption key, while
+ * `preview()`'s 40-character cut prints a *prefix* of a longer one — which is the part that mattered in the
+ * leak, and the reason the CI fixtures grep a prefix rather than a whole value.
  */
 function looksLikeMaterial(value: string): boolean {
   return value
@@ -258,11 +278,11 @@ function looksLikeMaterial(value: string): boolean {
     .some(
       (token) =>
         MATERIAL_RUN.test(token) &&
+        !looksLikePath(token) &&
         !token.includes('.') &&
         !token.includes('_') &&
         !token.includes(':') &&
-        !token.includes('-') &&
-        !token.startsWith('/'),
+        !token.includes('-'),
     );
 }
 
@@ -699,7 +719,9 @@ function checkNoteKey(report: Report): void {
     }
     const problem = keyProblem(`${KEY_PREVIOUS}[${safeTag(tag)}]`, material);
     if (problem !== undefined) report.fail(problem);
-    if (version !== undefined && Number(tag) === version) {
+    // `version` is `report.integer(…) ?? DEFAULT_KEY_VERSION`, so it is always a number: absent means 1,
+    // exactly as `env.ts` treats it, and a map tagged 1 does hold the current key.
+    if (Number(tag) === version) {
       report.fail(
         `${KEY_PREVIOUS} holds the current version ${safeTag(tag)}: the map is decrypt-only and holds *older* keys, ` +
           `while ${KEY_VERSION} is the current one. A rotation is ${KEY_VERSION}=<old>+1 with the old key ` +
@@ -852,7 +874,8 @@ function checkInvariants(report: Report): void {
 
 /** An empty value is a decision nobody made, so it is named — unless a rule above already named it. */
 function checkBlankLines(report: Report): void {
-  for (const key of [...report.keys()]) {
+  // `keys()` is already a fresh array (`[...this.values.keys()]`), so no copy is needed while failing keys.
+  for (const key of report.keys()) {
     if (!report.isSetButEmpty(key)) continue;
     const documented = DOCUMENTED_DEFAULTS.get(key);
     report.fail(

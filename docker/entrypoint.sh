@@ -15,7 +15,8 @@
 #     script would be indistinguishable from a defaulted one.
 #
 # Which is why there is no `pnpm`, no `tsx` and no `.ts` execution here: the runtime layer has no toolchain
-# (`docker history` should be able to prove it). `exec` keeps the Node process as PID 1's child, so SIGTERM
+# (a container walking `/app` can show that; `docker history` cannot — docs/DEPLOY.md §2 step 5). `exec` keeps
+# the Node process as PID 1's child, so SIGTERM
 # from `docker stop` reaches the graceful shutdown handler in `index.ts` instead of killing the shell.
 
 set -eu

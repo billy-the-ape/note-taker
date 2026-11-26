@@ -178,27 +178,49 @@ curl -fsS "http://localhost:${HOST_PORT:-3000}/api/healthz"                     
 docker compose --env-file .env -f docker/compose.yml exec app \
   node -e "console.log(process.env.NODE_ENV)"                                   # production
 docker compose --env-file .env -f docker/compose.yml exec app id -u              # not 0
-docker run --rm --entrypoint sh "$(docker compose --env-file .env \
-  -f docker/compose.yml images -q app)" -c '
-  leak=""
-  for tool in curl wget tsx tsc vite vitest pnpm drizzle-kit biome eslint prettier nodemon pino-pretty; do
-    found=$(command -v "$tool" 2>/dev/null) || continue
-    case "$found" in /app/*) leak="$leak $tool=$found";; esac
+image=$(docker compose --env-file .env -f docker/compose.yml images -q app)
+docker run --rm --entrypoint sh "$image" -c '
+  for tool in tsx tsc vite vitest biome eslint prettier nodemon drizzle-kit playwright typescript curl wget pnpm; do
+    hit=$(find /app -type f -name "$tool" -print 2>/dev/null | head -n1)
+    [ -n "$hit" ] || hit=$(find /app -type d -name "$tool" -path "*/node_modules/*" -print 2>/dev/null | head -n1)
+    [ -n "$hit" ] || continue
+    echo "LEAK, the runtime tree carries $tool: $hit"; exit 1
   done
-  [ -z "$leak" ] || { echo "LEAK, this image put a tool on PATH:$leak"; exit 1; }
-  echo "clean: no build tool or download tool of ours; node $(node -v) as uid $(id -u)"'
+  src=$(find /app -name "*.ts" ! -name "*.d.ts" -print 2>/dev/null | head -n3)
+  [ -n "$src" ] && { echo "LEAK, source shipped instead of compiled output: $src"; exit 1; }
+  owned=$(find /app -user node -print 2>/dev/null | head -n5)
+  [ -n "$owned" ] && { echo "LEAK, the app user owns files it runs from: $owned"; exit 1; }
+  echo "clean: no build or download tool, no .ts source, nothing under /app writable by the app user; node $(node -v) as uid $(id -u)"'
 ```
 
-That last command is the "no toolchain in the runtime layer" check, and it asks the **filesystem** rather than
-`docker history` on purpose. `docker history --no-trunc` prints the *commands* of every layer including the
-base image's, and `node:22-slim`'s ancestors build Node with `apt-get install … curl wget …` in their history
-whether or not the finished image keeps those binaries — so `docker history … | grep curl` reports `LEAK` on a
-perfectly clean image, which is not a check. Grepping only this image's own layers is not much better: our own
-`RUN` lines mention those very tool names while asserting they are absent, so the history text matches either
-way. What can be verified is the narrower claim this file actually makes — **this** image adds no build tool
-and no download tool — and the only way to verify that is to ask a container of the image, judging a hit by
-whether it lives under `/app`, the one place this image writes. A `curl` in `/usr/bin` is the base image's
-business; a `/app/apps/server/node_modules/.bin/vite` is a bug in the Dockerfile, and this prints it.
+That last command is the "no toolchain in the runtime layer" check, and it walks the **filesystem**. Two wrong
+ways were tried before this one: `docker history --no-trunc | grep curl` reports `LEAK` on a correct image
+because the base image's layer *commands* install curl (`node:22-slim`'s ancestors build Node with
+`apt-get install … curl wget …`, whether or not the finished image keeps them), and our own `RUN` lines mention
+those tool names while asserting they are absent — so history text matches either way. `command -v` in a loop
+looks right and is silently inert: it searches `$PATH`, this image puts nothing under `/app` on `$PATH`
+(no `node_modules/.bin`, and `WORKDIR` adds nothing), so every hit is under `/usr/…` and the `/app` branch can
+never fire — a check that prints `clean` whatever happens is not a check.
+
+So the check asks the tree the image actually ships, and it asserts three things, all of them things this file
+claims elsewhere:
+
+* **no build tool, and no download tool** — by name, as a file or as a `node_modules` package. A `/usr/bin/curl`
+  left by the base image is the base's business; `/app/apps/server/node_modules/vite` is a bug in this
+  Dockerfile, and this is what prints it.
+* **no `.ts` source** (`.d.ts` declaration files excepted — `packages/contracts` ships them on purpose, and the
+  runtime stage of the Dockerfile asserts the same rule at build time; this one catches a stage that stopped
+  running).
+* **nothing under `/app` is owned by the app user** — the runtime counterpart of the Dockerfile's `--chown` rule:
+  the code `USER node` executes is root-owned and world-readable, so a compromised process cannot rewrite the code
+  it runs from. Ownership of a volume mount under `/run/secrets` (§3) is deliberately *not* under `/app`, which is
+  why that check is scoped this way.
+
+`$image` is the only variable in the block, which is the point: run the same script against any tag — a staging
+build, a candidate before promotion — and it proves the same three properties of it. Note also what the check is
+*not*: it does not claim the base image has no `curl`, only that this image did not add one, and it does not
+require the pruned tree to have no `node_modules/.bin` at all, because a production dependency shipping a bin link
+is normal — the assertion is about the tool set, by name.
 
 `NODE_ENV` printing `production` with **no `NODE_ENV` entry in `.env`** is the whole configuration story in
 one line: the image bakes `ENV NODE_ENV=production` and `compose.yml` repeats it in the app service, so the

@@ -1482,8 +1482,9 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   `NODE_ENV=production` — `docker compose --env-file .env -f docker/compose.yml exec app node -e "console.log(process.env.NODE_ENV)"`
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
-  the runtime image adds no build or download tool of its own — proven by asking a container of the image
-  (`command -v`, a hit counting only if it lives under `/app`), **not** by `docker history`, whose layer
+  the runtime image adds no build or download tool of its own — proven by asking a container of the image to
+  walk `/app` (no tool by name, no `.ts` source, nothing under `/app` owned by the app user), **not** by
+  `docker history`, whose layer
   *commands* mention `curl` because the base image's ancestors installed it, whether or not the finished image
   keeps it (this sentence corrected while reviewing PR-16: the original read "`docker history` shows no dev deps
   and no `curl`", a check that prints LEAK on a correct image); image runs as uid ≠ 0; boot fails loudly (non-zero) when

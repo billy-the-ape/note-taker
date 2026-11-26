@@ -97,9 +97,14 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   runs as `USER node`, `EXPOSE 3000`, and healthchecks with a **Node `fetch`** — this image installs no download
   tool of its own, and the base's own layers are not knowable from `docker history` (whose layer *commands*
   mention `curl` because `node:22-slim`'s ancestors installed it), so "no toolchain in the runtime layer" is
-  verified by asking a container with `command -v` and counting a hit only under `/app` (`docs/DEPLOY.md` §2
-  step 5) — `docker/entrypoint.sh` is `exec node apps/server/dist/index.js` and nothing else: no pnpm, no
-  tsx, no `.ts`. Env checking and migrations therefore happen **inside** the compiled bootstrap, before the
+  verified by walking `/app` inside a container (`docs/DEPLOY.md` §2 step 5: no tool by name, no `.ts` source,
+  nothing under `/app` owned by the app user). A `command -v` loop is the tempting wrong version — it searches
+  `$PATH`, which contains nothing under `/app`, so it prints `clean` whatever the image contains. **No `COPY` in
+  the runtime stage takes `--chown=node:node`**: application code arrives root-owned and world-readable, so the
+  process cannot rewrite the code it executes, and the runtime stage asserts `find /app -user node` is empty —
+  which CI's `docker build` therefore checks, while §2 step 5 of the runbook is the same three checks for a
+  human with a daemon. `docker/entrypoint.sh` is `exec node apps/server/dist/index.js` and nothing else: no pnpm,
+  no tsx, no `.ts`. Env checking and migrations therefore happen **inside** the compiled bootstrap, before the
   port is bound. The pruned install must carry the **compiled** `@note-taker/contracts`
   (`package.json` + `dist/`, reached through `exports`) and the stage asserts that with Node's own resolver.
   `docker/compose.yml` publishes exactly one port (`${HOST_PORT:-3000}:3000`), pins `PORT=3000` and

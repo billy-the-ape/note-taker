@@ -143,19 +143,27 @@ WORKDIR /app
 # The pruned dependency tree first: the application's own files are written last, so a code change never
 # invalidates this layer. `/app/apps/server/node_modules` is where Node's resolution walk from
 # `/app/apps/server/dist/**` lands, and it is the only `node_modules` in the image.
-COPY --from=prune --chown=node:node /opt/deploy/node_modules ./apps/server/node_modules
+#
+# No `--chown` anywhere below, and that is the assertion rather than an oversight: everything copied here
+# arrives root-owned and world-readable (the build stages run as root with a 022 umask), so `USER node` can
+# read the code it runs and cannot rewrite it — a compromised request handler gets no write on `dist/`,
+# `migrations/`, `node_modules/` or the SPA bundle, and nothing under `/app` needs writing because the notes
+# live in Postgres. `--chown=node:node` on these five COPYs is exactly what an earlier version of this file
+# did, which made the claim below it false for the whole runtime layer; DEPLOY.md §2 step 5 proves the
+# invariant with `find /app -user node`, which must print nothing.
+COPY --from=prune /opt/deploy/node_modules ./apps/server/node_modules
 
 # `main` in this manifest is what `serverVersion()` reads beside the compiled `app.js`, and `dist/scripts/`
 # is how the operator scripts reach the container (see the header).
-COPY --from=build --chown=node:node /app/apps/server/package.json ./apps/server/package.json
-COPY --from=build --chown=node:node /app/apps/server/dist ./apps/server/dist
+COPY --from=build /app/apps/server/package.json ./apps/server/package.json
+COPY --from=build /app/apps/server/dist ./apps/server/dist
 # The committed migration history: `db/migrate.ts` finds this directory by walking up from the compiled
 # file and applies it before `listen()`, which is why `up -d` is the whole upgrade (docs/DEPLOY.md §8).
-COPY --from=build --chown=node:node /app/apps/server/migrations ./apps/server/migrations
+COPY --from=build /app/apps/server/migrations ./apps/server/migrations
 # The SPA, staged at the same workspace-relative path PR-12's `plugins/static-spa.ts` is written against
 # (`apps/web/dist`), so the API process serves it from the one published port and the image needs no second
 # server. Until that plugin lands this is inert payload and `GET /` stays the API's own 404 envelope.
-COPY --from=build --chown=node:node /app/apps/web/dist ./apps/web/dist
+COPY --from=build /app/apps/web/dist ./apps/web/dist
 
 # `exec` is the point of the file: env validation and migrations are the compiled bootstrap's job, inside the
 # process, so what is left here is to start one Node process as PID 1's child.
@@ -164,6 +172,33 @@ COPY --from=build --chown=node:node /app/apps/web/dist ./apps/web/dist
 # that serves notes cannot rewrite the code it is running; and nothing in this image is writable by the app,
 # because the data lives in Postgres.
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# The runtime layer, asserted rather than assumed — and asserted *here*, where CI's `docker build` step runs it,
+# because `docs/DEPLOY.md` §2 step 5 is the same three checks and needs a human with a daemon to execute them.
+# Each line is the twin of a claim made elsewhere in this file and in AGENTS.md:
+#
+#   * no build tool, and no download tool, anywhere in `/app` — by name, as a file or as a `node_modules`
+#     package. The prune stage checks the tree before it is copied; this one checks the layer the app runs in,
+#     which is where a stray `COPY` or a dependency that grew a tool would show up.
+#   * no `.ts` source (`.d.ts` excepted, as in stage 3: declaration files are output, not source).
+#   * nothing under `/app` owned by the app user — the ownership rule this stage used to violate with
+#     `--chown=node:node` on all five COPYs while its comment claimed the opposite. It runs as root, before
+#     `USER node`, so it can see every file: a hit means `USER node` could rewrite the code it executes.
+#
+# Written with `find` and no `$PATH` reasoning on purpose: `command -v` searches `$PATH`, this image puts nothing
+# under `/app` there, so a loop built on it is a check that prints "clean" whatever the image contains.
+RUN set -eu; \
+  for tool in tsx tsc vite vitest biome eslint prettier nodemon drizzle-kit playwright typescript curl wget pnpm; do \
+    hit=$(find /app -type f -name "$tool" -print -o -type d -name "$tool" -path '*/node_modules/*' -print | head -n1); \
+    if [ -n "$hit" ]; then echo "$tool is in the runtime layer: $hit"; exit 1; fi; \
+  done; \
+  if find /app -name '*.ts' ! -name '*.d.ts' -print | grep -q .; then \
+    echo 'a source .ts file is in the runtime layer'; exit 1; \
+  fi; \
+  owned=$(find /app -user node -print | head -n5); \
+  if [ -n "$owned" ]; then echo "the app user owns files it runs from: $owned"; exit 1; fi; \
+  test -f /app/apps/server/dist/index.js; \
+  echo 'runtime layer: no toolchain, no .ts source, nothing app-owned'
 
 # The base image's unprivileged user. The *name* is what this file asserts, never the uid: recent
 # `node:22-slim` tags ship `node` as 65532, and pinning a number the base image owns is how an image ends up

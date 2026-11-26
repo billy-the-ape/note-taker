@@ -249,6 +249,49 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   store, and PR-12 added its keys there (`theme`, `sidebarCollapsed`, `treeCollapsed` — the last a **sparse**
   `Set<folderId>` where a collapsed folder is a member and the root is always expanded, so a new folder is open
   and no empty folder costs a stored id) rather than inventing a fifth.
+- **Autosave is one pure machine, and its in-flight snapshot is the contract** (PR-14): `apps/web/src/lib/autosave.ts`
+  owns the note buffer (the editor renders `snapshot().buffer`) so a `VERSION_CONFLICT` can only ever be compared with
+  **the exact request that went on the wire** — a retry re-sends those bytes and that `baseVersion`, never a fresh
+  capture of the buffer, and an equal payload means "the write landed and the reply was lost": adopt the returned
+  `version`, go `clean` or `dirty`, show no banner. Plain `CONFLICT` (a sibling-name clash, same 409) is never reacted
+  to. **Nothing leaves while a reply is owed:** any flush arriving during a backoff — the debounce, the 10 s cap,
+  `blur`, a note switch, an unmount, `Ctrl/Cmd+S` — re-sends that same request rather than capturing the buffer again,
+  because newer text written against the abandoned `baseVersion` comes back as a `VERSION_CONFLICT` carrying *our own*
+  earlier write (the phantom conflict this file exists to prevent) and would hand the spent retry budget back; such a
+  flush only moves the replay earlier; a `Ctrl/Cmd+S` or `Retry` from the spent-budget `error` state is the
+  one exception, because that row of §4 *is* a person deciding to try again — it re-funds the schedule and
+  drops the stale failure, while a `blur` that lands there gets one more try and nothing else, and either
+  way the message goes, since `saveStatusText` reads `failure` before `state` and would otherwise keep
+  saying "Not saved — …" over a request that is on its way out. `adopt`/`keepMine`/`useServer` drop the owed replay, since each has just
+  answered what the row holds. No second debounce window and no 10 s deadline is armed beside a scheduled replay,
+  either, or §4's `1s,2s,4s,8s,30s` schedule stops being exact. And because `snapshot()` is cached with `notify()` the
+  only thing that republishes it, **every** path that changes the buffer publishes — including the `stopped` and
+  `conflict` paths, where an editor bound to `snapshot().buffer` would otherwise swallow the keystroke that woke it —
+  while `dirty` keeps meaning "newer than the row", so undoing back to the saved text lands on `clean` instead of a
+  pill reading `Unsaved changes` over a write that will never start.
+  `features/notes/useAutosave.ts` is the only DOM-touching half — one machine per note id in a ref-`Map`, so a
+  note switch runs the *outgoing* machine's cleanup and flushes the right buffer — and it installs `blur`,
+  `visibilitychange`, `pagehide`, `beforeunload` and `Ctrl/Cmd+S`; `saveNow()` (the flag is a preference, not a
+  disable-switch for saving) writes even with `settings.autosave === false`. The unload flush is
+  `fetch(…, { keepalive: true })` with the ordinary CSRF header, and **`visibilitychange → hidden` uses that
+  transport too** whenever the body fits **and nothing is owed** (a hidden trigger whose page survives the
+  tab switch must not be the one that pre-empts a replay: the newest buffer on the old `baseVersion` comes
+  back as a conflict about our own lost reply, on a page that is still open to show it). A closing tab hides
+  *before* `pagehide`, so an ordinary `PUT` started on `hidden` would occupy rule 1, get aborted by the
+  unload, and leave `pagehide` with nothing it may start — the keepalive path would then never run on a
+  normal close, which is why the transport exists at all. §6's 60 KiB is a budget on the **request body**, measured
+  with `contentWriteBytes` (`JSON.stringify({content, baseVersion})`), because escaping turns a 58 KiB buffer of
+  quotes into a ~116 KiB body that `fetch` rejects before it leaves; `note.mutations.test.ts` pins the two-key shape
+  that measure assumes. Over the budget nothing is attempted and the `beforeunload` guard — armed by exactly the
+  negation of `unloadCarriesBuffer()`: clean, or the buffer leaving on `keepalive`, or `pagehide` still able to start
+  it — is what protects the text, and an **ordinary** in-flight `PUT` never counts as carried, because the unload
+  aborts it. **Never add `navigator.sendBeacon`:** it cannot set `X-CSRF-Token` (§6). The crash mirror is
+  `lib/draft.ts` under `localStorage['note-draft:<id>']` — deliberately *not* a `uiStore` key, since it is a note body
+  rather than a preference — and it is cleared only when it still holds the text being discarded, because the key is
+  per-browser and tabs share it. That rule covers the *discard* button and the `404` "save as a new note" path too:
+  the prompt does not lock the editor, so by the time either acts the mirror may hold a newer paragraph than the one
+  being discarded or saved, and clearing it unconditionally would delete a crash fallback nobody has saved. `SaveStatus`/`ConflictBanner`/`DraftPrompt` in `components/editor` are allowed to say
+  only what the machine knows: never `Saved` for a buffer that could not be flushed, and never a silent overwrite.
 - **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
   cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`
   `names.ts`, and `apps/web/src/lib/name.ts` is the app's single import site for them (it re-exports the contract API

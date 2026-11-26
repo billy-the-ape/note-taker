@@ -328,19 +328,22 @@ note-taker/
             │                                   one-shot 403 refresh-and-replay per §10; proven in PR-07)
             ├── lib/queryClient.ts             PR-05
             ├── lib/markdown.ts                PR-13 toolbar transforms (pure, unit-tested)
-            ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested)
+            ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested) owns the buffer
+            ├── lib/draft.ts                   PR-14 the `note-draft:<id>` crash mirror (not a `uiStore` key)
             ├── lib/name.ts                    PR-15 thin wrapper over contracts names.ts
             ├── features/auth/{session.tsx, auth.api.ts, useSession.ts}   PR-08
             ├── features/tree/{tree.queries.ts, tree.selectors.ts, tree.mutations.ts}  PR-12
             ├── features/notes/{note.queries.ts, note.mutations.ts}       PR-13/14
             ├── features/notes/{new-note.ts, open-note.ts}  PR-15 the create path (tree-cache uniqueness,
             │                                            cache bookkeeping) and the editor-caret handoff
+            ├── features/notes/useAutosave.ts  PR-14 the machine's DOM half (flush triggers, draft prompt)
+            ├── features/settings/settings.api.ts PR-14 `GET /api/settings` read (PR-16 grows the screen)
             └── components/
                 ├── ui/{Button,Input,Field,Dialog,Menu,Toast,Spinner}.tsx  PR-08 (grown by later PRs)
                 ├── layout/{AppShell,Sidebar,TopBar,StatusBar}.tsx         PR-12
                 ├── tree/{FolderTree,FolderRow,NoteRow,TreeContextMenu}.tsx PR-12
                 ├── editor/{EditorPane,MarkdownEditor,EditorToolbar,PreviewPane}.tsx PR-13
-                ├── editor/{SaveStatus,ConflictBanner}.tsx                 PR-14
+                ├── editor/{SaveStatus,ConflictBanner,DraftPrompt}.tsx     PR-14
                 ├── notes/{RenameDialog,MoveDialog,DeleteConfirm}.tsx      PR-12 (shared dialog forms)
                 └── notes/NewNoteDialog.tsx                               PR-15
 ```
@@ -669,7 +672,7 @@ without teaching the guard anything.
 | --- | --- |
 | Server state (tree, note content, settings, session) | TanStack Query, cache keys `['tree',userId]`, `['note',id]`, `['settings']` |
 | Mutations | TanStack Query mutations with optimistic tree updates + rollback on error (a **create** has no id to insert optimistically — `POST /api/notes` mints it, so the row enters the tree on confirmation; PR-15 §9) |
-| Editor buffer (uncommitted text) | local component state + autosave engine ref; mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
+| Editor buffer (uncommitted text) | **the autosave engine owns it** (PR-14): `lib/autosave.ts` holds the buffer and the editor renders `snapshot().buffer`, because §11.4's conflict comparison needs one owner of the string that went on the wire and a component holding its own `useState` on top of the engine is two. Mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
 | Transient UI (dialogs, preview mode, sidebar width) | local state + a tiny `ui` store for sidebar/preview mode persisted in `localStorage` |
 
 No global client store (no Redux/Zustand) in the MVP — Query + Router cover it, and less state means fewer bugs.
@@ -738,6 +741,62 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   entered when the API answers `VERSION_CONFLICT`). Note the vocabulary: `VERSION_CONFLICT` is the API error code for a
   stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
   reacts to the latter.
+
+**Seven things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
+
+- **Nothing leaves while a reply is owed.** A request that went out and never came back is an answer the client has
+  not read. So every flush that arrives during a backoff — the debounce, the 10 s cap, `blur`,
+  `visibilitychange → hidden`, a note switch, an unmount, `Ctrl/Cmd+S` — sends **the request that failed**, its bytes
+  and its `baseVersion` unchanged, and never a fresh capture of the buffer: newer text written against the version we
+  left on the wire is answered by a `VERSION_CONFLICT` carrying *our own* earlier write, which the fork would then
+  read as a second writer. Such a flush moves the replay earlier and leaves the spent retry budget spent; keystrokes
+  typed meanwhile go out in the window after it settles, which is the "to `dirty` if the user typed meanwhile" case
+  above rather than a second interpretation of it. The 10 s cap opens no second window beside a scheduled replay, and
+  no 10 s deadline is armed next to a 30 s backoff, because "the backoff is exactly 1 s, 2 s, 4 s, 8 s, 30 s" is a
+  promise this section makes.
+- **A person re-funds the retry schedule; a trigger does not, and neither keeps the old failure.** A flush during a
+  backoff buys nothing, but `Ctrl/Cmd+S` and *Retry* arriving from the spent-budget `error` state are §4's own "manual
+  retry" row, so they clear `attempt` and the message before the replay — without that, the spent `attempt` made the
+  next failure terminal instead of opening a fresh 1 s window, and the pill read `failure` before it read the state
+  (`saveStatusText`'s precedence), so it said "Not saved — …" with `data-state="error"` over a request that was on its
+  way out. A `blur`, a note switch or a `hidden` that lands in the same state sends the owed request and clears the
+  message, because a pill must never describe a failed cycle while a request is in flight, but it does not buy a new
+  schedule: §4 makes the next cycle the user's decision.
+- **An explicit resolution supersedes the owed replay.** *Keep mine*, *Use server* and a re-read of the note each say
+  what the row holds and at which version, which is the only question a replay exists to ask, so each drops it. The
+  unload `keepalive` write is the one place that sends newer text while a reply is owed: only one request can leave an
+  exiting page, and losing the buffer would be the worse loss. On the next load the row and the draft mirror disagree,
+  which is what the restore prompt is for.
+- **The snapshot is the screen's only window.** `snapshot()` is cached and `notify()` is the only thing that clears the
+  cache, and the editor renders `snapshot().buffer` — so a path that updates the buffer without publishing makes a
+  controlled editor swallow the keystroke that woke it, in `conflict` and in the two stopped rows being exactly the
+  states where the text has to stay visible. `onEdit` publishes on every path, and `dirty` means "newer than the row"
+  everywhere: undoing back to the saved text is `clean`, not a pill reading "Unsaved changes" over a write that will
+  never start.
+- **The unload guard is the negation of "the unload carries this", not of the budget alone.** `beforeunload` is armed
+  only when the buffer is dirty *and* nothing is carrying it: clean, or a `keepalive` request already leaving with
+  exactly that text, or `pagehide` still able to start one — those need no prompt. An **ordinary** in-flight `PUT`
+  never counts as carried, because the unload aborts it, and an autosave-off or over-budget buffer is never carried
+  either. A prompt over a save already leaving is noise; a missing prompt over a buffer that cannot leave is data loss.
+- **`visibilitychange → hidden` goes out on the unload transport — but only when nothing is owed — and the budget
+  measures the body.** A closing tab hides *before* `pagehide` (the unload steps are hide → `beforeunload` →
+  `pagehide`), so the ordinary `PUT` a `hidden` handler used to start occupied rule 1, was aborted by the unload, and
+  left `pagehide` with nothing it may start — the `keepalive` path never ran on a normal close. Within the budget
+  `hidden` now sends `fetch(…, {keepalive: true})`, and a mere tab switch is unharmed, because a live page reads a
+  `keepalive` reply normally. **The first bullet outranks that transport:** with a replay owed, `hidden` behaves like
+  every other trigger and sends the owed request, because the ordinary `hidden` is a tab switch whose page survives,
+  and a keepalive write of the newest buffer against the abandoned `baseVersion` is answered by a `VERSION_CONFLICT`
+  carrying *our own* lost write — a conflict fork about the reader's own edit, on a page that is still open and could
+  have retried. `pagehide` alone keeps the right to supersede the owed request (the bullet above). That ~64 KiB cap is
+  a cap on the **request body**, which `lib/api.ts` builds with `JSON.stringify({content, baseVersion})`, and escaping
+  is not
+  free: a `"` or a `\n` costs two bytes and a control character six, so 58 KiB of quotes is a ~116 KiB body that
+  `fetch` rejects before it leaves — *after* the predicate had promised the buffer fitted. `contentWriteBytes` is that
+  measure, and the two-key body it assumes is pinned by `note.mutations.test.ts`.
+- **The draft mirror clears only on a match.** `localStorage` is per-browser and the key is per-note, so a write
+  confirmed in one tab must not delete another tab's unsaved text: `clear(text)` removes the key when it still holds
+  exactly `text` and leaves it alone otherwise. The mirror is not an `nt.` `uiStore` preference and does not go through
+  that store; it is a note body under a key §11.2 names.
 
 ### 11.5 UX details that the README implies and must not be skipped
 

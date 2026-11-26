@@ -1,6 +1,5 @@
 import { createRootRoute, type ErrorComponentProps, Outlet } from '@tanstack/react-router';
 
-import { ThemeToggle } from '../components/layout/ThemeToggle';
 import { ToastProvider } from '../components/ui/Toast';
 import { guardNavigation, SessionProvider } from '../features/auth/session';
 import { ApiError } from '../lib/api';
@@ -16,8 +15,12 @@ import { ApiError } from '../lib/api';
  * PR-12 adds `routes/app/route.tsx` and takes the authed half of the table over from here; what stays
  * is this: nobody who is not signed in gets past the sign-in pages, whatever the path.
  *
- * The header holds only the theme knob. The real chrome (sidebar, search, status bar) is PR-12's shell
- * — the point of this file is the redirect, and it is why `/welcome` exists at all.
+ * **This layout owns no furniture** (PR-12 review, round two). It renders the providers and a bare
+ * `<Outlet/>`: the chrome the auth pages want is in the pathless `routes/_auth.tsx`, and the authed shell is
+ * `routes/app/route.tsx`'s. Root chrome over the shell was a real defect — `AppShell`'s full-viewport grid
+ * inside a `max-w-2xl` column, under a second header with a second theme toggle, `<main>` nested in `<main>` —
+ * and the fix is a sibling layout route rather than a path test here, because a path test is a second
+ * route-shaped decision in the file whose whole job is to make route-shaped decisions happen once.
  */
 export const Route = createRootRoute({
   beforeLoad: ({ location }) => guardNavigation(location.pathname),
@@ -40,17 +43,7 @@ function RootLayout() {
   return (
     <ToastProvider>
       <SessionProvider>
-        <div className="min-h-dvh antialiased">
-          <header className="mx-auto flex w-full max-w-2xl items-center justify-between gap-4 px-6 pt-6">
-            <span className="text-sm font-semibold tracking-wide text-ink">Note Taker</span>
-            {/* The theme is a preference about this screen, so it belongs to the chrome rather than to a
-                page — and PR-16 moves the control into settings without touching this line. */}
-            <ThemeToggle />
-          </header>
-          <main className="mx-auto flex w-full max-w-2xl flex-col gap-8 px-6 py-10">
-            <Outlet />
-          </main>
-        </div>
+        <Outlet />
       </SessionProvider>
     </ToastProvider>
   );

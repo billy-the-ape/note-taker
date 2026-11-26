@@ -14,6 +14,7 @@ import { createLogger } from './logger.js';
 import { type AuthGuard, createAuthGuard, registerAuthGuard } from './plugins/auth-guard.js';
 import { registerCsrfGuard } from './plugins/csrf.js';
 import { registerErrorHandlers } from './plugins/error-handler.js';
+import { registerStaticSpa } from './plugins/static-spa.js';
 import { authRoutes } from './routes/auth.routes.js';
 import { folderRoutes } from './routes/folders.routes.js';
 import { healthRoutes } from './routes/health.routes.js';
@@ -60,6 +61,14 @@ export interface BuildAppOptions {
    * the static `'ok'` it shipped with in PR-01, which is what every unit test and any pool-less boot uses.
    */
   readonly checkDb?: () => Promise<unknown>;
+  /**
+   * The directory the built SPA is served from (PR-12). Absent means `apps/web/dist`, and **a directory
+   * with no `index.html` in it serves nothing** — which is why the whole test suite, and `pnpm dev` with
+   * no `pnpm build` run, are unaffected by this option existing. Read `plugins/static-spa.ts` before
+   * changing it: the path is a repository/image layout fact, not an operator knob, which is why it is an
+   * option here rather than a variable in `env.ts`.
+   */
+  readonly webDist?: string;
 }
 
 const UNKNOWN_VERSION = '0.0.0-unknown';
@@ -98,8 +107,14 @@ function serverVersion(): string {
  * * `fastify-type-provider-zod` — the auth routes validate with `schema.parse(request.body)` and let the
  *   resulting `ZodError` reach `mapError()`, which already renders it as `400 VALIDATION` with `details`
  *   (PR-05). A type provider earns its keep once routes declare `schema` for their *responses*; none do yet.
- * * `@fastify/static` + SPA fallback (PR-12), which will own the not-found answer for non-`/api` paths and must
- *   be registered before that changes anything here — including the CSP that `index.html` needs.
+ *
+ * PR-12 added `plugins/static-spa.ts` at the end of this function: `@fastify/static` over `apps/web/dist`
+ * with the `/app` fallback, registered after every API route so no `/api` path is ever swallowed. It is a
+ * route like any other, so the helmet headers registered inside {@link registerAuth} — and the error envelope —
+ * apply to the served shell too: `script-src 'self'` covers Vite's hashed bundles, and the CSP's one concession
+ * (inline *styles*, whose reason is written out in {@link helmetOptions}) is what a same-origin stylesheet plus
+ * an editor's measurement pass need. If a later build starts inlining a `<script>`, that is a CSP conversation
+ * to have then, not a directive to widen now.
  */
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const { env } = options;
@@ -127,6 +142,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // {@link registerAuth} as `undefined`, which is what `getKeyring()` below then resolves.
     await registerAuth(app, env, options.db, options.keyring);
   }
+
+  // Last, so the API is routed first whatever the build directory contains: `static-spa` registers one
+  // route per file rather than a catch-all, but the ordering is what makes "`/api/*` is never swallowed"
+  // true by construction instead of by inspection (docs/plans/mvp/MVP-12.md §6).
+  await registerStaticSpa(app, options.webDist === undefined ? {} : { root: options.webDist });
 
   return app;
 }

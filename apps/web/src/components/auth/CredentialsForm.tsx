@@ -140,7 +140,7 @@ export function CredentialsForm({ mode, heading, description, submitLabel, foote
         // asks again.
         await refreshStatus().catch(() => undefined);
       }
-      await navigate({ to: '/welcome', replace: true });
+      await navigate({ to: '/app', replace: true });
     } catch (error) {
       const serverFields = error instanceof ApiError ? fieldErrorsFromDetails(error.details) : {};
       setFieldErrors((current) => ({ ...current, ...serverFields }));

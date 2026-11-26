@@ -140,6 +140,34 @@ describe('the CSRF header', () => {
   });
 });
 
+describe('keepalive, which only PR-14’s unload path asks for', () => {
+  it('reaches fetch as keepalive and still carries the CSRF header', async () => {
+    const fetch = mockFetch([jsonResponse({ id: 'n1', version: 8 })]);
+    const client = createApiClient({ fetch: fetch.fetch, readCsrfToken: () => 'token-9' });
+
+    await client.request(ROUTES.noteContent('n1'), {
+      method: 'PUT',
+      body: { content: 'text written on the way out', baseVersion: 7 },
+      keepalive: true,
+    });
+
+    expect(fetch.calls[0]?.init.keepalive).toBe(true);
+    // The header is the whole reason the unload path is a `fetch` and not `navigator.sendBeacon`,
+    // which can only POST and cannot set it (docs/plans/mvp/MVP-14.md §6).
+    expect(new Headers(fetch.calls[0]?.init.headers).get(CSRF_HEADER_NAME)).toBe('token-9');
+  });
+
+  it('is absent from every request that did not ask for it', async () => {
+    const fetch = mockFetch([jsonResponse({ needsSetup: false, registrationOpen: false })]);
+    const client = createApiClient({ fetch: fetch.fetch, readCsrfToken: () => undefined });
+
+    await client.request(ROUTES.auth.status);
+    // Not `false`: `RequestInit.keepalive` is optional, and a wrapper that always sends it would
+    // quietly move every request in the app onto the unload transport.
+    expect(fetch.calls[0]?.init.keepalive).toBeUndefined();
+  });
+});
+
 describe('ApiError', () => {
   it('carries the whole envelope, including the data a conflict client needs', async () => {
     const fetch = mockFetch([

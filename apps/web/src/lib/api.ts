@@ -98,6 +98,14 @@ export interface ApiCallOptions {
   /** Serialised as JSON when present. `POST`/`PUT` bodies are objects, never pre-stringified strings. */
   readonly body?: unknown;
   readonly signal?: AbortSignal;
+  /**
+   * Handed to `fetch` unchanged, and only ever set by PR-14's unload path: `fetch(url, {keepalive:true})`
+   * is the one request a browser will finish after the page that started it is gone, which is what makes
+   * it the flush on `pagehide` (§6 of docs/plans/mvp/MVP-14.md) — and the reason that path is a `fetch`
+   * and not `navigator.sendBeacon`, which cannot set `X-CSRF-Token`. Browsers cap a `keepalive` body at
+   * about 64 KiB, so the caller is responsible for not sending more than that; nothing here enforces it.
+   */
+  readonly keepalive?: boolean;
 }
 
 export interface ApiJsonOptions<T> extends ApiCallOptions {
@@ -289,6 +297,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     const method = callOptions?.method ?? 'GET';
     const body = callOptions?.body;
     const signal = callOptions?.signal;
+    const keepalive = callOptions?.keepalive;
 
     const response = await fetchImpl(`${baseUrl}${path}`, {
       method,
@@ -296,6 +305,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       headers: headersFor(method, body !== undefined),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       ...(signal === undefined ? {} : { signal }),
+      ...(keepalive === undefined ? {} : { keepalive }),
     });
 
     if (response.ok) return response;

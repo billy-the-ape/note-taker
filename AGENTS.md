@@ -133,3 +133,20 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   assert on `textContent`/`getAttribute`/`.value`. Server state is TanStack Query, routing is the router, and
   `src/lib/uiStore.ts` is the tiny persisted-UI box (`nt.`-prefixed `localStorage`); there is no global client
   store, and PR-12/13 add their keys to that store rather than inventing a fifth.
+- **Autosave is one pure machine, and its in-flight snapshot is the contract** (PR-14): `apps/web/src/lib/autosave.ts`
+  owns the note buffer (the editor renders `snapshot().buffer`) so a `VERSION_CONFLICT` can only ever be compared with
+  **the exact request that went on the wire** — a retry re-sends those bytes and that `baseVersion`, never a fresh
+  capture of the buffer, and an equal payload means "the write landed and the reply was lost": adopt the returned
+  `version`, go `clean` or `dirty`, show no banner. Plain `CONFLICT` (a sibling-name clash, same 409) is never reacted
+  to. The 10 s force-flush stands down while a backoff is running, or §4's `1s,2s,4s,8s,30s` schedule stops being
+  exact. `features/notes/useAutosave.ts` is the only DOM-touching half — one machine per note id in a ref-`Map`, so a
+  note switch runs the *outgoing* machine's cleanup and flushes the right buffer — and it installs `blur`,
+  `visibilitychange`, `pagehide`, `beforeunload` and `Ctrl/Cmd+S`; `saveNow()` (the flag is a preference, not a
+  disable-switch for saving) writes even with `settings.autosave === false`. The unload flush is
+  `fetch(…, { keepalive: true })` with the ordinary CSRF header and **only** for a buffer ≤ 60 KiB; over that nothing
+  is attempted and the `beforeunload` guard — armed by exactly the negation of that predicate — is what protects the
+  text. **Never add `navigator.sendBeacon`:** it cannot set `X-CSRF-Token` (§6). The crash mirror is
+  `lib/draft.ts` under `localStorage['note-draft:<id>']` — deliberately *not* a `uiStore` key, since it is a note body
+  rather than a preference — and it is cleared only when it still holds the text being discarded, because the key is
+  per-browser and tabs share it. `SaveStatus`/`ConflictBanner`/`DraftPrompt` in `components/editor` are allowed to say
+  only what the machine knows: never `Saved` for a buffer that could not be flushed, and never a silent overwrite.

@@ -328,17 +328,20 @@ note-taker/
             │                                   one-shot 403 refresh-and-replay per §10; proven in PR-07)
             ├── lib/queryClient.ts             PR-05
             ├── lib/markdown.ts                PR-13 toolbar transforms (pure, unit-tested)
-            ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested)
+            ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested) owns the buffer
+            ├── lib/draft.ts                   PR-14 the `note-draft:<id>` crash mirror (not a `uiStore` key)
             ├── lib/name.ts                    PR-15 thin wrapper over contracts names.ts
             ├── features/auth/{session.tsx, auth.api.ts, useSession.ts}   PR-08
             ├── features/tree/{tree.queries.ts, tree.selectors.ts, tree.mutations.ts}  PR-12
             ├── features/notes/{note.queries.ts, note.mutations.ts}       PR-13/14
+            ├── features/notes/useAutosave.ts  PR-14 the machine's DOM half (flush triggers, draft prompt)
+            ├── features/settings/settings.api.ts PR-14 `GET /api/settings` read (PR-16 grows the screen)
             └── components/
                 ├── ui/{Button,Input,Field,Dialog,Menu,Toast,Spinner}.tsx  PR-08 (grown by later PRs)
                 ├── layout/{AppShell,Sidebar,TopBar,StatusBar}.tsx         PR-12
                 ├── tree/{FolderTree,FolderRow,NoteRow,TreeContextMenu}.tsx PR-12
                 ├── editor/{EditorPane,MarkdownEditor,EditorToolbar,PreviewPane}.tsx PR-13
-                ├── editor/{SaveStatus,ConflictBanner}.tsx                 PR-14
+                ├── editor/{SaveStatus,ConflictBanner,DraftPrompt}.tsx     PR-14
                 ├── notes/{RenameDialog,MoveDialog,DeleteConfirm}.tsx      PR-12 (shared dialog forms)
                 └── notes/NewNoteDialog.tsx                               PR-15
 ```
@@ -665,7 +668,7 @@ PR-08's acceptance testable on its own.
 | --- | --- |
 | Server state (tree, note content, settings, session) | TanStack Query, cache keys `['tree',userId]`, `['note',id]`, `['settings']` |
 | Mutations | TanStack Query mutations with optimistic tree updates + rollback on error |
-| Editor buffer (uncommitted text) | local component state + autosave engine ref; mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
+| Editor buffer (uncommitted text) | **the autosave engine owns it** (PR-14): `lib/autosave.ts` holds the buffer and the editor renders `snapshot().buffer`, because §11.4's conflict comparison needs one owner of the string that went on the wire and a component holding its own `useState` on top of the engine is two. Mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
 | Transient UI (dialogs, preview mode, sidebar width) | local state + a tiny `ui` store for sidebar/preview mode persisted in `localStorage` |
 
 No global client store (no Redux/Zustand) in the MVP — Query + Router cover it, and less state means fewer bugs.
@@ -734,6 +737,23 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   entered when the API answers `VERSION_CONFLICT`). Note the vocabulary: `VERSION_CONFLICT` is the API error code for a
   stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
   reacts to the latter.
+
+**Four things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
+
+- **A retry re-sends the request that failed, not a fresh capture of the buffer.** That is what §11.4's comparison
+  requires: the payload a `VERSION_CONFLICT` is checked against has to be the payload that request carried. Keystrokes
+  typed while a backoff is waiting stay in the buffer and go out in the debounce window after the replay settles, which
+  is the "to `dirty` if the user typed meanwhile" case above rather than a second interpretation of it.
+- **The 10 s force-flush stands down while a backoff is running.** Two schedules in the same machine would otherwise
+  interleave, and "the backoff is exactly 1 s, 2 s, 4 s, 8 s, 30 s" is a promise this section makes.
+- **The unload guard is the negation of the unload budget.** `beforeunload` is armed when the buffer is dirty *and*
+  `pagehide` would not be able to write it — autosave off, over 60 KiB, or a request already in flight, because a
+  browser will not queue a second `keepalive` behind one. So the prompt never covers a save that is already leaving,
+  and never skips a buffer that cannot be flushed.
+- **The draft mirror clears only on a match.** `localStorage` is per-browser and the key is per-note, so a write
+  confirmed in one tab must not delete another tab's unsaved text: `clear(text)` removes the key when it still holds
+  exactly `text` and leaves it alone otherwise. The mirror is not an `nt.` `uiStore` preference and does not go through
+  that store; it is a note body under a key §11.2 names.
 
 ### 11.5 UX details that the README implies and must not be skipped
 

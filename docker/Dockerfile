@@ -180,25 +180,38 @@ COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 #   * no build tool, and no download tool, anywhere in `/app` — by name, as a file or as a `node_modules`
 #     package. The prune stage checks the tree before it is copied; this one checks the layer the app runs in,
 #     which is where a stray `COPY` or a dependency that grew a tool would show up.
-#   * no `.ts` source (`.d.ts` excepted, as in stage 3: declaration files are output, not source).
+#   * no `.ts` **source of ours** (`.d.ts` excepted, as in stage 3: declaration files are output, not source).
+#     Scoped to the payload paths this stage COPYs, and the scoping is load-bearing rather than tidy: the pruned
+#     third-party tree ships 500+ `.ts` files of its own today — fastify's `examples/` and `test/types/*.tst.ts`,
+#     `@fastify/helmet`'s and `process-warning`'s types, ajv's — so an unscoped `find /app -name '*.ts'` failed
+#     CI's `docker build` with "a source .ts file is in the runtime layer" on a perfectly correct image. What may
+#     not appear is *this repository's* TypeScript: the compiled server, the committed migrations, the rewritten
+#     `@note-taker` package (whose store copy in `pnpm deploy` output really does contain `src/*.ts`, deleted and
+#     rebuilt in stage 3), and the SPA bundle.
 #   * nothing under `/app` owned by the app user — the ownership rule this stage used to violate with
 #     `--chown=node:node` on all five COPYs while its comment claimed the opposite. It runs as root, before
 #     `USER node`, so it can see every file: a hit means `USER node` could rewrite the code it executes.
 #
-# Written with `find` and no `$PATH` reasoning on purpose: `command -v` searches `$PATH`, this image puts nothing
-# under `/app` there, so a loop built on it is a check that prints "clean" whatever the image contains.
+# The payload list is asserted to exist before it is searched, because `find` on a missing path exits non-zero
+# into a `$(… | head)` pipeline whose status is `head`'s: a COPY that went away would otherwise turn this
+# assertion into a vacuous pass. Written with `find` and no `$PATH` reasoning on purpose — `command -v` searches
+# `$PATH`, this image puts nothing under `/app` there, so a loop built on it prints "clean" whatever the image
+# contains.
 RUN set -eu; \
   for tool in tsx tsc vite vitest biome eslint prettier nodemon drizzle-kit playwright typescript curl wget pnpm; do \
     hit=$(find /app -type f -name "$tool" -print -o -type d -name "$tool" -path '*/node_modules/*' -print | head -n1); \
     if [ -n "$hit" ]; then echo "$tool is in the runtime layer: $hit"; exit 1; fi; \
   done; \
-  if find /app -name '*.ts' ! -name '*.d.ts' -print | grep -q .; then \
-    echo 'a source .ts file is in the runtime layer'; exit 1; \
-  fi; \
+  payload='/app/apps/server/dist /app/apps/server/migrations /app/apps/server/node_modules/@note-taker /app/apps/web/dist'; \
+  for p in $payload; do \
+    if [ ! -d "$p" ]; then echo "a payload path this image is supposed to ship is missing: $p"; exit 1; fi; \
+  done; \
+  src=$(find $payload -name '*.ts' ! -name '*.d.ts' -print | head -n5); \
+  if [ -n "$src" ]; then echo "a source .ts file of ours is in the runtime layer: $src"; exit 1; fi; \
   owned=$(find /app -user node -print | head -n5); \
   if [ -n "$owned" ]; then echo "the app user owns files it runs from: $owned"; exit 1; fi; \
   test -f /app/apps/server/dist/index.js; \
-  echo 'runtime layer: no toolchain, no .ts source, nothing app-owned'
+  echo 'runtime layer: no toolchain, no source of ours, nothing app-owned'
 
 # The base image's unprivileged user. The *name* is what this file asserts, never the uid: recent
 # `node:22-slim` tags ship `node` as 65532, and pinning a number the base image owns is how an image ends up

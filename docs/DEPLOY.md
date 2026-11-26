@@ -186,8 +186,12 @@ docker run --rm --entrypoint sh "$image" -c '
     [ -n "$hit" ] || continue
     echo "LEAK, the runtime tree carries $tool: $hit"; exit 1
   done
-  src=$(find /app -name "*.ts" ! -name "*.d.ts" -print 2>/dev/null | head -n3)
-  [ -n "$src" ] && { echo "LEAK, source shipped instead of compiled output: $src"; exit 1; }
+  payload="/app/apps/server/dist /app/apps/server/migrations /app/apps/server/node_modules/@note-taker /app/apps/web/dist"
+  for p in $payload; do
+    [ -d "$p" ] || { echo "LEAK, a payload path this image is supposed to ship is missing: $p"; exit 1; }
+  done
+  src=$(find $payload -name "*.ts" ! -name "*.d.ts" -print | head -n3)
+  [ -n "$src" ] && { echo "LEAK, our own source shipped instead of compiled output: $src"; exit 1; }
   owned=$(find /app -user node -print 2>/dev/null | head -n5)
   [ -n "$owned" ] && { echo "LEAK, the app user owns files it runs from: $owned"; exit 1; }
   echo "clean: no build or download tool, no .ts source, nothing under /app writable by the app user; node $(node -v) as uid $(id -u)"'
@@ -208,9 +212,15 @@ claims elsewhere:
 * **no build tool, and no download tool** — by name, as a file or as a `node_modules` package. A `/usr/bin/curl`
   left by the base image is the base's business; `/app/apps/server/node_modules/vite` is a bug in this
   Dockerfile, and this is what prints it.
-* **no `.ts` source** (`.d.ts` declaration files excepted — `packages/contracts` ships them on purpose, and the
-  runtime stage of the Dockerfile asserts the same rule at build time; this one catches a stage that stopped
-  running).
+* **no `.ts` source of ours** — scoped to the four payload paths the image ships (`apps/server/dist`,
+  `apps/server/migrations`, the rewritten `@note-taker` package, `apps/web/dist`), with the paths themselves
+  asserted present so a dropped `COPY` cannot turn the check into a vacuous pass. The scoping matters: the
+  pruned third-party tree contains **500+ `.ts` files** today — fastify's `examples/` and `test/types/*.tst.ts`,
+  `@fastify/helmet`'s and `process-warning`'s types, ajv's — and a dependency shipping its own TypeScript is that
+  dependency's packaging choice, not a leak in this image. The unscoped version of this line failed CI's
+  `docker build` on a correct image. (`.d.ts` stays excepted: `packages/contracts` builds with
+  `declaration: true`, so declaration files are expected output; the Dockerfile asserts the same rule inside the
+  build, where CI runs it on every push.)
 * **nothing under `/app` is owned by the app user** — the runtime counterpart of the Dockerfile's `--chown` rule:
   the code `USER node` executes is root-owned and world-readable, so a compromised process cannot rewrite the code
   it runs from. Ownership of a volume mount under `/run/secrets` (§3) is deliberately *not* under `/app`, which is

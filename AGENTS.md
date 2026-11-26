@@ -97,8 +97,9 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   runs as `USER node`, `EXPOSE 3000`, and healthchecks with a **Node `fetch`** — this image installs no download
   tool of its own, and the base's own layers are not knowable from `docker history` (whose layer *commands*
   mention `curl` because `node:22-slim`'s ancestors installed it), so "no toolchain in the runtime layer" is
-  verified by walking `/app` inside a container (`docs/DEPLOY.md` §2 step 5: no tool by name, no `.ts` source,
-  nothing under `/app` owned by the app user). A `command -v` loop is the tempting wrong version — it searches
+  verified by walking `/app` inside a container (`docs/DEPLOY.md` §2 step 5: no tool by name anywhere; no `.ts`—
+  source of ours, scoped to the payload paths the image ships, because third-party packages legitimately
+  ship hundreds of their own; nothing under `/app` owned by the app user). A `command -v` loop is the tempting wrong version — it searches
   `$PATH`, which contains nothing under `/app`, so it prints `clean` whatever the image contains. **No `COPY` in
   the runtime stage takes `--chown=node:node`**: application code arrives root-owned and world-readable, so the
   process cannot rewrite the code it executes, and the runtime stage asserts `find /app -user node` is empty —

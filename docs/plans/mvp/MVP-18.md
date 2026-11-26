@@ -253,7 +253,9 @@ CI docker build step.
 - transcripts: backup → createdb → psql restore → run -d restore-drill → read note at :3100 → docker stop → dropdb
 - transcripts: rotation --dry-run → run → --verify 0 → pre-rotation note opens; reset-password restores login
 - the runtime image adds no build or download tool, proven the way it can be proven: a container of the image is
-  asked to walk `/app` — no tool by name, no `.ts` source, nothing under `/app` owned by the app user —
+  asked to walk `/app` — no tool by name; no `.ts` source of ours, scoped to the payload paths the image ships
+  (dependencies ship hundreds of their own, and that is not this image's problem); nothing under `/app` owned by
+  the app user —
   **not** `docker history | grep curl`, which reports LEAK on a correct image because the base image's own layer
   *commands* install curl either way, and not a `command -v` loop either, because `$PATH` contains nothing under
   `/app` so that check prints `clean` whatever the image contains.

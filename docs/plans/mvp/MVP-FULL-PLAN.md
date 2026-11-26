@@ -645,7 +645,7 @@ home/LAN/VM network, possibly behind a reverse proxy.
 | `/setup` | only when `needsSetup` | create the first account (README: self-hosted, first-run) |
 | `/login` | redirect away when authed | username + password, error + rate-limit messaging |
 | `/signup` | only when `registrationOpen` **AND** `!needsSetup`; otherwise redirect to `/login` (`/setup` on a fresh install) | self-sign-up form; creates a `member` (route + guard land in PR-08, server guard in PR-07) |
-| `/welcome` | auth | **placeholder home created by PR-08** (signed-in card + sign-out control); deleted by PR-12 when `/app` lands |
+| `/welcome` | — | **does not exist: PR-12 deleted `routes/welcome.tsx`.** PR-08's placeholder home; a bookmark to it is an unknown path and lands on `/app` when signed in |
 | `/app` | auth | AppShell; default view = recent notes + "New note" |
 | `/app/note/$noteId` | auth | editor + preview for one note |
 | `/app/search` | auth | search results (`?q=`) |
@@ -656,8 +656,10 @@ Route guards live in `routes/app/route.tsx` (`beforeLoad` reads the session cont
 TanStack Router's own convention:** in file-based routing a directory's layout route is `route.tsx` inside it
 (`routes/app/route.tsx` wraps `index.tsx`, `note.$noteId.tsx`, `settings.tsx`, `search.tsx`); `__layout.tsx` is the
 Next.js App Router habit and is not what the router's plug-in picks up. Until PR-12
-creates that layout, the authed redirect target is `/welcome` (created in PR-08, replaced in PR-12), which keeps
-PR-08's acceptance testable on its own.
+created that layout, the authed redirect target was `/welcome` (created in PR-08, deleted by PR-12), which kept
+PR-08's acceptance testable on its own. PR-12 repointed every authed landing and redirect at `/app`, and the guard
+matches `/app` as a **prefix** (`isAppPath` in `session.tsx`), so a later PR adds `/app/search` or `/app/settings`
+without teaching the guard anything.
 
 ### 11.2 State
 

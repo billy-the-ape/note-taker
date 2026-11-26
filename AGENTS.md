@@ -119,9 +119,53 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `guardNavigation(pathname)` in `src/features/auth/session.tsx`, which reads the auth snapshot out of the
   **`queryClient` singleton** under `queryKeys.authStatus` / `queryKeys.authSession` and applies the §4 table
   (`decideNavigation` is that table as a pure function — add a row there, never a per-page check). A page
-  component never redirects: `routes/welcome.tsx` is §4's placeholder home and **PR-12 deletes it**. The
+  component never redirects: **PR-12 deleted `routes/welcome.tsx`**, PR-08's placeholder home, so every signed-in
+  landing and redirect is `/app` and a bookmark to `/welcome` is just another unknown path that lands there. The
   guard failing is not an error — a dead API reads "signed out, nothing installed", which lands on `/login`,
   the one page that can then explain the dead network by trying.
+- **`/app` is guarded as a subtree, and its layout is `routes/app/route.tsx`** (PR-12): the guard matches the
+  prefix plus `/` (`isAppPath`), so `/app/settings`, `/app/search` and `/app/note/$noteId` need no route of their
+  own to be let through — a per-page check for each child is what that rule exists to prevent. `routes/app/route.tsx`
+  is TanStack Router's directory layout route (`__layout.tsx` is the Next.js habit the router does not read); it
+  renders `AppShell` + `Sidebar` and every child renders `<Outlet/>` inside it. The `*` route must stay last in
+  `routeTree.gen.ts` and `/apple` is asserted not to match `/app`.
+- **The API process serves the built SPA, and only when there is a build to serve** (PR-12):
+  `apps/server/src/plugins/static-spa.ts` registers `@fastify/static` at `defaultWebDistRoot()` (or the
+  `buildApp({ webDist })` override) **only if `<root>/index.html` exists**, and reports `{ served, root }` either
+  way, so "no build yet" is an observable state rather than a crash. Three things are load-bearing there: it is
+  registered **last** in `buildApp()` so route-shape conflicts fail loudly against the API's own routes; the
+  fallback is two `wildcard: false` wildcards (`/app`, `/app/*`) because `@fastify/static`'s default
+  `prefixMatching: true` swallows every non-GET request whose path starts with a served path, `POST /api/notes`
+  included; and `send()` is awaited inside a try, because the plugin's 404 is asynchronous and a synchronous
+  `try`/`catch` around it answers `500 ENOENT` for a perfectly good deep link. A production host with no web
+  build still boots and still answers `/api/*` — that is the self-host story PR-18 inherits.
+- **The tree's rules live in selectors, not in components** (PR-12): `features/tree/tree.selectors.ts` owns the
+  comparator (folders before notes, case-insensitive `name`, `id` tiebreak — the same three keys as
+  `GET /api/tree`'s `ORDER BY`), the nesting (orphans are hoisted, never dropped; a cycle is a row that is not a
+  folder), the visible flatten with its indent arithmetic (a folder's single-child chain is hoisted, so a `b/…/z/n`
+  drawer costs one column), the descendant set (legal-move pruning and the count a delete warning owes), the
+  breadcrumbs and `recentNotes` (PR-11's `/api/search/recent` mirror, so the shell does not re-derive recency).
+  `tree.mutations.ts` imports `moveIsBlocked` from that same module, so **an illegal move is refused before
+  `fetch`** — the server stays the authority and still answers 409. Optimistic writes are
+  `react-query`'s `onMutate` on `['tree', userId]`; each of `applyRename`/`applyMove`/`applyDelete` returns the
+  *same object* when the id is not in the cache, which is what lets a mutation over live data stay a no-op
+  rollback rather than inventing a row from the dialog's stale snapshot. A row is named by `<row>-<field>` and
+  the field's problem by `<field>-error`, inline, always.
+- **A 500-node sidebar has a render budget, and the tree pays for it in DOM nodes** (PR-12): §6's check is
+  "renders in under a second", and `FolderTree.test.tsx` measures the honest number (`flattenTree` + the React
+  commit, via `act`/`fireEvent`, never `userEvent`'s pointer polling or a `waitFor` tick) and logs it. 500 rows is
+  100 ms in jsdom with three rules kept: a row is a plain `<div>` (`TreeRow` is not a component boundary), a
+  **closed** row menu is `rowMenuTrigger(...)` — a called function, not a mounted Radix root — and a note row
+  passes `leading={null}` instead of a spacer span per row. Adding a per-row component, context or wrapper node
+  costs 500 of whatever it is; measure before adding one.
+- **Tree UI tests drive a stateful fake, not a stub table** (PR-12): `src/test/treeApi.ts` is a folder/note model
+  that enforces the server's rules — sibling uniqueness (409), the cycle block (409), the emptiness gate (409
+  `that folder is not empty` unless `?cascade=true`), the generated `new-file-…` name — and exposes
+  `tree()/set()/failOnce()/hold()/created()`. `bootAuth(path, { user, tree })` installs it as the **`fallback`**
+  of `fakeApi`, so a test fails loudly when the client asks for a route that does not exist (a `null` stub would
+  hang instead), and `hold()` is what lets a test watch the optimistic paint before the failure arrives. A plain
+  route stub is still correct for the auth forms: the fake is for the one surface whose rules are worth failing
+  over.
 - **Web tests boot the whole app against a stubbed `fetch`** (PR-08): `src/test/{setup.ts,fakeApi.ts,authHarness.tsx,renderApp.tsx}`
   — `renderApp(path)` is `main.tsx` with a memory history, `bootAuth(path, install)` adds the auth routes with a
   *mutable* session (so a sign-out really ends it), and `noReply: ['login']` is how a test says "nobody answers
@@ -132,4 +176,6 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `// @vitest-environment jsdom` on line 1; `@testing-library/jest-dom` is deliberately **not** a dependency —
   assert on `textContent`/`getAttribute`/`.value`. Server state is TanStack Query, routing is the router, and
   `src/lib/uiStore.ts` is the tiny persisted-UI box (`nt.`-prefixed `localStorage`); there is no global client
-  store, and PR-12/13 add their keys to that store rather than inventing a fifth.
+  store, and PR-12 added its keys there (`theme`, `sidebarCollapsed`, `treeCollapsed` — the last a **sparse**
+  `Set<folderId>` where a collapsed folder is a member and the root is always expanded, so a new folder is open
+  and no empty folder costs a stored id) rather than inventing a fifth.

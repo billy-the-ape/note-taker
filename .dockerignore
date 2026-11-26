@@ -1,14 +1,24 @@
 # Keeps the Docker build context small and keeps host state out of the image.
-# PR-18 owns the multi-stage image: it installs and builds INSIDE the image, so the
-# compiled apps/server/dist and apps/web/dist are produced there rather than copied from
-# a developer machine, and are deliberately NOT ignored (a stale host build must not leak in,
-# and PR-12 serves apps/web/dist from the API process at runtime).
+# PR-18 owns the multi-stage image: it installs and builds INSIDE the image, so the compiled
+# apps/server/dist and apps/web/dist are produced there rather than copied from a developer machine.
+# `**/dist` is therefore ignored — a release must not be shippable from a build that happened to be lying
+# around in someone's checkout, and `tsc` does not delete output whose source has gone away. The Dockerfile
+# deletes the three dists again before building, so the guarantee survives anyone editing this file.
+#
+# **Every pattern below is anchored at the context root**, because that is how Docker matches them: unlike
+# .gitignore, a `.dockerignore` entry applies only where it is written, so plain `node_modules` matches the
+# root's and NOT `apps/server/node_modules` — which is where a workspace install actually puts everything, and
+# `COPY . .` would pour it over the tree the image had just installed (CI cannot see this class of mistake,
+# because its runner has run `pnpm install` in the same checkout seconds earlier). Hence the `**/` prefixes on
+# the three host-build artefacts: they are the ones a developer's tree has at every level.
 .git
 .github
 .clinerules
 docs
 
-node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
 .pnpm-store
 
 # A real .env must never reach an image; the template is documentation, not runtime input.

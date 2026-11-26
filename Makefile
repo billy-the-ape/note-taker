@@ -20,9 +20,17 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 COMPOSE := docker compose --env-file .env -f docker/compose.dev.yml
+# PR-18's production stack, spelled identically to the dev line above and for the identical reason: Compose
+# resolves its project directory from the compose file's location, so `-f docker/compose.yml` alone would
+# load `.env` from `docker/`. docs/DEPLOY.md uses this exact invocation in every command an operator
+# copy-pastes, so the Makefile and the runbook cannot drift. These targets deliberately do NOT depend on
+# bootstrap-env: a production `.env` is generated (docs/DEPLOY.md §2), and a copied .env.example would carry
+# neither a key nor the trio the runbook sources, which is a parse error worth hearing out loud.
+COMPOSE_PROD := docker compose --env-file .env -f docker/compose.yml
 PNPM := pnpm
 
-.PHONY: help bootstrap-env db-up db-down db-reset dev build test coverage
+.PHONY: help bootstrap-env db-up db-down db-reset dev build test coverage check-env \
+        prod-config prod-build prod-up prod-down prod-ps prod-logs
 
 help:
 	@echo 'Note Taker — run these from the repo root'
@@ -34,6 +42,15 @@ help:
 	@echo '  make test         run the unit tests'
 	@echo '  make coverage     run the unit tests with v8 coverage (what CI runs)'
 	@echo '  make bootstrap-env  create .env from .env.example if it is missing (all db targets do this)'
+	@echo '  make check-env      pnpm check:env — lint the repo-root .env against the production rules'
+	@echo ''
+	@echo 'The production stack (docker/compose.yml, PR-18). Read docs/DEPLOY.md before the first up:'
+	@echo '  make prod-config  compose config: interpolate .env, failing by name if the key is missing'
+	@echo '  make prod-build   build the image (multi-stage; nothing in this repo is ever pushed)'
+	@echo '  make prod-up      db + app on one published port, migrations inside the app'
+	@echo '  make prod-down    stop it (the pgdata volume keeps its data)'
+	@echo '  make prod-ps      both services, with the app reporting healthy'
+	@echo '  make prod-logs    follow the app container'
 
 # Compose hard-errors when --env-file points at a missing file, so `.env` is bootstrapped rather than
 # assumed. `test -f` short-circuits, so an existing .env (and every local edit in it) is left alone, and
@@ -69,3 +86,32 @@ test:
 # The CI `unit` job runs pnpm coverage, so the thresholds live in the Vitest configs, not in a flag here.
 coverage:
 	$(PNPM) coverage
+
+# The preflight, behind the same interface as everything else. It judges the *file*, so it is at its most
+# useful when the shell has nothing in it; `DOTENV_PATH=/somewhere pnpm check:env` judges another file.
+check-env:
+	$(PNPM) check:env
+
+# ── production (PR-18) ──────────────────────────────────────────────────────────────────────────────
+# Each of these is `$(COMPOSE_PROD)` and nothing more: the flags are the interface, and docs/DEPLOY.md
+# spells the same command out in full so an operator who never opens a Makefile types exactly the same thing.
+
+# The parse-time preflight. `config` never contacts the daemon, so this is the one production check that
+# works on a host with Docker installed and nothing running yet (docs/DEPLOY.md §2, step 2b).
+prod-config:
+	$(COMPOSE_PROD) config
+
+prod-build:
+	$(COMPOSE_PROD) build
+
+prod-up:
+	$(COMPOSE_PROD) up -d
+
+prod-down:
+	$(COMPOSE_PROD) down
+
+prod-ps:
+	$(COMPOSE_PROD) ps
+
+prod-logs:
+	$(COMPOSE_PROD) logs -f app

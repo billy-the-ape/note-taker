@@ -1,8 +1,8 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 
-import { CredentialsForm } from '../components/auth/CredentialsForm';
-import { FormMessage } from '../components/ui/Field';
-import { useSession } from '../features/auth/useSession';
+import { CredentialsForm } from '../../components/auth/CredentialsForm';
+import { FormMessage } from '../../components/ui/Field';
+import { useSession } from '../../features/auth/useSession';
 
 /**
  * `/login` — the only page an unauthenticated visitor is allowed to stay on
@@ -15,7 +15,7 @@ import { useSession } from '../features/auth/useSession';
  * No guard of its own: the root's `beforeLoad` owns the whole table, and a second copy here is the
  * "guards per page" the brief rules out.
  */
-export const Route = createFileRoute('/login')({
+export const Route = createFileRoute('/_auth/login')({
   component: LoginPage,
 });
 

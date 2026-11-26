@@ -13,12 +13,16 @@
  *    unknown `/api` path — is exactly what it was before the SPA existed. `static-spa.test.ts` asserts
  *    that with a built fixture, `POST /api/notes` included, because a plugin that quietly swallowed a
  *    mutation would show up as a lost note rather than as a failing test anywhere else.
- * 2. **A deep link is the app, not a 404.** `/app`, `/app/note/<id>`, `/app/settings`: those URLs exist
- *    only inside the client's router, and a person who refreshes one deserves the SPA, so
- *    `GET|HEAD /app` and `/app/*` answer `index.html`. Only `/app` is claimed, because after PR-16/PR-17
- *    the whole *routable* surface of the SPA sits under it; `/some-random-path` deliberately stays a
- *    §9.1 `404` envelope (it is also the half of this contract that keeps a probe, a crawler or a
- *    mis-typed asset URL from getting a couple of kilobytes of HTML and calling it a success).
+ * 2. **A deep link is the app, not a 404** — and the list of links is {@link SPA_SHELL_ROUTES}. `/app`,
+ *    `/app/note/<id>`, `/login`, `/setup`, `/signup`: those URLs exist only inside the client's router, and a
+ *    person who refreshes or bookmarks one deserves the SPA, so each one answers `index.html` on `GET|HEAD`.
+ *    What is *not* claimed stays unclaimed: `/some-random-path` is a §9.1 `404` envelope, which is the half of
+ *    this contract that keeps a probe, a crawler or a mis-typed asset URL from getting a couple of kilobytes of
+ *    HTML and calling it a success — and the reason the fallback is a list of routes rather than "any non-`/api`
+ *    `GET` whose `Accept` mentions `text/html`", since a crawler and a mistyped `/app.ssh` both accept HTML too.
+ *    The list is a copy of the SPA's top-level route surface, and `apps/web/src/routes/` is the thing it must
+ *    match; a PR that adds a *child* of `/app` needs no change here, and a PR that adds a top-level route adds
+ *    it below, where the test that requests each path will say so if it does not.
  * 3. **No build is not an error.** `pnpm dev` runs the SPA in Vite on `:5173` and the API on `:3000`, so
  *    a host with no `apps/web/dist` is the normal development state, and the test suites boot the app
  *    with no build at all. A missing `index.html` therefore registers *nothing*: `/api/*` answers as
@@ -47,6 +51,32 @@ import { join, resolve, sep } from 'node:path';
 
 import fastifyStatic from '@fastify/static';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+
+/**
+ * The SPA's top-level routes, which are the paths whose refresh must answer `index.html`.
+ *
+ * `/app` claims its subtree because everything authed lives under it (PR-13's note, PR-16's settings,
+ * PR-17's search) — a child needs nothing here. The three auth pages are top-level (they cannot live under
+ * `/app`, which is the guarded half of the app), so each is listed as a page with no children: a cold reload of
+ * `/login` by a signed-out person, or of `/setup` by an operator on a fresh install, is the same product as
+ * entering through `/`, not a JSON envelope in a browser tab.
+ *
+ * The list is deliberately not derived from a wildcard or from `Accept`: rule 2's whole value is that an
+ * unknown path keeps answering the §9.1 envelope.
+ */
+export interface SpaShellRoute {
+  /** The path as the router writes it. */
+  readonly path: string;
+  /** Whether the path owns a subtree of client routes (`/app/settings` is one; `/login` has none). */
+  readonly children: boolean;
+}
+
+export const SPA_SHELL_ROUTES: readonly SpaShellRoute[] = [
+  { path: '/app', children: true },
+  { path: '/login', children: false },
+  { path: '/setup', children: false },
+  { path: '/signup', children: false },
+] as const;
 
 /** `index.html` is the app's entry: caching it is how an upgrade fails to arrive. */
 const NO_STORE = 'no-cache';
@@ -122,10 +152,15 @@ export async function registerStaticSpa(
     return reply.type('text/html; charset=utf-8').send(readFileSync(indexPath));
   };
 
-  // `HEAD` is registered explicitly because Fastify does not derive it from `GET`, and a probe or a
-  // download manager that asks for headers alone should not get a 404 for the app's own home page.
-  app.route({ method: ['GET', 'HEAD'], url: '/app', handler: sendIndex });
-  app.route({ method: ['GET', 'HEAD'], url: '/app/*', handler: sendIndex });
+  // One route per shell path, plus `/app/*` for its subtree. `HEAD` is registered explicitly because Fastify
+  // does not derive it from `GET`, and a probe or a download manager that asks for headers alone should not get
+  // a 404 for the app's own home page.
+  for (const { path, children } of SPA_SHELL_ROUTES) {
+    const urls = children ? [path, `${path}/*`] : [path];
+    for (const url of urls) {
+      app.route({ method: ['GET', 'HEAD'], url, handler: sendIndex });
+    }
+  }
 
   app.log.info({ root }, 'serving the built SPA from the API port');
   return { served: true, root };

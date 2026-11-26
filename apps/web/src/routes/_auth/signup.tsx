@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 
-import { CredentialsForm } from '../components/auth/CredentialsForm';
+import { CredentialsForm } from '../../components/auth/CredentialsForm';
 
 /**
  * `/signup` — self-sign-up for a `member`, driven by `POST /api/auth/register`
@@ -16,7 +16,7 @@ import { CredentialsForm } from '../components/auth/CredentialsForm';
  * It is a `member`, never an `owner`: role promotion is an operator act in the MVP (PR-07 §2), and
  * there is deliberately no control here that looks like one.
  */
-export const Route = createFileRoute('/signup')({
+export const Route = createFileRoute('/_auth/signup')({
   component: SignUpPage,
 });
 

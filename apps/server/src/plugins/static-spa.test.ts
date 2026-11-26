@@ -19,7 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../app.js';
 import { parseEnv } from '../env.js';
 import { createTestLogger } from '../logger.js';
-import { defaultWebDistRoot, registerStaticSpa } from './static-spa.js';
+import { defaultWebDistRoot, registerStaticSpa, SPA_SHELL_ROUTES } from './static-spa.js';
 
 /** Vite's output shape: an `index.html`, hashed bundles under `assets/`, and a root-level icon. */
 const INDEX_MARK = '<title>Note Taker fixture</title>';
@@ -168,9 +168,54 @@ describe('the SPA on the API port', () => {
     await app.close();
   });
 
-  it('answers an unknown path outside /app with the envelope, not with the app', async () => {
+  it.each(
+    SPA_SHELL_ROUTES.flatMap(({ path, children }) =>
+      children
+        ? [
+            [path, `the ${path} shell itself`],
+            [`${path}/deep/child`, `a ${path} child, which needs nothing in the list to be reached`],
+          ]
+        : [[path, `the ${path} shell itself`]],
+    ),
+  )('serves the shell for %s — %s, and never the envelope', async (url) => {
+    // The auth pages are top-level client routes (they cannot hide under the guarded `/app`), so on the
+    // single production port a signed-out person reloading `/login`, or an operator reloading `/setup` on a
+    // fresh install, was being handed a JSON envelope in a browser tab: only entering through `/` worked.
+    // The list they come from is exported, so this test is over the *declaration* rather than a second copy
+    // of it — the copy a reviewer has to trust is the one in `static-spa.ts`.
+    const app = await makeApp(dist);
+    const response = await app.inject(url);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/html');
+    expect(response.headers['cache-control']).toBe('no-cache');
+    expect(response.body).toContain(INDEX_MARK);
+
+    // A probe that asks for headers alone gets the same answer, on every path rather than only on `/`.
+    const head = await app.inject({ method: 'HEAD', url });
+    expect(head.statusCode).toBe(200);
+    expect(head.headers['content-type']).toContain('text/html');
+
+    await app.close();
+  });
+
+  it.each(['/login/deep/child', '/setup/today', '/signup/now', '/totally-not-a-note'])(
+    'keeps %s a 404 envelope, because a page owns no subtree',
+    async (url) => {
+      // The other edge of the list, and the reason the fallback is a list: `/login` is a route, and
+      // `/login/anything` is a mistake or a probe. Serving HTML there would make a crawler's 404 a 200, and
+      // "any non-`/api` GET that accepts HTML" fails the same way — a crawler accepts HTML too.
+      const app = await makeApp(dist);
+      const response = await app.inject(url);
+      expect(response.statusCode).toBe(404);
+      expect(errorResponseSchema.safeParse(response.json()).success).toBe(true);
+      await app.close();
+    },
+  );
+
+  it('answers an unknown path with the envelope, not with the app', async () => {
     // Deliberately not a fallback: `/some-random-path` is either a mistake or a probe, and both want a 404
-    // they can branch on. Only the routable half of the SPA (`/app/…`, from PR-16/PR-17 onward) falls back.
+    // they can branch on. Only the paths in `SPA_SHELL_ROUTES` fall back.
     const app = await makeApp(dist);
     const response = await app.inject('/totally-not-a-note');
     expect(response.statusCode).toBe(404);

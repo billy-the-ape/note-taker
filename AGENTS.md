@@ -168,14 +168,28 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   is TanStack Router's directory layout route (`__layout.tsx` is the Next.js habit the router does not read); it
   renders `AppShell` + `Sidebar` and every child renders `<Outlet/>` inside it. The `*` route must stay last in
   `routeTree.gen.ts` and `/apple` is asserted not to match `/app`.
+- **`__root.tsx` owns no furniture** (PR-12 review, round two): the root layout is providers and a bare
+  `<Outlet/>`. The centered column, wordmark and theme toggle that the three credential pages want live in the
+  **pathless** `routes/_auth.tsx`, and `login/setup/signup` are its children (`routes/_auth/*.tsx`, paths still
+  `/login` etc.). Root chrome over the shell squeezed `AppShell`'s full-viewport grid into a `max-w-2xl` column
+  under a second header with a second `ThemeToggle` and a `<main>` inside a `<main>`; the fix is a sibling
+  layout route, not a `pathname.startsWith('/app')` in the root, because that file's whole job is to make
+  route-shaped decisions happen once. `routes/chrome.test.tsx` pins the count (one chrome wrapper, one header,
+  one knob, one `<main>`, on both doors) because jsdom cannot see a width.
 - **The API process serves the built SPA, and only when there is a build to serve** (PR-12):
   `apps/server/src/plugins/static-spa.ts` registers `@fastify/static` at `defaultWebDistRoot()` (or the
   `buildApp({ webDist })` override) **only if `<root>/index.html` exists**, and reports `{ served, root }` either
   way, so "no build yet" is an observable state rather than a crash. Three things are load-bearing there: it is
   registered **last** in `buildApp()` so route-shape conflicts fail loudly against the API's own routes; the
-  fallback is two `wildcard: false` wildcards (`/app`, `/app/*`) because `@fastify/static`'s default
-  `prefixMatching: true` swallows every non-GET request whose path starts with a served path, `POST /api/notes`
-  included; and the fallback handler is `async` with an `await`ed `reply.send(readFileSync(index.html))`,
+  fallback is `wildcard: false` (because `@fastify/static`'s default `prefixMatching: true` swallows every
+  non-GET request whose path starts with a served path, `POST /api/notes` included) over
+  **`SPA_SHELL_ROUTES`** — `/app` plus its subtree, and the top-level auth pages `/login`, `/setup`, `/signup`.
+  That list is the server-side copy of the SPA's route surface and must match `apps/web/src/routes/`: a new
+  *child* of `/app` needs nothing here, a new **top-level** route is added to the list or its reload answers a
+  JSON envelope in a browser tab. It is a list rather than "any non-`/api` GET that accepts `text/html`"
+  because everything outside it must keep answering the §9.1 envelope (a crawler and a mistyped `/app.ssh` both
+  accept HTML), and `static-spa.test.ts` asserts both edges — every listed path serves the shell, and
+  `/login/deep/child` is still a 404; and the fallback handler is `async` with an `await`ed `reply.send(readFileSync(index.html))`,
   because `send(createReadStream(file))` commits `200 text/html` before the file is opened, so an `index.html`
   that vanishes under a running process would arrive as an empty document *called* the app instead of the error
   envelope the handler still owns. A production host with no web build still boots and still answers `/api/*` —
@@ -235,7 +249,6 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   store, and PR-12 added its keys there (`theme`, `sidebarCollapsed`, `treeCollapsed` — the last a **sparse**
   `Set<folderId>` where a collapsed folder is a member and the root is always expanded, so a new folder is open
   and no empty folder costs a stored id) rather than inventing a fifth.
-  store, and PR-12/13 add their keys to that store rather than inventing a fifth.
 - **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
   cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`
   `names.ts`, and `apps/web/src/lib/name.ts` is the app's single import site for them (it re-exports the contract API

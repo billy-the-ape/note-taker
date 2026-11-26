@@ -41,6 +41,24 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   readonly ref?: Ref<HTMLButtonElement>;
 }
 
+/**
+ * The classes a `Button` carries, in the order it carries them.
+ *
+ * Exported because one control in this app cannot be a `Button` and still need to look like one: a tree row's
+ * `⋯` is rendered 500 times, and `Button` costs 500 extra component renders for a `<button>` the row could
+ * write itself (§6's 500-node render budget). Sharing the class list is what makes that a copy of the same
+ * control rather than a look-alike that drifts.
+ */
+export function buttonClass(
+  variant: ButtonVariant = 'secondary',
+  size: ButtonSize = 'md',
+  className = '',
+): string {
+  return `inline-flex select-none items-center justify-center rounded-md font-medium transition-colors
+        focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-paper
+        disabled:cursor-not-allowed disabled:opacity-60 ${VARIANTS[variant]} ${SIZES[size]} ${className}`;
+}
+
 export function Button({
   variant = 'secondary',
   size = 'md',
@@ -59,9 +77,7 @@ export function Button({
       type={type}
       disabled={disabled || loading}
       aria-busy={loading || undefined}
-      className={`inline-flex select-none items-center justify-center rounded-md font-medium transition-colors
-        focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-paper
-        disabled:cursor-not-allowed disabled:opacity-60 ${VARIANTS[variant]} ${SIZES[size]} ${className}`}
+      className={buttonClass(variant, size, className)}
     >
       {loading ? <Spinner label="Working" size="sm" /> : null}
       {children}

@@ -24,11 +24,34 @@ export interface Reply {
 /** One recorded request, in the order they were made. */
 export interface Recorded {
   readonly method: string;
+  /** The path with its query string removed, which is what a route table is keyed by. */
   readonly path: string;
+  /**
+   * The full request target, query string included. `path` cannot answer "did the client send
+   * `?cascade=true`" (§9.2 #15) — and after PR-12 that is a question about a deleted subtree, so it is worth
+   * recording rather than reconstructing.
+   */
+  readonly url: string;
   readonly body: unknown;
 }
 
-export type Stub = (request: { method: string; path: string; body: unknown }) => Reply;
+/** What a stub is asked about: the same three facts, plus the url a query-parameter rule needs. */
+export interface Requested {
+  readonly method: string;
+  readonly path: string;
+  readonly url: string;
+  readonly body: unknown;
+}
+
+/**
+ * A route's answer.
+ *
+ * A stub may return a promise, which is how a test holds a request open. That is not a flourish: the
+ * acceptance criteria are about a *sequence* — the tree changes optimistically, then the tree goes back — and
+ * a fake that always answers immediately makes the first half unobservable, because React has painted nothing
+ * by the time the rollback has already happened.
+ */
+export type Stub = (request: Requested) => Reply | Promise<Reply>;
 
 export interface FakeApi {
   readonly fetch: FetchLike;
@@ -39,21 +62,31 @@ export interface FakeApi {
  * `routes` is keyed by `` `${method} ${path}` `` — `'POST /api/auth/login'`. A request with no entry
  * answers `500 INTERNAL` on purpose: a test that asked a question nobody thought to ask should fail
  * loudly rather than silently receive `{}` and pass for the wrong reason.
+ *
+ * `fallback` is consulted for a route the table does not contain, and it exists for the tree fake
+ * (`test/treeApi.ts`): the ids inside `/api/folders/<id>` are only known at runtime, so a table keyed by
+ * literal string can never hold them. An explicit entry still wins, which is what lets a test say "answer
+ * *this* route differently today" without reimplementing the model behind it.
  */
-export function fakeApi(routes: Readonly<Record<string, Stub>>): FakeApi {
+export function fakeApi(
+  routes: Readonly<Record<string, Stub>>,
+  options: { readonly fallback?: Stub | undefined } = {},
+): FakeApi {
   const calls: Recorded[] = [];
+  const fallback = options.fallback;
 
   const fetchImpl: FetchLike = async (input, init) => {
     const method = (init.method ?? 'GET').toUpperCase();
+    const url = input;
     const path = input.split('?')[0] ?? input;
     const body = typeof init.body === 'string' && init.body.length > 0 ? JSON.parse(init.body) : undefined;
-    calls.push({ method, path, body });
+    calls.push({ method, path, url, body });
 
-    const stub = routes[`${method} ${path}`];
+    const stub = routes[`${method} ${path}`] ?? fallback;
     if (stub === undefined) {
       return jsonReply({ status: 500, body: errorBody('INTERNAL', `no stub for ${method} ${path}`) });
     }
-    return toResponse(stub({ method, path, body }));
+    return toResponse(await stub({ method, path, url, body }));
   };
 
   return { fetch: fetchImpl, calls };

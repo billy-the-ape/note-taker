@@ -10,15 +10,15 @@
  * share one request each on boot. No bespoke session store and no module-level mutable session, which
  * is exactly what plan §11.2 rules out.
  *
- * **Boot rehydration.** A hard refresh of `/welcome` leaves a browser holding two facts: the URL and
+ * **Boot rehydration.** A hard refresh of `/app` leaves a browser holding two facts: the URL and
  * an `HttpOnly` cookie. `GET /api/auth/session` (§9.2 #8) turns the second into the first, which is
  * why "refresh keeps the session" is an acceptance criterion for this file rather than for the login
  * form.
  *
  * **The guards.** `decideNavigation` is the pure table of the brief's §4; `guardNavigation` is the
  * three-line effect that awaits the boot and throws `redirect()`. Both are exported: the table is
- * unit-testable without a DOM, and PR-12 replaces the catch-all row with `routes/app/route.tsx` while
- * keeping the table.
+ * unit-testable without a DOM, and PR-12 keeps the table while replacing `/welcome` with the `/app` row
+ * below — the authed half of §4 is therefore asserted in PR-12's suite rather than in PR-08's.
  */
 import type { AuthStatusResponse, SessionResponse, SessionUser } from '@note-taker/contracts';
 import { type QueryClient, queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -78,19 +78,20 @@ export const SIGNED_OUT_SNAPSHOT: AuthSnapshot = authSnapshot({
   registrationOpen: false,
 });
 
-/** The four paths this PR owns, in one place, so the table and the route files cannot disagree. */
+/** The four paths the guards name, in one place, so the table and the route files cannot disagree. */
 export const AUTH_PATHS = {
   setup: '/setup',
   login: '/login',
   signup: '/signup',
-  welcome: '/welcome',
+  /** PR-12 replaced PR-08's `/welcome` placeholder with the real home, and deleted that page. */
+  app: '/app',
 } as const;
 
 export type AuthPath = (typeof AUTH_PATHS)[keyof typeof AUTH_PATHS];
 
-/** Where "home" is right now: signed in means `/welcome`; a fresh install means `/setup`. */
+/** Where "home" is: signed in means `/app`; a fresh install means `/setup`. */
 export function homePathFor(snapshot: AuthSnapshot): AuthPath {
-  if (snapshot.user !== null) return AUTH_PATHS.welcome;
+  if (snapshot.user !== null) return AUTH_PATHS.app;
   return snapshot.needsSetup ? AUTH_PATHS.setup : AUTH_PATHS.login;
 }
 
@@ -115,9 +116,30 @@ const ALLOW: NavigationDecision = { kind: 'allow' };
  *
  * Stripping trailing slashes is the whole path normalisation — these four are the entire vocabulary,
  * and `/login/` is the same page as `/login`.
+ *
+ * **PR-12 changed two things**, and both are here rather than spread through the route files:
+ *
+ * * `/welcome` is gone. PR-08's placeholder home was deleted with it, so that URL is now on the `*` row
+ *   and lands wherever home is — the honest answer to a bookmark of a page that no longer exists, and
+ *   better than a 404 for a person whose session is perfectly fine.
+ * * `/app` is a **prefix**, not a page. Its layout route has children (`/app/note/$id` in PR-13,
+ *   `/app/settings` in PR-16, `/app/search` in PR-17), and a table that matched only the exact string
+ *   would put every one of them on the `*` row and redirect a signed-in visitor out of the app they are
+ *   standing in. Matching the subtree here is also what lets `routes/app/route.tsx` run this same table
+ *   instead of a second, narrower one.
  */
 export function decideNavigation(pathname: string, snapshot: AuthSnapshot): NavigationDecision {
   const path = pathname.replace(/\/+$/, '') || '/';
+
+  // Checked before the switch because it is the one row that is a subtree rather than a name, and because
+  // `/apple` is not `/app`.
+  if (path === AUTH_PATHS.app || path.startsWith(`${AUTH_PATHS.app}/`)) {
+    // The app is for somebody who is signed in, and nobody else. `homePathFor` keeps a fresh install on
+    // `/setup` and takes the second-run visitor to `/login`, which is the same pair of answers every other
+    // row gives. `routes/app/route.tsx` asks this same question again in its own `beforeLoad`, so a page
+    // under `/app` cannot be reached by a guard that had not heard of it.
+    return snapshot.user === null ? { kind: 'redirect', to: homePathFor(snapshot) } : ALLOW;
+  }
 
   switch (path) {
     case AUTH_PATHS.setup:
@@ -126,7 +148,7 @@ export function decideNavigation(pathname: string, snapshot: AuthSnapshot): Navi
 
     case AUTH_PATHS.login:
       // Never a page you stay on once you are signed in — the criterion PR-08 is named for.
-      return snapshot.user === null ? ALLOW : { kind: 'redirect', to: AUTH_PATHS.welcome };
+      return snapshot.user === null ? ALLOW : { kind: 'redirect', to: AUTH_PATHS.app };
 
     case AUTH_PATHS.signup:
       // An authed visitor is not who this page is for. §4's row is about the two booleans, and a
@@ -134,7 +156,7 @@ export function decideNavigation(pathname: string, snapshot: AuthSnapshot): Navi
       // form creates a *second* account and the response would replace the session they already have,
       // so the honest destination is the home they were on. §4's `*` row says the same thing for every
       // other path.
-      if (snapshot.user !== null) return { kind: 'redirect', to: AUTH_PATHS.welcome };
+      if (snapshot.user !== null) return { kind: 'redirect', to: AUTH_PATHS.app };
       // …then the derived flag, so the link and this guard cannot disagree about what "open" means.
       if (snapshot.signupVisible) return ALLOW;
       // Not open, so this is someone who wants a `/signup` that cannot exist: they get home, and `user` is
@@ -143,12 +165,9 @@ export function decideNavigation(pathname: string, snapshot: AuthSnapshot): Navi
       // definition of "home" and two, and this row inventing a third answer is not a risk worth taking.
       return { kind: 'redirect', to: homePathFor(snapshot) };
 
-    case AUTH_PATHS.welcome:
-      return snapshot.user === null ? { kind: 'redirect', to: homePathFor(snapshot) } : ALLOW;
-
     default:
       // The `*` row, and the only redirect not obvious from the path: `/`, a typo, the remains of a
-      // deleted route. PR-12 replaces this row for `/app/...` with `routes/app/route.tsx`.
+      // deleted route — which as of PR-12 includes `/welcome` itself, the page this PR deleted.
       return { kind: 'redirect', to: homePathFor(snapshot) };
   }
 }

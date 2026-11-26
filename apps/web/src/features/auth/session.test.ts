@@ -58,8 +58,12 @@ describe('decideNavigation — signed out, second run', () => {
     ['/login', 'allow'],
     ['/setup', AUTH_PATHS.login],
     ['/signup', AUTH_PATHS.login],
+    // PR-12's criterion, in table form: `/app` is guarded, and a stranger who types it gets the sign-in page
+    // rather than an empty shell. `/welcome` is here too now that the file is deleted — it is on the `*` row,
+    // and the bookmark of a removed page should still find its way to a form.
     ['/welcome', AUTH_PATHS.login],
     ['/app', AUTH_PATHS.login],
+    ['/app/note/019a3b4c-5d6e-7f80-9123-456789abcdef', AUTH_PATHS.login],
     ['/notes/whatever', AUTH_PATHS.login],
   ] as const;
 
@@ -79,8 +83,11 @@ describe('decideNavigation — signed out, fresh install', () => {
     // presses the button, and learns from the server what is actually missing — whereas `/` and every
     // other path send them to the first-run page. Being strict here would mean a page nobody may see.
     ['/login', 'allow'],
+    // A fresh install gets the first-run page from `/app` too, not the app's own guard: `homePathFor` is the
+    // one place that knows `/setup` and `/login` are the two answers.
     ['/welcome', AUTH_PATHS.setup],
     ['/app', AUTH_PATHS.setup],
+    ['/app/settings', AUTH_PATHS.setup],
   ] as const)('%s → %s', (path, expected) => {
     expect(decideNavigation(path, fresh)).toEqual(
       expected === 'allow' ? { kind: 'allow' } : { kind: 'redirect', to: expected },
@@ -109,32 +116,50 @@ describe('decideNavigation — registration open, one account installed', () => 
 
   it('sends a signed-in visitor home, even though the two booleans say the page is legal', () => {
     // §4 writes this row as a condition on the install, not on the visitor. Both are respected by
-    // sending anybody who already has a session to `/welcome`: the form would create a second account
+    // sending anybody who already has a session to `/app`: the form would create a second account
     // and the response would replace the session they are using.
     const alsoSignedIn = authSnapshot({ ...openSignUp, user: sessionUser() });
     expect(alsoSignedIn.signupVisible).toBe(true);
     expect(decideNavigation('/signup', alsoSignedIn)).toEqual({
       kind: 'redirect',
-      to: AUTH_PATHS.welcome,
+      to: AUTH_PATHS.app,
     });
   });
 });
 
 describe('decideNavigation — signed in', () => {
   it.each([
-    ['/welcome', 'allow'],
-    ['/login', AUTH_PATHS.welcome],
-    ['/setup', AUTH_PATHS.welcome],
-    ['/signup', AUTH_PATHS.welcome],
-    ['/', AUTH_PATHS.welcome],
-    // PR-08 has no `/app` route, so an authed visitor who types it is on the `*` row and goes home —
-    // which is the honest answer to a URL that does not exist yet. PR-12 gives `/app` its own layout
-    // guard and this row stops applying to it.
-    ['/app', AUTH_PATHS.welcome],
+    // PR-12 deleted `/welcome` and `/app` became the home, so the two rows swapped places from PR-08's:
+    // the app's own URL is now stay-able and the placeholder's is a bookmark of nothing.
+    ['/app', 'allow'],
+    ['/login', AUTH_PATHS.app],
+    ['/setup', AUTH_PATHS.app],
+    ['/signup', AUTH_PATHS.app],
+    ['/', AUTH_PATHS.app],
+    ['/welcome', AUTH_PATHS.app],
   ] as const)('%s → %s', (path, expected) => {
     expect(decideNavigation(path, signedIn)).toEqual(
       expected === 'allow' ? { kind: 'allow' } : { kind: 'redirect', to: expected },
     );
+  });
+
+  it.each([
+    '/app/',
+    '/app/note/019a3b4c-5d6e-7f80-9123-456789abcdef',
+    '/app/settings',
+    '/app/search',
+  ] as const)('lets the %s subtree through, because the guard is a prefix and not a page', (path) => {
+    // PR-13 adds `/app/note/$id`, PR-16 `settings`, PR-17 `search`. A table that matched `/app` exactly
+    // would put each of them on the `*` row and send a signed-in visitor out of the app they were in — and
+    // it would do it only for the children, so the test that visits `/app` would pass.
+    expect(decideNavigation(path, signedIn)).toEqual({ kind: 'allow' });
+  });
+
+  it('does not mistake /apple for /app', () => {
+    // The other half of the prefix row: a match on the *string* `/app` inside a path would let the guard
+    // wave through URLs that are not under the app at all.
+    expect(decideNavigation('/apple', signedIn)).toEqual({ kind: 'redirect', to: AUTH_PATHS.app });
+    expect(decideNavigation('/apple', secondRun)).toEqual({ kind: 'redirect', to: AUTH_PATHS.login });
   });
 });
 
@@ -150,7 +175,17 @@ describe('decideNavigation — the small print', () => {
   it('never redirects to a path it has not named', () => {
     // `to` is a union of four literals, so this is a type-level guarantee too; it is written down
     // because a table that grew a fifth destination would otherwise be a 404 with extra steps.
-    const destinations = ['/', '/x', '/setup', '/login', '/signup', '/welcome', '/app', '//'] as const;
+    const destinations = [
+      '/',
+      '/x',
+      '/setup',
+      '/login',
+      '/signup',
+      '/welcome',
+      '/app',
+      '/app/settings',
+      '//',
+    ] as const;
     for (const snapshot of [fresh, secondRun, openSignUp, signedIn]) {
       for (const path of destinations) {
         const decision = decideNavigation(path, snapshot);
@@ -162,8 +197,11 @@ describe('decideNavigation — the small print', () => {
   });
 
   it('a bare slash is not a path that can be stayed on', () => {
-    expect(decideNavigation('/', signedIn)).toEqual({ kind: 'redirect', to: AUTH_PATHS.welcome });
+    expect(decideNavigation('/', signedIn)).toEqual({ kind: 'redirect', to: AUTH_PATHS.app });
     expect(homePathFor(fresh)).toBe(AUTH_PATHS.setup);
+    // PR-12: home for a signed-in visitor is the app, and that is the one place this assertion is the whole
+    // answer — every redirect in the app goes through this helper.
+    expect(homePathFor(signedIn)).toBe(AUTH_PATHS.app);
   });
 });
 

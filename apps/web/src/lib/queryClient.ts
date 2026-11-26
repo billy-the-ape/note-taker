@@ -27,7 +27,7 @@ export const queryKeys = {
   /**
    * `GET /api/auth/session` (§9.2 #8) — `{user|null}`. Keyed by nothing, because it *is* the cookie:
    * a second user behind the same browser has a different cookie, and a cache entry that outlived the
-   * session would be the one bug that shows somebody else's name on `/welcome`.
+   * session would be the one bug that shows somebody else's name on `/app`.
    */
   authSession: ['auth', 'session'] as const,
   /** The folder/note tree of one user (§9.2 #12). */

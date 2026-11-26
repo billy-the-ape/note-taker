@@ -18,6 +18,7 @@ import { expect, vi } from 'vitest';
 import type { Reply, Stub } from './fakeApi';
 import { fakeApi, sessionReply, sessionUser, statusReply } from './fakeApi';
 import { renderApp } from './renderApp';
+import { makeTreeServer, type TreeServer } from './treeApi';
 
 export const TEST_USERNAME = 'ada.lovelace';
 /** Long enough to clear `passwordSchema`, so a failure means what it says. */
@@ -38,12 +39,24 @@ export interface Installation {
    * success case and make the test pass for the wrong reason.
    */
   readonly noReply?: readonly ('setup' | 'register' | 'login' | 'logout')[];
+  /**
+   * The tree endpoints, answered by the in-memory model in `test/treeApi.ts` rather than by a table.
+   *
+   * Every boot has one, because PR-12 made `/app` the home page: a sign-in test that ends at home now asks
+   * for a tree whether or not it meant to, and the fake's default `500` would put a red sidebar in a test
+   * about passwords. `true` means "a tree exists and it is empty"; a `TreeServer` built by the test brings
+   * its own folders and notes. An entry in `routes` still wins over the model, so a test that wants a dead
+   * tree endpoint says so.
+   */
+  readonly tree?: TreeServer | true;
 }
 
 export interface BootedApp {
   readonly fake: ReturnType<typeof fakeApi>;
   readonly app: ReturnType<typeof renderApp>;
   readonly user: UserEvent;
+  /** The tree model answering this boot's tree requests. */
+  readonly tree: TreeServer;
 }
 
 /**
@@ -99,7 +112,12 @@ export async function bootAuth(path: string, install: Installation = {}): Promis
       });
   }
 
-  const fake = fakeApi(routes);
+  // One model, wired to the fake *and* handed back: a test that queues a failure on the handle it was given
+  // must be queueing it on the thing that answers the requests.
+  const treeServer: TreeServer =
+    install.tree === undefined || install.tree === true ? makeTreeServer() : install.tree;
+
+  const fake = fakeApi(routes, { fallback: treeServer.stub });
   // `lib/api.ts` reads `globalThis.fetch` at call time, so the module-level client the guards use goes
   // through this stub too — no injection, no `vi.mock`, and the real wrapper still runs.
   vi.stubGlobal('fetch', fake.fetch);
@@ -111,7 +129,12 @@ export async function bootAuth(path: string, install: Installation = {}): Promis
   // helper that gets misused, and the assertion says which half of "booted" has to be true.
   await waitFor(() => expect(app.router.state.isLoading).toBe(false), { timeout: 3000 });
 
-  return { fake, app, user: userEvent.setup() };
+  return {
+    fake,
+    app,
+    user: userEvent.setup(),
+    tree: treeServer,
+  };
 }
 
 /** Fills the shared credential form's boxes and presses its button. */

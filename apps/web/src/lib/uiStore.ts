@@ -9,7 +9,7 @@
  *
  * **What does not go in here.** Anything another device would need (that is PR-09's settings row),
  * anything a second component has to agree on right now (that is React state), and anything secret. PR-12
- * adds a sidebar width and PR-13 a note sort order; both are one key name away, which is the entire reason
+ * adds a persisted sidebar collapse and PR-13 a note sort order; both are one key name away, which is the entire reason
  * the store exists rather than each component inventing its own `localStorage` incantation.
  *
  * Values are stored as plain strings, not JSON. A quoted `"dark"` in a debugging console is a worse
@@ -20,7 +20,7 @@
 export const UI_STORAGE_PREFIX = 'nt.';
 
 /** The names this store knows about. PR-12/13 add to this union; nothing else names a key ad hoc. */
-export type UiKey = 'theme';
+export type UiKey = 'theme' | 'sidebarCollapsed' | 'treeCollapsed';
 
 /** The storage key a name lands on: `theme` is `nt.theme`. */
 export function uiStorageKey(key: UiKey): string {
@@ -43,8 +43,12 @@ function storage(): Storage | undefined {
 
 /**
  * Reads a key, or the caller's fallback. The caller supplies the fallback rather than the store knowing
- * every default, because a default is a fact about the feature (PR-12's sidebar width belongs to the
- * sidebar, not to this file).
+ * every default, because a default is a fact about the feature: PR-12's sidebar collapse and its collapsed
+ * folder ids both belong to the components that draw them, not to this file.
+ *
+ * Note the union is three names wide as of PR-12 and this function still knows nothing about any of them.
+ * `treeCollapsed`'s value is a comma-joined list of ids (see `features/tree/tree.expansion.ts`) and
+ * `sidebarCollapsed`'s is the word `true`: encoding is the feature's business, storage is the store's.
  */
 export function readUi(key: UiKey, fallback: string): string {
   const store = storage();

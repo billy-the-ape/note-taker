@@ -1,0 +1,148 @@
+# Note Taker — the production stack (docs/plans/mvp/MVP-18.md §5).
+#
+# One published port, and no command that is not spelled out here. Read `docs/DEPLOY.md` §1 first: **both
+# flags, from the repo root**, always —
+#
+#     docker compose --env-file .env -f docker/compose.yml <up|ps|logs|exec|…>
+#
+# Compose resolves its project directory from *this file's* location, so `-f docker/compose.yml` on its own
+# would auto-load `.env` from `docker/` instead of the repo root where it lives, and a missing `--env-file`
+# path is a hard error before Docker is contacted. The same rule `docker/compose.dev.yml` pins in `Makefile`
+# (PR-02), and `docs/DEPLOY.md` uses this exact invocation in every command an operator copy-pastes.
+#
+# Two services, and only one of them is reachable:
+#
+#   * `db`  — Postgres 16 on a named volume, with **no published port**. The app reaches it as the service
+#     name `db` over the Compose network; nothing on the host needs to reach it, and `pg_dump`, `createdb`
+#     and `psql` all run with `docker compose exec -T db …` (docs/DEPLOY.md §5–§6). A published 5432 would
+#     put the notes' ciphertext on the LAN for the price of one typo in a security group.
+#   * `app` — the image built by `docker/Dockerfile`: one Node process, migrations included, serving the API
+#     on `${HOST_PORT:-3000}` (docs/DEPLOY.md §2) — and the SPA from the same port, from the moment PR-12's
+#     `plugins/static-spa.ts` exists to read the `apps/web/dist` this image stages for it.
+
+# Pinning the project name keeps volume, network and container names identical in every clone or git
+# worktree on a machine, instead of following the checkout directory name (the restore drill and
+# `docker stop restore-drill` in docs/DEPLOY.md §6 depend on names being predictable).
+name: note-taker
+
+services:
+  db:
+    # `postgres:16`, not `-alpine`: this is the image the CI `integration` job runs against (PR-03), so the
+    # database whose ordering and casting behaviour the tests assert is the database that ships. The dev
+    # stack pins `postgres:16-alpine` because that container only ever talks to one developer's `pnpm dev`,
+    # and a dump taken there restores here on purpose: `docs/DATA-MODEL.md` documents the sibling ordering the
+    # server relies on, and PR-04 made that assertion collation-independent precisely so musl and glibc
+    # cannot disagree about it.
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      # Interpolated from the repo-root `.env` — the `--env-file` on the command line, not from the
+      # container's environment. The defaults mirror `DSN_DEFAULTS` in `apps/server/src/env.ts`. They are a
+      # convenience for the container only: the runbook's shell commands read `"$POSTGRES_USER"` and
+      # `"$POSTGRES_DB"`, so all three must actually be written in `.env` (a `${VAR:-default}` is invisible
+      # to a sourced shell and an omitted variable expands to empty).
+      POSTGRES_USER: ${POSTGRES_USER:-notetaker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notetaker}
+      POSTGRES_DB: ${POSTGRES_DB:-notetaker}
+    volumes:
+      # A named volume, not a bind mount: the image's own initdb permissions survive on macOS/Windows, and
+      # `docs/DEPLOY.md` §5 backs this volume up with `pg_dump` rather than by copying it.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `$$` is Compose's escape: these two are read from the container's own environment (the block
+      # above), not interpolated out of `.env` at config time. `pg_isready` is the only probe this image
+      # ships, and it answers "can a client authenticate and select this database", which is what `app`
+      # needs to be true before it opens a pool.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    # No `ports:` at all. See the header: the database is reachable from the app container and from
+    # `docker compose exec`, and from nowhere else.
+
+  app:
+    build:
+      # Two different roots, and mixing them up is the classic compose build mistake: `context` is resolved
+      # relative to **this file**, so `..` is the repo root — the workspace the multi-stage build installs and
+      # builds — while `dockerfile` is resolved relative to **that context**, so it is `docker/Dockerfile`
+      # and not `../docker/Dockerfile`. `docker compose … config` prints both resolved to absolute paths,
+      # which is the cheapest way to check this paragraph without asking Docker to build anything.
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: note-taker-app:latest
+    # Migrations run inside the app process, so a `db` that has merely started is enough — but it has to be
+    # *healthy*, or the first boot races `initdb` on a fresh volume and the migration failure looks like a
+    # broken release rather than a cold start.
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # `init: true` puts a reaper as PID 1's partner so a container that leaves orphan processes (none
+    # today; the app is one Node process) cannot accumulate zombies across a long uptime.
+    init: true
+    # The container's environment comes from the repo-root `.env`, so it never depends on what the shell
+    # that ran `up -d` happened to export. `environment:` below still wins — that is what makes the pinned
+    # values and the composed DSN real no matter what the file contains.
+    env_file: ../.env
+    ports:
+      # The single published mapping, and the only port the host gains. `PORT` inside the container stays
+      # 3000 (see `environment:`), so this is the one knob: `HOST_PORT=8080` in `.env` answers on `:8080`
+      # and nothing listens on `:3000`.
+      #
+      # Deliberately **not** loopback-prefixed, unlike the dev database's `127.0.0.1:` mapping: this is a
+      # server whose whole point is being reachable, and an operator who wants it behind `127.0.0.1` only
+      # (in front of their own TLS proxy) edits this line, which is a documented one-line change in
+      # docs/DEPLOY.md §8 rather than a hidden default.
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      # The image bakes `NODE_ENV=production` too; repeating it here is the "cannot drift apart silently"
+      # rule from docs/plans/mvp/MVP-18.md §4, and it is why `docs/DEPLOY.md` tells an operator never to put
+      # `NODE_ENV` in `.env` at all (`pnpm check:env` fails a file that does).
+      NODE_ENV: production
+      # Pinned, so `EXPOSE 3000` and the image's `HEALTHCHECK` stay true while `HOST_PORT` moves the host
+      # side of the mapping. There is no version of "just change PORT in the .env" that keeps both honest.
+      PORT: "3000"
+      # Raw interpolation, host is the service name `db` and never `localhost`, and the port is the
+      # *service* port 5432 — the published host port is a different number and irrelevant in here. This is
+      # why `POSTGRES_PASSWORD` has to be `[A-Za-z0-9]+`: nothing percent-encodes on the way, and `@ : / +
+      # % ? #` in it silently builds a DSN that points somewhere else. Nothing here catches that — `env.ts`
+      # refuses those characters only where it *derives* a DSN (`dsnComponent()`, development and test), and
+      # this line is the case where it is handed one verbatim. `pnpm check:env` is the check, and it is
+      # optional, so docs/DEPLOY.md §2 step 2 tells the operator to generate the password with
+      # `openssl rand -hex 32` rather than to trust a boot guard that cannot see a composed URL.
+      DATABASE_URL: postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/$POSTGRES_DB
+      # Required, with no default: `docker compose config` fails at parse time naming the variable instead
+      # of handing the container an empty key, and it does so **without creating a container** — which is
+      # what makes docs/DEPLOY.md §2's preflight work on a host with nothing but Docker installed. A
+      # silently-empty key would otherwise boot, encrypt nothing, and produce notes that decrypt to nothing.
+      #
+      # The mounted-key-file variant (`NOTE_ENCRYPTION_KEY_FILE`, read by `crypto/keys.ts` at boot) is an
+      # explicit four-piece edit to this file — the block below the `app` service spells it out, and
+      # docs/DEPLOY.md §3 walks through it. Compose interpolation cannot express "either this or that", so
+      # there is no way to make this line optional from `.env`. `pnpm check:env` warns when it sees
+      # `_KEY_FILE` in a production `.env`, which is this edit remembered for you.
+      NOTE_ENCRYPTION_KEY: ${NOTE_ENCRYPTION_KEY:?set NOTE_ENCRYPTION_KEY in the repo-root .env}
+      # NOTE_ENCRYPTION_KEY_PREVIOUS, HOST, SECURE_COOKIES, TRUST_PROXY, ALLOW_REGISTRATION, SESSION_TTL_DAYS
+      # and the rest arrive through `env_file:` above. They are not repeated here: a variable listed twice is
+      # a variable whose effective value depends on which of the two you happen to read.
+
+  # ── the optional edit: a mounted key file ────────────────────────────────────
+  # The key can live in a file the app reads at boot (`NOTE_ENCRYPTION_KEY_FILE`, PR-06) instead of in a
+  # variable, so it never appears in a shell, in `docker inspect`, or in a `.env` somebody sourced at 3 a.m.
+  # That variant is a deliberate **edit to this file**, in four pieces: add `notes-keys` to the app's
+  # `volumes:` as `/run/secrets`, add `NOTE_ENCRYPTION_KEY_FILE: /run/secrets/note_key` to its
+  # `environment:`, delete the required `NOTE_ENCRYPTION_KEY` line above (Compose interpolation cannot
+  # express "either this or that"), and declare the volume at the bottom of this file as
+  # `notes-keys: { name: note-taker_notes-keys, external: true }` (see the note there for why it is not an
+  # internal volume). Then create it and put the key in it: docs/DEPLOY.md §3 walks through both, and
+  # `pnpm check:env` warns when it sees `NOTE_ENCRYPTION_KEY_FILE` while this file still demands the
+  # variable, which is this edit remembered for you.
+
+# One volume, and deliberately not two: the *key* volume is left undeclared here on purpose, because a
+# declared internal volume is owned by the stack — created, replaced, and deleted by
+# `docker compose down -v`, which is a reflex, and deleting the volume that holds `NOTE_ENCRYPTION_KEY_FILE`
+# makes every note body in `pgdata` unrecoverable (docs/DEPLOY.md §5). The edit above therefore declares it
+# **`external: true`**: the operator creates it once, Compose only refers to it, and `down -v` walks past it.
+volumes:
+  pgdata:

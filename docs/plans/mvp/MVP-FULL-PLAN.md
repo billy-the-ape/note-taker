@@ -334,6 +334,8 @@ note-taker/
             ├── features/auth/{session.tsx, auth.api.ts, useSession.ts}   PR-08
             ├── features/tree/{tree.queries.ts, tree.selectors.ts, tree.mutations.ts}  PR-12
             ├── features/notes/{note.queries.ts, note.mutations.ts}       PR-13/14
+            ├── features/notes/{new-note.ts, open-note.ts}  PR-15 the create path (tree-cache uniqueness,
+            │                                            cache bookkeeping) and the editor-caret handoff
             ├── features/notes/useAutosave.ts  PR-14 the machine's DOM half (flush triggers, draft prompt)
             ├── features/settings/settings.api.ts PR-14 `GET /api/settings` read (PR-16 grows the screen)
             └── components/
@@ -648,7 +650,7 @@ home/LAN/VM network, possibly behind a reverse proxy.
 | `/setup` | only when `needsSetup` | create the first account (README: self-hosted, first-run) |
 | `/login` | redirect away when authed | username + password, error + rate-limit messaging |
 | `/signup` | only when `registrationOpen` **AND** `!needsSetup`; otherwise redirect to `/login` (`/setup` on a fresh install) | self-sign-up form; creates a `member` (route + guard land in PR-08, server guard in PR-07) |
-| `/welcome` | auth | **placeholder home created by PR-08** (signed-in card + sign-out control); deleted by PR-12 when `/app` lands |
+| `/welcome` | — | **does not exist: PR-12 deleted `routes/welcome.tsx`.** PR-08's placeholder home; a bookmark to it is an unknown path and lands on `/app` when signed in |
 | `/app` | auth | AppShell; default view = recent notes + "New note" |
 | `/app/note/$noteId` | auth | editor + preview for one note |
 | `/app/search` | auth | search results (`?q=`) |
@@ -659,15 +661,17 @@ Route guards live in `routes/app/route.tsx` (`beforeLoad` reads the session cont
 TanStack Router's own convention:** in file-based routing a directory's layout route is `route.tsx` inside it
 (`routes/app/route.tsx` wraps `index.tsx`, `note.$noteId.tsx`, `settings.tsx`, `search.tsx`); `__layout.tsx` is the
 Next.js App Router habit and is not what the router's plug-in picks up. Until PR-12
-creates that layout, the authed redirect target is `/welcome` (created in PR-08, replaced in PR-12), which keeps
-PR-08's acceptance testable on its own.
+created that layout, the authed redirect target was `/welcome` (created in PR-08, deleted by PR-12), which kept
+PR-08's acceptance testable on its own. PR-12 repointed every authed landing and redirect at `/app`, and the guard
+matches `/app` as a **prefix** (`isAppPath` in `session.tsx`), so a later PR adds `/app/search` or `/app/settings`
+without teaching the guard anything.
 
 ### 11.2 State
 
 | Kind | Where |
 | --- | --- |
 | Server state (tree, note content, settings, session) | TanStack Query, cache keys `['tree',userId]`, `['note',id]`, `['settings']` |
-| Mutations | TanStack Query mutations with optimistic tree updates + rollback on error |
+| Mutations | TanStack Query mutations with optimistic tree updates + rollback on error (a **create** has no id to insert optimistically — `POST /api/notes` mints it, so the row enters the tree on confirmation; PR-15 §9) |
 | Editor buffer (uncommitted text) | **the autosave engine owns it** (PR-14): `lib/autosave.ts` holds the buffer and the editor renders `snapshot().buffer`, because §11.4's conflict comparison needs one owner of the string that went on the wire and a component holding its own `useState` on top of the engine is two. Mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
 | Transient UI (dialogs, preview mode, sidebar width) | local state + a tiny `ui` store for sidebar/preview mode persisted in `localStorage` |
 
@@ -777,6 +781,20 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   to the selected folder/root, "Create" is disabled while the name is invalid or collides (debounced
   uniqueness check against the tree cache, no extra endpoint).
 - Rename dialogs reuse the same component with the current name and the same fixed `.md` suffix for notes.
+
+**Three things PR-15 only settled in code, recorded because PR-12/13/19 read this section as behaviour:**
+
+- **The suffix is a sibling element, not a character.** The input's value is the editable name; `.md` is a node after
+  it. A `keydown` guard for "cannot be deleted" has to enumerate every way a character leaves a field (backspace,
+  delete, cut, drag-out, drop, autofill, IME and screen-reader replacements); the markup rule has no cases. The one
+  route that still gets `.md` into the value is a paste, and `stripMd` removes it from the request body.
+- **The uniqueness check is a debounced read of `['tree', userId]`, never a request.** The tree already lists every
+  sibling, so a "is this free?" endpoint re-learns a list this tab is holding. The consequence is deliberate: a tab
+  that has not fetched the tree has no opinion, so the `409 CONFLICT` (with the winner's id) is a first-class branch
+  of the dialog, not an error page.
+- **Creating hands the caret over through the cache, not the URL.** `['editor-focus']` holds the id this tab just
+  created; PR-13's editor page asks `takesEditorFocus(client, id)` on mount. A `?focus=1` would be bookmarked and
+  re-opened, and a one-shot consume would be eaten by `StrictMode`'s double mount (PR-15 §9).
 - Everything reachable by keyboard: tree arrow-key navigation, `Enter` to open, `F2` rename, `Delete` delete,
   `Ctrl/Cmd+K` (search *page* link in MVP, palette is backlog). Two chord rules keep this collision-free:
   **`Ctrl/Cmd+K` is editor-scoped against shell-scoped** — while the CodeMirror editor has focus, its keymap owns the
@@ -1517,12 +1535,18 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   `NODE_ENV=production` — `docker compose --env-file .env -f docker/compose.yml exec app node -e "console.log(process.env.NODE_ENV)"`
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
-  `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
+  the runtime image adds no build or download tool of its own — proven by asking a container of the image to
+  walk `/app` (no tool by name; no `.ts` source of ours, scoped to the payload paths the image ships, since
+  third-party packages ship their own TypeScript; nothing under `/app` owned by the app user), **not** by
+  `docker history`, whose layer
+  *commands* mention `curl` because the base image's ancestors installed it, whether or not the finished image
+  keeps it (this sentence corrected while reviewing PR-16: the original read "`docker history` shows no dev deps
+  and no `curl`", a check that prints LEAK on a correct image); image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production — **and** on that same clean VM, with nothing on it but Docker,
   `docker compose --env-file .env -f docker/compose.yml config` exits non-zero naming the variable without creating a
   single container: that is the form §15 step 2b runs, backed by `${NOTE_ENCRYPTION_KEY:?…}` in the app service. The
   dev/CI form is asserted **in the CI `build` job**, where the repo toolchain exists and never from the runbook: `pnpm
-  check:env`, run against two fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
+  check:env`, run against four fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
   environment — defined as `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero
   listing the same missing
   variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. Two details make that
@@ -1530,7 +1554,10 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   comes from its script line, §16) and **no `DATABASE_URL` line** — the runbook's file carries the `POSTGRES_*` trio,
   which is exactly what satisfies the preflight's DSN rule even though the *boot* guard demands a composed
   `DATABASE_URL` in the process (§10). A third assertion pins the negative case: a `.env` with neither form exits
-  non-zero naming both options.
+  non-zero naming both options. Two more pin a promise about the *report itself* — added after PR-16's first review
+  found the failure paths printing the key they were reporting on: fixtures whose values are pasted into a malformed
+  line, into a boolean, and onto a line of their own must still fail and still name the rule, while neither the whole
+  value nor its first 20 characters may appear in the log (a prefix grep, because the leak was a truncated one).
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
   the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
   "$POSTGRES_USER" "${POSTGRES_DB}_restore"` — the scratch DB must exist before the pipe can succeed; `gunzip -c

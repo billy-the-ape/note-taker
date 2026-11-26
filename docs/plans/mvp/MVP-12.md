@@ -31,6 +31,11 @@ assertions live here and not in PR-08).
   Toast,Spinner}.tsx`, Tailwind tokens, `/setup`, `/login`, `/signup`, `/welcome`.
 - PR-05 gave `lib/api.ts` (typed `json()`, `ApiError`, CSRF header, one-shot 403 replay) and `queryClient.ts`
   (cache keys `['tree',userId]`, `['note',id]`, `['settings']`).
+- **PR-15 shipped the new-note dialog**: `components/notes/NewNoteDialog.tsx`, `useNewNoteDialog()` (the affordance
+  `TopBar`/`StatusBar`/the tree context menu call), `features/notes/new-note.ts` and `lib/name.ts`. Wiring the three
+  buttons is **this PR's job** (they are its files); the dialog's `['tree', userId]` cache read only sees a real
+  tree once `features/tree/tree.queries.ts` writes that key, and `takenSiblingNames` there may be absorbed into
+  PR-15's `new-note.ts` rather than duplicated.
 - PR-09's server endpoints: `GET /api/tree` → `{folders:[FolderNode], notes:[NoteNode]}` (metadata only, **no
   content**; folders-then-notes, `name` collation `C`), `POST /api/folders {name,parentId|null}`,
   `PATCH /api/folders/:id {name?,parentId?}`, `DELETE /api/folders/:id?cascade=true`,
@@ -72,7 +77,8 @@ documented there; **`AGENTS.md` gains the `static-spa` layout convention if it d
   with retry.
 - **Keyboard:** ↑ ↓ ← →, `Enter` open, `F2` rename, `Del` delete. Everything reachable by keyboard.
 - **A11y:** `role="tree"` on the container, `role="treeitem"` + `aria-selected` + `aria-expanded` on rows.
-- **Context menu:** "New folder" (inline form), "Rename", "Move to…" (folder-tree picker), "Delete".
+- **Context menu:** "New folder" (inline form), "New note" (PR-15's `useNewNoteDialog().openFor({ folderId,
+  folderName })`), "Rename", "Move to…" (folder-tree picker), "Delete".
   Destructive actions (folder with children, note delete) require **typing the item name** to confirm; a folder delete
   sends `cascade=true` only after that confirmation.
 - **Mutations:** TanStack Query mutations with optimistic tree updates and rollback on error; a `CONFLICT` on rename
@@ -103,8 +109,9 @@ documented there; **`AGENTS.md` gains the `static-spa` layout convention if it d
 
 ## 7. Out of scope
 
-The editor pane (PR-13), the new-note dialog (PR-15), search UI (PR-17), settings UI (PR-16), drag-and-drop (backlog —
-MVP moves via dialog), soft delete/trash (backlog PR-23).
+The editor pane (PR-13), search UI (PR-17), settings UI (PR-16), drag-and-drop (backlog —
+MVP moves via dialog), soft delete/trash (backlog PR-23). The new-note **dialog** is PR-15's and has landed; what
+belongs here is the **wiring** of its three affordances (§5).
 
 ## 8. PR body template
 

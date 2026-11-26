@@ -5,8 +5,9 @@
 # workflow (or narrowing its triggers) silently turns the Claude review off — plan §20 risk R6.
 #
 # A job never enters this file before the files it runs exist (MVP-03 §5): `integration` arrived with PR-04
-# (a `postgres:16` service + `pnpm coverage:integration`), PR-18 adds the `docker build` step inside
-# `build`, PR-19 adds `e2e`. Nothing here pushes an image, and nothing here caches except
+# (a `postgres:16` service + `pnpm coverage:integration`), PR-18 added the `docker build` step inside `build`
+# along with the two assertions that file makes possible (`check:env` against fixtures, and `compose config`
+# interpolation), PR-19 adds `e2e`. Nothing here pushes an image, and nothing here caches except
 # `actions/setup-node`'s `cache: pnpm` (MVP-03 §7).
 name: CI
 on:
@@ -135,8 +136,9 @@ jobs:
           path: apps/server/coverage-integration
           if-no-files-found: error
 
-  # `pnpm build`: tsc → apps/server/dist, vite build → apps/web/dist. No `docker build` step yet —
-  # docker/Dockerfile is PR-18's file, and the MVP has no registry to push to (MVP-03 §5).
+  # `pnpm build`: tsc → apps/server/dist, vite build → apps/web/dist. PR-18 added the two things this job
+  # owns and no other can assert: the production env preflight against fixture files (§5 of MVP-18.md), and
+  # the `docker build` step. Nothing here pushes an image — the MVP has no registry (MVP-03 §5, MVP-18 §8).
   build:
     runs-on: ubuntu-24.04
     steps:
@@ -151,3 +153,155 @@ jobs:
       # `pnpm build:packages && pnpm -r --filter './apps/**' build`, so this one step compiles the packages
       # (a no-op until PR-05) and then both apps — no duplicated step, and PR-05 needs no edit here either.
       - run: pnpm build
+      # PR-18 §7: the dev/CI form of the preflight is asserted **here**, where the repository's toolchain
+      # exists, and never from the runbook (whose first deploy host has nothing but Docker). The fixtures are
+      # reached through `DOTENV_PATH`, so the assertion is about two committed files and not about what this
+      # runner happens to export. `pnpm check:env` is `NODE_ENV=production tsx scripts/check-env.ts` (PR-01's
+      # inline-mode rule): the linter reads the file as data and never routes through `loadDevEnvFile()`,
+      # which is a no-op in `production` by design.
+      - name: check:env against the fixtures
+        env:
+          # The key from `scripts/fixtures/prod-no-dsn.env`, whose base64 decodes to
+          # `pr18-fixture-key-not-a-secretxx!`. It is a fixture, not a secret: step 2 below is proving that
+          # *filling the line in* is what turns the preflight green, and the two redaction fixtures reuse the
+          # same value so one prefix grep covers all of them.
+          FIXTURE_KEY: cHIxOC1maXh0dXJlLWtleS1ub3QtYS1zZWNyZXR4eCE=
+          # A second key for the wrong-variable fixture: base64 of 32 bytes beginning `0xfc 0xfd`, so its base64
+          # **starts with `/`**. Base64's alphabet contains `/`, so about one key in 64 does — and the exemption
+          # that keeps `NOTE_ENCRYPTION_KEY_FILE=/run/secrets/note_key` diagnosable used to exempt any token
+          # starting with `/`. Every earlier fixture began `cHIx…`, so CI was asserting the redaction rule with
+          # keys that could not reach the branch; this is the prefix that keeps `looksLikePath` honest.
+          SLASH_KEY: /P1wcjE4LXNsYXNoLWtleS1ub3QtYS1zZWNyZXQhISE=
+        run: |
+          set -euo pipefail
+          report=$(mktemp -d)
+
+          # 1. The runbook's production `.env` minus the key: non-zero, naming the same variable
+          #    `docker compose … config` names, and reached before Docker is contacted at all.
+          if DOTENV_PATH=scripts/fixtures/prod-missing-key.env pnpm check:env >"$report/missing.log" 2>&1; then
+            echo '::error::a key-less production .env passed check:env; it must not'
+            cat "$report/missing.log"
+            exit 1
+          fi
+          grep -q 'NOTE_ENCRYPTION_KEY' "$report/missing.log" || {
+            echo '::error::check:env failed without naming NOTE_ENCRYPTION_KEY'
+            cat "$report/missing.log"
+            exit 1
+          }
+          cat "$report/missing.log"
+
+          # 2. The same file with the key filled in: exit 0. Two details make that reachable and are
+          #    asserted by the fixture itself — it carries **no `NODE_ENV` entry** (compose.yml pins the
+          #    mode) and **no `DATABASE_URL` line** (the `POSTGRES_*` trio satisfies the DSN rule).
+          cp scripts/fixtures/prod-missing-key.env "$report/filled.env"
+          printf 'NOTE_ENCRYPTION_KEY=%s\n' "$FIXTURE_KEY" >>"$report/filled.env"
+          DOTENV_PATH="$report/filled.env" pnpm check:env
+
+          # 3. The negative case of the DSN carve-out: a file with neither form fails, naming both options.
+          if DOTENV_PATH=scripts/fixtures/prod-no-dsn.env pnpm check:env >"$report/nodsn.log" 2>&1; then
+            echo '::error::a .env with neither DATABASE_URL nor the POSTGRES_* trio passed check:env'
+            exit 1
+          fi
+          cat "$report/nodsn.log"
+          grep -q 'DATABASE_URL' "$report/nodsn.log" || { echo '::error::the failure must name DATABASE_URL'; exit 1; }
+          grep -q 'POSTGRES_USER' "$report/nodsn.log" || {
+            echo '::error::the failure must name the POSTGRES_* trio as the other option'
+            exit 1
+          }
+
+          # 4. The promise in `scripts/check-env.ts`'s own header — "it never echoes a value that could be key
+          #    material" — asserted where it was actually broken once: a malformed line is reported by printing
+          #    the offending text, and the offending text here *is* the key (an inline `#` is a comment to
+          #    Compose and literal text to a sourced shell, so the line has to be named). Failure output is
+          #    pasted into tickets, so the rule is: report the shape, never the value. Grepping the key out of
+          #    the log is the whole test, and `cat` above/below is what a failure has to show.
+          if DOTENV_PATH=scripts/fixtures/prod-redaction.env pnpm check:env >"$report/redaction.log" 2>&1; then
+            echo '::error::a NOTE_ENCRYPTION_KEY line with an inline comment passed check:env; the readers disagree about its value'
+            exit 1
+          fi
+          grep -q 'inline' "$report/redaction.log" || {
+            echo '::error::the malformed-line rule was not reported, so there is nothing to check for leakage'
+            cat "$report/redaction.log"
+            exit 1
+          }
+          #    The grep uses a prefix, deliberately: the leak this guard exists for printed the *first 40
+          #    characters* of a 44-character key, so grepping for the whole value would have passed a real
+          #    leak. 20 characters is long enough to be distinctive about this fixture and short enough to
+          #    survive any truncation the reporter applies. A failure prints the log with the match masked,
+          #    because a CI log about a key leak must not itself leak the key.
+          if grep -qF "${FIXTURE_KEY:0:20}" "$report/redaction.log"; then
+            echo '::error::check:env printed the key it was reporting on — report shape and length, never the value'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/redaction.log"
+            exit 1
+          fi
+          grep -q 'not printed' "$report/redaction.log" || {
+            echo '::error::the redacted preview is missing its length-only form'
+            cat "$report/redaction.log"
+            exit 1
+          }
+
+          # 5. The two shapes the first redaction fix left behind, both found by re-reading the failure paths
+          #    after it shipped: a key typed into a variable that is **not** the key (so the rule that fires is a
+          #    boolean rule, and the name of the variable is no reason at all to print the value), and a key left
+          #    on a line of its own (which parses as an assignment *named after the key*, and was therefore
+          #    printed while the report explained that nothing reads it). One fixture, both shapes, same rule.
+          if DOTENV_PATH=scripts/fixtures/prod-wrong-variable.env pnpm check:env >"$report/wrongvar.log" 2>&1; then
+            echo '::error::a note-encryption key in SECURE_COOKIES passed check:env; it is not a boolean'
+            exit 1
+          fi
+          grep -q 'SECURE_COOKIES' "$report/wrongvar.log" || {
+            echo '::error::the wrong-variable rule was not reported, so there is nothing to check for leakage'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
+            exit 1
+          }
+          if grep -qF "${FIXTURE_KEY:0:20}" "$report/wrongvar.log"; then
+            echo '::error::check:env printed a key it was only reporting the shape of — length only, whatever variable it was typed into'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
+            exit 1
+          fi
+          #    The same log, the leading-`/` key: this is the assertion that fails against the code before this
+          #    commit, and the reason the exemption cannot widen again without CI noticing.
+          if grep -qF "${SLASH_KEY:0:20}" "$report/wrongvar.log"; then
+            echo '::error::check:env printed the leading-slash key — the path exemption must not swallow base64 that merely happens to start with /'
+            sed -e "s|${SLASH_KEY}|${SLASH_KEY:0:4}<REDACTED>|" "$report/wrongvar.log"
+            exit 1
+          fi
+          grep -q 'not printed' "$report/wrongvar.log" || {
+            echo '::error::neither report in the wrong-variable fixture used the length-only form'
+            sed -e "s/${FIXTURE_KEY}/${FIXTURE_KEY:0:4}<REDACTED>/" "$report/wrongvar.log"
+            exit 1
+          }
+      # The same three properties the runbook's §2 preflight promises an operator, asserted where a runner
+      # has Docker: `config` fails naming the variable, `config` succeeds once the key exists, and what it
+      # composes is a DSN with host `db` on a pinned `PORT` with a `production` mode — with no `NODE_ENV` and
+      # no `DATABASE_URL` in the file. `.env` is gitignored, and `config` never talks to the daemon, so no
+      # container is created by any line of this step.
+      - name: compose config interpolates the way DEPLOY.md says
+        run: |
+          set -euo pipefail
+          report=$(mktemp -d)
+
+          cp scripts/fixtures/prod-missing-key.env .env
+          if docker compose --env-file .env -f docker/compose.yml config >"$report/keyless.log" 2>&1; then
+            echo '::error::compose.yml accepted a .env with no NOTE_ENCRYPTION_KEY'
+            exit 1
+          fi
+          grep -q 'NOTE_ENCRYPTION_KEY' "$report/keyless.log" || {
+            echo '::error::compose must name the variable it is missing'
+            cat "$report/keyless.log"
+            exit 1
+          }
+          cat "$report/keyless.log"
+
+          printf 'NOTE_ENCRYPTION_KEY=%s\n' cHIxOC1maXh0dXJlLWtleS1ub3QtYS1zZWNyZXR4eCE= >>.env
+          docker compose --env-file .env -f docker/compose.yml config >"$report/resolved.yml"
+          grep -q 'NODE_ENV: production' "$report/resolved.yml"
+          grep -q 'PORT: "3000"' "$report/resolved.yml"
+          # host `db` (the service name, never `localhost`) and the *service* port, whatever HOST_PORT is.
+          grep -q 'DATABASE_URL: postgres://[^@]*@db:5432/' "$report/resolved.yml"
+          ! grep -qE 'published: "5432"' "$report/resolved.yml"   # the db publishes nothing
+      # PR-18's `docker build` step. It builds and never pushes: there is no registry in the MVP
+      # (docs/plans/mvp/MVP-03.md §5, MVP-18.md §8), and an unpushed image still proves the multi-stage
+      # build, the pruned install, and the contract package that has to resolve inside it.
+      - name: docker build
+        run: docker build --file docker/Dockerfile --tag note-taker-app:ci .

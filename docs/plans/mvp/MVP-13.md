@@ -33,6 +33,12 @@ Open a note by URL and edit it as **raw Markdown** with a Markdown-aware toolbar
   Note payload cap is 1 MiB; **the UI warns at 900 KiB**.
 - `contracts`: `noteSchema`, `contentUpdateSchema`, `withMd()` for display, `ROUTES`.
 - `lib/api.ts` + `queryClient.ts` (cache key `['note',id]`), Tailwind tokens, `components/ui/*`.
+- **PR-15 already opens notes.** `features/notes/open-note.ts` marks `['editor-focus'] = noteId` and navigates to
+  `/app/note/<id>`; this PR's page has to read it (see §5), and PR-15 navigates with `navigate({ href })` because
+  `to` is typed against a route that did not exist yet — `NOTE_EDITOR_PATH` is exported for the swap to
+  `navigate({ to: NOTE_EDITOR_PATH, params: { noteId } })`. Its `apps/web/src/test/new-note-harness.tsx` holds the
+  two lines (read `['note',id]`, focus on the mark) as an executable version of that contract: move them into
+  `routes/app/note.$noteId.tsx` and keep the assertions (MVP-15 §9).
 - Pinned editor/markdown deps: CodeMirror 6 via `@uiw/react-codemirror` + `@codemirror/lang-markdown`,
   `react-markdown`, `remark-gfm`, `rehype-sanitize`.
 
@@ -73,6 +79,12 @@ below.
 **Guards & counters** — navigating away with an unsaved buffer prompts (the autosave-off dirty guard "Save / Discard /
 Stay" is formalized by PR-14; here it must at least not silently drop text). Character/byte counter with a warning at
 900 KiB (`MAX_NOTE_BYTES` = 1 MiB is the server cap).
+
+**The caret** — on mount the page asks `takesEditorFocus(client, noteId)` (`features/notes/open-note.ts`) and, when
+that is `true`, focuses the editor: "after create, the note is open in the editor, **focused**, and the URL changed" is
+PR-15's acceptance criterion, and the caret lives here. The predicate is a read rather than a one-shot consume, so
+`StrictMode`'s double-mount in development still sees it, and a note merely *visited* (tree click, back button, shared
+link) must not steal it.
 
 **`data-testid`s for PR-19:** `editor`, `editor-toolbar`, `preview`, `mode-split`, `mode-write`, `mode-preview`,
 `save-status` (render a placeholder pill — PR-14 fills it), `byte-counter`, `note-title`.

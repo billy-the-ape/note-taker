@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
 
-import { CredentialsForm } from '../components/auth/CredentialsForm';
+import { CredentialsForm } from '../../components/auth/CredentialsForm';
 
 /**
  * `/setup` — first-run account creation, shown only while `needsSetup` (docs/plans/mvp/MVP-08.md §4).
@@ -15,7 +15,7 @@ import { CredentialsForm } from '../components/auth/CredentialsForm';
  * `ALLOW_REGISTRATION=true`, and treating that as an invitation to offer sign-up is the dead end §4
  * exists to close.
  */
-export const Route = createFileRoute('/setup')({
+export const Route = createFileRoute('/_auth/setup')({
   component: SetupPage,
 });
 

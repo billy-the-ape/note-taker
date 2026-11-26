@@ -27,7 +27,7 @@ export const queryKeys = {
   /**
    * `GET /api/auth/session` (§9.2 #8) — `{user|null}`. Keyed by nothing, because it *is* the cookie:
    * a second user behind the same browser has a different cookie, and a cache entry that outlived the
-   * session would be the one bug that shows somebody else's name on `/welcome`.
+   * session would be the one bug that shows somebody else's name on `/app`.
    */
   authSession: ['auth', 'session'] as const,
   /** The folder/note tree of one user (§9.2 #12). */
@@ -36,6 +36,12 @@ export const queryKeys = {
   note: (id: string): readonly ['note', string] => ['note', id],
   /** The single settings row of the signed-in user (§9.2 #22). */
   settings: ['settings'] as const,
+  /**
+   * The id of the note **this tab just created**, so the editor knows to take the caret when it opens
+   * (PR-15). Not per-id, because there is only ever one answer, and not a URL: "created seconds ago" is a
+   * fact about the visit rather than about the note. `features/notes/open-note.ts` is the only writer.
+   */
+  editorFocus: ['editor-focus'] as const,
 } as const;
 
 /** The prefix a rename or move invalidates, whatever id it touched. */

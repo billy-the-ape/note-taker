@@ -3,7 +3,7 @@
  * The three credential pages and the way out (docs/plans/mvp/MVP-08.md §6, §7).
  *
  * These are the acceptance criteria the brief names, run through the real router: the first-run form
- * creates the owner and lands on `/welcome`; `/signup` only exists when the server says it may; a wrong
+ * creates the owner and lands on `/app`; `/signup` only exists when the server says it may; a wrong
  * password costs a click and not the password; `429` says when to come back; a `400` puts each complaint
  * under the input it came from; and signing out really ends the session.
  *
@@ -44,7 +44,7 @@ function textOf(element: Element | null): string {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('/setup — the first-run bootstrap', () => {
-  it('creates the owner and lands on /welcome', async () => {
+  it('creates the owner and lands on /app', async () => {
     const { fake, app, user } = await bootAuth('/setup', { needsSetup: true });
 
     // The confirmation is part of the form even though the server never sees it (§6): leave it out and
@@ -54,14 +54,14 @@ describe('/setup — the first-run bootstrap', () => {
       password: TEST_PASSWORD,
       confirmPassword: TEST_PASSWORD,
     });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'));
 
     const request = callsTo(fake, ROUTES.auth.setup)[0];
     expect(request?.method).toBe('POST');
     // The body is exactly `registerSchema`: no confirm field, no display name, nothing the server has to
     // forgive. A stray `confirmPassword` here would be a `400` the moment it is rejected strictly.
     expect(request?.body).toEqual({ username: TEST_USERNAME, password: TEST_PASSWORD });
-    expect(screen.queryByTestId('welcome')).not.toBeNull();
+    expect(screen.queryByTestId('app-shell')).not.toBeNull();
 
     // The install moved, and only asking again learns that: `needsSetup` is held for `staleTime` and
     // `guardNavigation` reads it through `ensureQueryData`, which answers a fresh entry rather than
@@ -78,7 +78,7 @@ describe('/setup — the first-run bootstrap', () => {
       password: TEST_PASSWORD,
       confirmPassword: TEST_PASSWORD,
     });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'));
 
     const body = callsTo(fake, ROUTES.auth.setup)[0]?.body as { username: string };
     expect(body.username).toBe(TEST_USERNAME);
@@ -96,10 +96,10 @@ describe('/setup — the first-run bootstrap', () => {
       password: TEST_PASSWORD,
       confirmPassword: TEST_PASSWORD,
     });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'));
 
     await app.router.navigate({ to: '/setup', replace: true });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'), { timeout: 3000 });
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'), { timeout: 3000 });
     expect(screen.queryByTestId('setup-form')).toBeNull();
   });
 
@@ -118,7 +118,7 @@ describe('/setup — the first-run bootstrap', () => {
       password: TEST_PASSWORD,
       confirmPassword: TEST_PASSWORD,
     });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'));
 
     await user.click(screen.getByTestId('sign-out'));
     await waitFor(() => expect(app.router.state.location.pathname).toBe('/login'), { timeout: 3000 });
@@ -165,7 +165,7 @@ describe('/setup — the first-run bootstrap', () => {
 });
 
 describe('/signup — self-sign-up, when it is open', () => {
-  it('creates a member and lands on /welcome', async () => {
+  it('creates a member and lands on /app', async () => {
     const { fake, app, user } = await bootAuth('/signup', { registrationOpen: true });
 
     await submitForm(user, 'signup', {
@@ -173,7 +173,7 @@ describe('/signup — self-sign-up, when it is open', () => {
       password: TEST_PASSWORD,
       confirmPassword: TEST_PASSWORD,
     });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'));
 
     expect(callsTo(fake, ROUTES.auth.register)).toHaveLength(1);
     // A `member` is all this page can create, and there is deliberately no control here that looks like a
@@ -230,7 +230,7 @@ describe('/login', () => {
     });
 
     await submitForm(user, 'login', { username: TEST_USERNAME, password: TEST_PASSWORD });
-    await waitFor(() => expect(app.router.state.location.pathname).toBe('/welcome'));
+    await waitFor(() => expect(app.router.state.location.pathname).toBe('/app'));
 
     expect(callsTo(fake, ROUTES.auth.login)[0]?.body).toEqual({
       username: TEST_USERNAME,
@@ -325,20 +325,20 @@ describe('/login', () => {
 
 describe('signing out', () => {
   it('ends the session rather than hiding the form', async () => {
-    const { fake, app, user } = await bootAuth('/welcome', { user: sessionUser() });
+    const { fake, app, user } = await bootAuth('/app', { user: sessionUser() });
 
     await user.click(await screen.findByTestId('sign-out'));
     await waitFor(() => expect(app.router.state.location.pathname).toBe('/login'));
 
     expect(callsTo(fake, ROUTES.auth.logout)).toHaveLength(1);
     // The proof this was a sign-out and not a repaint: the same fake now answers `GET /api/auth/session`
-    // with nobody home, so the guard would send `/welcome` back here for as long as that lasts.
+    // with nobody home, so the guard would send `/app` back here for as long as that lasts.
     expect(screen.queryByTestId('login-form')).not.toBeNull();
-    expect(screen.queryByTestId('welcome')).toBeNull();
+    expect(screen.queryByTestId('app-shell')).toBeNull();
   });
 
   it('stays signed in when the logout call fails', async () => {
-    const { app, user } = await bootAuth('/welcome', {
+    const { app, user } = await bootAuth('/app', {
       user: sessionUser(),
       logoutReply: () => failure(500, 'INTERNAL', 'the session row is stuck'),
     });
@@ -348,7 +348,7 @@ describe('signing out', () => {
     // Clearing the cache and routing to `/login` before the server agreed would leave a person who is
     // still authenticated looking at a signed-out app — the worse of the two failures.
     expect(textOf(await screen.findByTestId('sign-out-error'))).toContain('the session row is stuck');
-    expect(app.router.state.location.pathname).toBe('/welcome');
-    expect(screen.queryByTestId('welcome')).not.toBeNull();
+    expect(app.router.state.location.pathname).toBe('/app');
+    expect(screen.queryByTestId('app-shell')).not.toBeNull();
   });
 });

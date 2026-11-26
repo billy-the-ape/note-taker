@@ -75,6 +75,16 @@ export function FolderRow({
           disabled={busy || !row.hasChildren}
           data-testid={`folder-toggle-${row.id}`}
           className="flex size-5 shrink-0 items-center justify-center rounded text-ink-muted hover:text-ink disabled:opacity-30"
+          // **The row keeps the focus.** Chromium and Firefox focus a `<button>` when it is pressed, and
+          // `TreeRow` is deliberately deaf to keys aimed at anything but the row itself — otherwise `Enter` on
+          // this chevron would fold the folder *and* run the row's open. So a chevron that takes focus on
+          // mousedown parks the keyboard on a `tabindex={-1}` button that answers nothing, and ↓, `F2` and
+          // `Delete` are dead until the person clicks a row again. Suppressing the default of the press keeps
+          // the click (which is the whole point of the button) and leaves the focus where it was; the keyboard
+          // toggles a folder with `→`/`←` anyway, and nothing here is reachable only by mouse.
+          onMouseDown={(event) => {
+            event.preventDefault();
+          }}
           onClick={(event) => {
             // Without the stop, one click would both fold the folder and re-aim the row's cursor, and the two
             // would disagree about which of them the user meant.

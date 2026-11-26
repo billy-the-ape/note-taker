@@ -21,17 +21,19 @@ export interface Reply {
   readonly headers?: Readonly<Record<string, string>>;
 }
 
-/** One recorded request, in the order they were made. */
+/**
+ * One recorded request, in the order they were made.
+ *
+ * **Three fields, and they have to stay three.** This is the shape PR-08's and PR-15's tests deep-equality
+ * against (`expect(fake.calls).toEqual([{ method, path, body }])`), so a fourth field here is a red `unit`
+ * job in every PR that was merged before it. The full request target is recorded too — it is one field wider
+ * and lives in {@link FakeApi.requests}, and a test that has to know whether `?cascade=true` was sent reads
+ * that one. One recording, two views, no versioned assertion.
+ */
 export interface Recorded {
   readonly method: string;
   /** The path with its query string removed, which is what a route table is keyed by. */
   readonly path: string;
-  /**
-   * The full request target, query string included. `path` cannot answer "did the client send
-   * `?cascade=true`" (§9.2 #15) — and after PR-12 that is a question about a deleted subtree, so it is worth
-   * recording rather than reconstructing.
-   */
-  readonly url: string;
   readonly body: unknown;
 }
 
@@ -55,7 +57,15 @@ export type Stub = (request: Requested) => Reply | Promise<Reply>;
 
 export interface FakeApi {
   readonly fetch: FetchLike;
+  /** The recorded requests as `{ method, path, body }`, in order — the shape a deep-equality test is written against. */
   readonly calls: readonly Recorded[];
+  /**
+   * The same requests in the same order, with the url. `path` cannot answer "did the client send
+   * `?cascade=true`" (§9.2 #15) — after PR-12 that is a question about a deleted subtree, so it is worth
+   * recording rather than reconstructing, and it is why this view exists rather than a field on
+   * {@link Recorded}.
+   */
+  readonly requests: readonly Requested[];
 }
 
 /**
@@ -72,7 +82,7 @@ export function fakeApi(
   routes: Readonly<Record<string, Stub>>,
   options: { readonly fallback?: Stub | undefined } = {},
 ): FakeApi {
-  const calls: Recorded[] = [];
+  const requests: Requested[] = [];
   const fallback = options.fallback;
 
   const fetchImpl: FetchLike = async (input, init) => {
@@ -80,7 +90,7 @@ export function fakeApi(
     const url = input;
     const path = input.split('?')[0] ?? input;
     const body = typeof init.body === 'string' && init.body.length > 0 ? JSON.parse(init.body) : undefined;
-    calls.push({ method, path, url, body });
+    requests.push({ method, path, url, body });
 
     const stub = routes[`${method} ${path}`] ?? fallback;
     if (stub === undefined) {
@@ -89,7 +99,15 @@ export function fakeApi(
     return toResponse(await stub({ method, path, url, body }));
   };
 
-  return { fetch: fetchImpl, calls };
+  // `calls` is derived rather than stored, so the two views cannot drift and the historical shape is not a
+  // second array somebody has to remember to append to.
+  return {
+    fetch: fetchImpl,
+    requests,
+    get calls(): readonly Recorded[] {
+      return requests.map(({ method, path, body }) => ({ method, path, body }));
+    },
+  };
 }
 
 function toResponse(reply: Reply): Response {

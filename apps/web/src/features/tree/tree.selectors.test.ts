@@ -28,6 +28,7 @@ import {
   folderHasChildren,
   isDescendantOrSelf,
   legalMoveTargets,
+  opensDeletedNote,
   ROOT_LABEL,
   recentNotes,
 } from './tree.selectors';
@@ -446,5 +447,47 @@ describe('countNodes (the status bar)', () => {
     // Collapsing is a view, not a delete: §5's counts are about the caller's work, not about the sidebar.
     expect(countNodes(TREE)).toEqual(countNodes({ folders: TREE.folders, notes: TREE.notes }));
     expect(flattenTree(TREE, { collapsed: new Set([F_WORK]) }).length).toBeLessThan(flattenTree(TREE).length);
+  });
+});
+
+describe('opensDeletedNote — whose delete takes the opened note with it', () => {
+  it.each([
+    // A note row is only the shell's problem when it *is* the shell's note.
+    [N_DRAFT, 'note', N_DRAFT, true],
+    [N_DRAFT, 'note', N_PLAN, false],
+    // A folder's notes are its whole subtree: the direct parent, and one level further down.
+    [N_DRAFT, 'folder', F_WORK, true],
+    [N_PLAN, 'folder', F_WORK, true],
+    [N_PLAN, 'folder', F_PROJECTS, true],
+    // A sibling folder decides nothing about a note that is not in it.
+    [N_DRAFT, 'folder', F_ARCHIVE, false],
+    [N_DRAFT, 'folder', F_NOTES, false],
+    // A root note is in no subtree, and an empty folder is in nobody's.
+    [N_IDEAS, 'folder', F_WORK, false],
+    [N_IDEAS, 'folder', F_NOTES, false],
+  ] as const)('%s deleted as %s/%s → %s', (opened, kind, id, expected) => {
+    expect(opensDeletedNote(TREE, opened, { kind, id })).toBe(expected);
+  });
+
+  it.each([null, undefined, testId('note', 999)])(
+    'a shell reading %s is unaffected by any delete',
+    (opened) => {
+      expect(opensDeletedNote(TREE, opened, { kind: 'note', id: N_DRAFT })).toBe(false);
+      expect(opensDeletedNote(TREE, opened, { kind: 'folder', id: F_WORK })).toBe(false);
+    },
+  );
+
+  it('is a question about the cache it was given, not about a row that has already gone', () => {
+    // The delete of `Work` is decided from the tree *before* the request: after the cache has been
+    // invalidated there is no `Projects` left to ask, and the answer the shell needs is the one about the
+    // subtree that is about to disappear.
+    const beforeWorkDeleted = TREE;
+    expect(opensDeletedNote(beforeWorkDeleted, N_PLAN, { kind: 'folder', id: F_WORK })).toBe(true);
+
+    const after = {
+      folders: beforeWorkDeleted.folders.filter((folder) => folder.id !== F_WORK && folder.id !== F_PROJECTS),
+      notes: beforeWorkDeleted.notes.filter((note) => note.id !== N_PLAN && note.id !== N_DRAFT),
+    };
+    expect(opensDeletedNote(after, N_PLAN, { kind: 'folder', id: F_WORK })).toBe(false);
   });
 });

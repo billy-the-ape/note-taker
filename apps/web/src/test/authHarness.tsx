@@ -184,3 +184,12 @@ export function failure(
 export function callsTo(fake: ReturnType<typeof fakeApi>, path: string) {
   return fake.calls.filter((call) => call.path === path);
 }
+
+/**
+ * The **urls** the client sent to `path`, in order — the question `callsTo` cannot ask, because its rows are
+ * deliberately `{ method, path, body }` (see `Recorded`). Query-string rules live here: whether a folder
+ * delete carried `?cascade=true` is a fact about a request, not about the route it hit.
+ */
+export function urlsTo(fake: ReturnType<typeof fakeApi>, path: string): readonly string[] {
+  return fake.requests.filter((request) => request.path === path).map((request) => request.url);
+}

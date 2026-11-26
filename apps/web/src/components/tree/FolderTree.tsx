@@ -40,6 +40,7 @@ import {
   descendantFolderIds,
   displayName,
   flattenTree,
+  opensDeletedNote,
   ROOT_LABEL,
 } from '../../features/tree/tree.selectors';
 import { DeleteConfirm } from '../notes/DeleteConfirm';
@@ -66,9 +67,14 @@ export interface FolderTreeProps {
    * "open" means — PR-13's editor route is the first real implementation of that idea.
    */
   readonly onOpenNote?: ((note: { readonly id: string; readonly name: string } | null) => void) | undefined;
+  /**
+   * The note the shell is reading, which is the only fact that makes a delete's effect on it decidable (§5;
+   * PR-12 review). `null` when nothing is open.
+   */
+  readonly openedNoteId?: string | null | undefined;
 }
 
-export function FolderTree({ response, onOpenNote }: FolderTreeProps) {
+export function FolderTree({ response, onOpenNote, openedNoteId = null }: FolderTreeProps) {
   const { toast } = useToast();
   const mutations = useTreeMutations();
 
@@ -283,6 +289,12 @@ export function FolderTree({ response, onOpenNote }: FolderTreeProps) {
   };
 
   const submitDelete = async (row: FlatRow): Promise<void> => {
+    // Decided **before** the request, from the tree as it stands now: after the cache has been invalidated
+    // this row's subtree is already gone from the rows, and "was the note being read one of them?" would have
+    // nothing to answer from. `opensDeletedNote` is the same walk the cascade gate counts, for the same
+    // reason — a folder's notes are its whole subtree.
+    const takesTheOpenedNote = opensDeletedNote(response, openedNoteId, { kind: row.kind, id: row.id });
+
     await run({
       label: 'Deleted',
       failure: 'Could not delete that',
@@ -299,7 +311,10 @@ export function FolderTree({ response, onOpenNote }: FolderTreeProps) {
       // editor open on a deleted note is PR-14's "save into a row that is gone" bug at its source.
       after: () => {
         setDialog(null);
-        if (row.kind === 'note') onOpenNote?.(null);
+        // Only a delete that reached the note on screen lets go of it. The cursor needs no such decision:
+        // `flattenTree` re-picks the tab stop from the rows that are left, whereas the shell's opened note is
+        // state outside the tree and has to be told.
+        if (takesTheOpenedNote) onOpenNote?.(null);
       },
     });
   };

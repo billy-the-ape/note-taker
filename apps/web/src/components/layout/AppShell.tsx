@@ -46,10 +46,15 @@ export interface TreeState {
 export interface AppShellProps {
   readonly tree: TreeState;
   readonly onOpenNote?: (note: { readonly id: string; readonly name: string } | null) => void;
+  /**
+   * The note the page is reading, handed to the sidebar because a delete there is the one thing that can take
+   * it away (PR-12 review). The route owns the state; the shell only passes it to the half that decides.
+   */
+  readonly openedNoteId?: string | null | undefined;
   readonly children: ReactNode;
 }
 
-export function AppShell({ tree, onOpenNote, children }: AppShellProps) {
+export function AppShell({ tree, onOpenNote, openedNoteId = null, children }: AppShellProps) {
   return (
     <div className="flex h-dvh flex-col bg-paper text-ink" data-testid="app-shell">
       <TopBar />
@@ -72,6 +77,7 @@ export function AppShell({ tree, onOpenNote, children }: AppShellProps) {
           busy={tree.busy}
           onRetry={tree.retry}
           onOpenNote={onOpenNote}
+          openedNoteId={openedNoteId}
         />
 
         <main id="app-main" className="min-w-0 overflow-y-auto" data-testid="app-main" tabIndex={-1}>

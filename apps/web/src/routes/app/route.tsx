@@ -108,7 +108,7 @@ function AppLayout() {
 
   return (
     <AppContext.Provider value={value}>
-      <AppShell tree={tree} onOpenNote={setOpenedNote}>
+      <AppShell tree={tree} onOpenNote={setOpenedNote} openedNoteId={openedNote?.id ?? null}>
         <Outlet />
       </AppShell>
     </AppContext.Provider>

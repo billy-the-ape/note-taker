@@ -39,9 +39,20 @@ export interface SidebarProps {
   readonly busy: boolean;
   readonly onRetry: () => void;
   readonly onOpenNote?: ((note: { readonly id: string; readonly name: string } | null) => void) | undefined;
+  /** Passed straight to the tree, which is the half that can tell whether a delete reaches the opened note. */
+  readonly openedNoteId?: string | null | undefined;
 }
 
-export function Sidebar({ response, loading, failed, message, busy, onRetry, onOpenNote }: SidebarProps) {
+export function Sidebar({
+  response,
+  loading,
+  failed,
+  message,
+  busy,
+  onRetry,
+  onOpenNote,
+  openedNoteId = null,
+}: SidebarProps) {
   const [collapsed, setCollapsed] = useState(() => readUi(SIDEBAR_COLLAPSED_KEY, '') === 'true');
 
   const toggle = (): void => {
@@ -93,7 +104,11 @@ export function Sidebar({ response, loading, failed, message, busy, onRetry, onO
       ) : loading ? (
         <TreeSkeleton />
       ) : (
-        <FolderTree response={response ?? { folders: [], notes: [] }} onOpenNote={onOpenNote} />
+        <FolderTree
+          response={response ?? { folders: [], notes: [] }}
+          onOpenNote={onOpenNote}
+          openedNoteId={openedNoteId}
+        />
       )}
     </nav>
   );

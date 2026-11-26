@@ -252,9 +252,7 @@ describe('the auth calls', () => {
   it('signs out through the route that deletes the session row', async () => {
     const fake = stub({ [`POST ${ROUTES.auth.logout}`]: () => ({ status: 204 }) });
     await expect(signOut()).resolves.toBeUndefined();
-    expect(fake.calls).toEqual([
-      { method: 'POST', path: ROUTES.auth.logout, url: ROUTES.auth.logout, body: undefined },
-    ]);
+    expect(fake.calls).toEqual([{ method: 'POST', path: ROUTES.auth.logout, body: undefined }]);
   });
 
   it('turns a rejected answer into the ApiError the form knows how to read', async () => {

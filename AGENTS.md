@@ -175,28 +175,45 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   registered **last** in `buildApp()` so route-shape conflicts fail loudly against the API's own routes; the
   fallback is two `wildcard: false` wildcards (`/app`, `/app/*`) because `@fastify/static`'s default
   `prefixMatching: true` swallows every non-GET request whose path starts with a served path, `POST /api/notes`
-  included; and `send()` is awaited inside a try, because the plugin's 404 is asynchronous and a synchronous
-  `try`/`catch` around it answers `500 ENOENT` for a perfectly good deep link. A production host with no web
-  build still boots and still answers `/api/*` — that is the self-host story PR-18 inherits.
+  included; and the fallback handler is `async` with an `await`ed `reply.send(readFileSync(index.html))`,
+  because `send(createReadStream(file))` commits `200 text/html` before the file is opened, so an `index.html`
+  that vanishes under a running process would arrive as an empty document *called* the app instead of the error
+  envelope the handler still owns. A production host with no web build still boots and still answers `/api/*` —
+  that is the self-host story PR-18 inherits.
 - **The tree's rules live in selectors, not in components** (PR-12): `features/tree/tree.selectors.ts` owns the
   comparator (folders before notes, case-insensitive `name`, `id` tiebreak — the same three keys as
   `GET /api/tree`'s `ORDER BY`), the nesting (orphans are hoisted, never dropped; a cycle is a row that is not a
-  folder), the visible flatten with its indent arithmetic (a folder's single-child chain is hoisted, so a `b/…/z/n`
-  drawer costs one column), the descendant set (legal-move pruning and the count a delete warning owes), the
+  folder), the visible flatten with its indent arithmetic (one `INDENT_REM` of padding per level, and the level
+  is the server's `depth`: a 100-level chain costs 100 indents, which is the §9.2 #13 cap's problem, not the
+  sidebar's, and nothing here re-derives it), the descendant set (legal-move pruning and the count a delete
+  warning owes), the
   breadcrumbs and `recentNotes` (PR-11's `/api/search/recent` mirror, so the shell does not re-derive recency).
   `tree.mutations.ts` imports `moveIsBlocked` from that same module, so **an illegal move is refused before
   `fetch`** — the server stays the authority and still answers 409. Optimistic writes are
   `react-query`'s `onMutate` on `['tree', userId]`; each of `applyRename`/`applyMove`/`applyDelete` returns the
   *same object* when the id is not in the cache, which is what lets a mutation over live data stay a no-op
   rollback rather than inventing a row from the dialog's stale snapshot. A row is named by `<row>-<field>` and
-  the field's problem by `<field>-error`, inline, always.
-- **A 500-node sidebar has a render budget, and the tree pays for it in DOM nodes** (PR-12): §6's check is
-  "renders in under a second", and `FolderTree.test.tsx` measures the honest number (`flattenTree` + the React
-  commit, via `act`/`fireEvent`, never `userEvent`'s pointer polling or a `waitFor` tick) and logs it. 500 rows is
-  100 ms in jsdom with three rules kept: a row is a plain `<div>` (`TreeRow` is not a component boundary), a
-  **closed** row menu is `rowMenuTrigger(...)` — a called function, not a mounted Radix root — and a note row
-  passes `leading={null}` instead of a spacer span per row. Adding a per-row component, context or wrapper node
-  costs 500 of whatever it is; measure before adding one.
+  the field's problem by `<field>-error`, inline, always. A row is the only tab stop and the only key target,
+  which is why the chevron inside a folder row calls `preventDefault()` on its **mousedown**: a `<button>` that
+  takes focus on a click would park the keyboard on a `tabindex={-1}` control that answers nothing, and ↓/`F2`/
+  `Delete` go silent until another row is clicked. `opensDeletedNote` is in the same module because the
+  shell, not the tree, holds the opened note: a note delete clears it **only** when it names that note, and a
+  folder delete clears it when the note sits in that folder or anywhere under it — the same closed set the
+  cascade request destroys.
+- **A 500-node sidebar has a render budget, and the tree pays for it in DOM nodes** (PR-12): §6's number is
+  "500 nodes in < 150 ms", and `FolderTree.test.tsx` measures it honestly — the mount of the sidebar alone
+  (`act`/`fireEvent`, never `userEvent`'s pointer polling or a `waitFor` tick), three cycles, **fastest** wins,
+  beside a 50-row mount of the same component in the same process. Two things are asserted: the scaling of
+  mount and of `flattenTree` against their 50-row figures (every environment, since instrumentation multiplies
+  both sides of those divisions equally), and §6's absolute 150 ms on an **uninstrumented** run only — the
+  `unit` CI job runs this file through `pnpm coverage`, where v8 instrumentation charges every function a row
+  calls and the same tree reads ~1.9× slower (CI measured 191.7 ms of what this machine calls ~100 ms). Under
+  coverage the absolute number is still logged with its verdict, so it is reported and never asserted falsely.
+  `VITEST_COVERAGE=1` is set by `apps/web`'s own `coverage` script — a switch this repo owns, not a runner
+  environment to sniff. 500 rows is ~100 ms in jsdom with three rules kept: a row is a plain `<div>` (`TreeRow`
+  is not a component boundary), a **closed** row menu is `rowMenuTrigger(...)` — a called function, not a mounted
+  Radix root — and a note row passes `leading={null}` instead of a spacer span per row. Adding a per-row
+  component, context or wrapper node costs 500 of whatever it is; measure before adding one.
 - **Tree UI tests drive a stateful fake, not a stub table** (PR-12): `src/test/treeApi.ts` is a folder/note model
   that enforces the server's rules — sibling uniqueness (409), the cycle block (409), the emptiness gate (409
   `that folder is not empty` unless `?cascade=true`), the generated `new-file-…` name — and exposes

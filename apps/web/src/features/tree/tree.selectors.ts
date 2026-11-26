@@ -436,6 +436,31 @@ export function displayName(row: Pick<FlatRow, 'kind' | 'name'>): string {
   return row.kind === 'note' ? withMd(row.name) : row.name;
 }
 
+/**
+ * Whether deleting `deleted` takes the **opened** note with it — the shell's question, answered by the tree's
+ * data because the tree is the half that can see both rows.
+ *
+ * Two directions were both wrong before it was written out. A note row in the sidebar is not necessarily the
+ * note on screen, so clearing the shell on *any* note delete drops an editor over a note that is still there;
+ * and a folder delete takes its notes with it, including the one being read, which "it was not a note row"
+ * quietly missed. A folder's notes are the whole subtree, so this is the same closed set the cascade request
+ * destroys, walked the same way.
+ */
+export function opensDeletedNote(
+  response: TreeResponse,
+  openedNoteId: string | null | undefined,
+  deleted: { readonly kind: NodeKind; readonly id: string },
+): boolean {
+  if (openedNoteId === null || openedNoteId === undefined) return false;
+  if (deleted.kind === 'note') return openedNoteId === deleted.id;
+
+  const opened = response.notes.find((note) => note.id === openedNoteId);
+  // A note the cache does not hold is not being read from under this folder — it is not in the tree at all,
+  // which is a different problem than the one this answers — and a note at the root is in no subtree.
+  if (opened === undefined || opened.folderId === null) return false;
+  return descendantFolderIds(response.folders, deleted.id).has(opened.folderId);
+}
+
 function groupBy<T>(items: readonly T[], key: (item: T) => string | null): Map<string, T[]> {
   const out = new Map<string, T[]>();
   for (const item of items) {

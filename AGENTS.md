@@ -138,8 +138,17 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   **the exact request that went on the wire** — a retry re-sends those bytes and that `baseVersion`, never a fresh
   capture of the buffer, and an equal payload means "the write landed and the reply was lost": adopt the returned
   `version`, go `clean` or `dirty`, show no banner. Plain `CONFLICT` (a sibling-name clash, same 409) is never reacted
-  to. The 10 s force-flush stands down while a backoff is running, or §4's `1s,2s,4s,8s,30s` schedule stops being
-  exact. `features/notes/useAutosave.ts` is the only DOM-touching half — one machine per note id in a ref-`Map`, so a
+  to. **Nothing leaves while a reply is owed:** any flush arriving during a backoff — the debounce, the 10 s cap,
+  `blur`, a note switch, an unmount, `Ctrl/Cmd+S` — re-sends that same request rather than capturing the buffer again,
+  because newer text written against the abandoned `baseVersion` comes back as a `VERSION_CONFLICT` carrying *our own*
+  earlier write (the phantom conflict this file exists to prevent) and would hand the spent retry budget back; such a
+  flush only moves the replay earlier. `adopt`/`keepMine`/`useServer` drop the owed replay, since each has just
+  answered what the row holds. No second debounce window and no 10 s deadline is armed beside a scheduled replay,
+  either, or §4's `1s,2s,4s,8s,30s` schedule stops being exact. And because `snapshot()` is cached with `notify()` the
+  only thing that republishes it, **every** path that changes the buffer publishes — including the `stopped` and
+  `conflict` paths, where an editor bound to `snapshot().buffer` would otherwise swallow the keystroke that woke it —
+  while `dirty` keeps meaning "newer than the row", so undoing back to the saved text lands on `clean` instead of a
+  pill reading `Unsaved changes` over a write that will never start. `features/notes/useAutosave.ts` is the only DOM-touching half — one machine per note id in a ref-`Map`, so a
   note switch runs the *outgoing* machine's cleanup and flushes the right buffer — and it installs `blur`,
   `visibilitychange`, `pagehide`, `beforeunload` and `Ctrl/Cmd+S`; `saveNow()` (the flag is a preference, not a
   disable-switch for saving) writes even with `settings.autosave === false`. The unload flush is

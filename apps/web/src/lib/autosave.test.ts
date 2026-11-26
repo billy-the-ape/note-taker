@@ -179,6 +179,9 @@ async function flushed(): Promise<void> {
 /** A buffer of `bytes` bytes, ASCII, so the byte maths is the same maths the code does. */
 const textOf = (bytes: number): string => 'a'.repeat(bytes);
 
+/** The first two waits of §4's schedule, for the tests that have to land in the middle of one. */
+const [FIRST_BACKOFF = 1_000, SECOND_BACKOFF = 2_000] = AUTOSAVE_BACKOFF_MS;
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-01-01T12:03:11.000Z'));
@@ -351,6 +354,118 @@ describe('the backoff schedule (§4, §6)', () => {
     expect(h.calls).toHaveLength(7);
     expect(h.calls[6]).toEqual({ content: 'b', baseVersion: 1, via: 'put' });
     expect(h.machine.snapshot()).toMatchObject({ state: 'clean', version: 9 });
+  });
+});
+
+describe('a flush that arrives mid-backoff (§5: the replay comes first)', () => {
+  // `flushAutomatic` is reached from `blur`, `visibilitychange: hidden`, a note switch, an unmount and
+  // the 10 s deadline, and `flush` from Ctrl+S. None of those is a person overriding the backoff with
+  // newer text: a fresh capture written against the old `baseVersion` is exactly how a lost reply
+  // becomes a phantom conflict, and it also handed the spent retry budget back. So a flush during a
+  // backoff sends **the request the backoff owes**, sooner, and the newer buffer goes in the window
+  // after that request settles — which is what §5 already promises for a keystroke.
+  it('replays the owed request when leaving the tab asks for a flush, and never shows a phantom conflict', async () => {
+    const h = start({ content: 'body', version: 1 });
+    // The lost response itself: `PUT(bodyX, base 1)` lands, its reply does not.
+    h.reply(dropped(), versionConflict('bodyX', 2), ok(3));
+
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'retrying', attempt: 1 });
+
+    // The user keeps typing, then leaves the tab.
+    h.machine.onEdit('bodyXY');
+    expect(h.machine.flushAutomatic()).toBe('written');
+
+    // What left is the owed request — `bodyX` against `1` — not the newer buffer against a version the
+    // row may already have moved past.
+    expect(h.calls.map(({ content, baseVersion, via }) => ({ content, baseVersion, via }))).toEqual([
+      { content: 'bodyX', baseVersion: 1, via: 'put' },
+      { content: 'bodyX', baseVersion: 1, via: 'put' },
+    ]);
+
+    await flushed();
+    // The replay's answer is the equal payload: the write landed, only the reply was lost. No
+    // conflict, the version is adopted, and `bodyXY` is still owed.
+    expect(h.machine.snapshot()).toMatchObject({ state: 'dirty', version: 2 });
+    expect(h.machine.snapshot().conflict).toBeUndefined();
+
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.calls).toHaveLength(3);
+    expect(h.calls[2]).toEqual({ content: 'bodyXY', baseVersion: 2, via: 'put' });
+    expect(h.machine.snapshot()).toMatchObject({ state: 'clean', version: 3 });
+    // Rule 1 survived the whole sequence.
+    expect(h.peak()).toBe(1);
+  });
+
+  it('does not hand a blur the budget the failed cycle already spent', async () => {
+    const h = start({ content: 'body' });
+    for (let index = 0; index < 6; index += 1) h.reply(serverError());
+
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot().attempt).toBe(1);
+
+    h.machine.onEdit('bodyXY');
+    await tick(FIRST_BACKOFF / 2);
+    expect(h.machine.flushAutomatic()).toBe('written');
+    await flushed();
+
+    // Second failure of the same cycle: still on the schedule, and still at the *second* wait — a
+    // reset budget would already be off by 1 s by now.
+    expect(h.machine.snapshot()).toMatchObject({ state: 'retrying', attempt: 2 });
+    await tick(SECOND_BACKOFF - 1);
+    expect(h.calls).toHaveLength(2);
+    await tick(1);
+    await flushed();
+    expect(h.calls).toHaveLength(3);
+  });
+
+  it('takes Ctrl+S mid-backoff as "send it now", which is the owed request now', async () => {
+    const h = start({ content: 'body', version: 1 });
+    h.reply(dropped(), ok(4), ok(5));
+
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    h.machine.onEdit('bodyXY');
+
+    expect(h.machine.flush()).toBe('written');
+    expect(h.calls[1]).toEqual({ content: 'bodyX', baseVersion: 1, via: 'put' });
+
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'dirty', version: 4 });
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.calls[2]).toEqual({ content: 'bodyXY', baseVersion: 4, via: 'put' });
+    expect(h.machine.snapshot().state).toBe('clean');
+  });
+
+  it('opens no second window beside a scheduled replay when the flag is flipped back on', async () => {
+    const h = start({ content: 'body' });
+    h.reply(dropped(), dropped(), ok(3));
+
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot().state).toBe('retrying');
+
+    // Autosave off and back on while a replay is owed. `resume` has nothing to schedule: the backoff
+    // already owns this buffer, and a debounce window next to it would fire `flushAutomatic`, whose
+    // answer is the same owed request sent twice as far as the schedule is concerned.
+    h.setAutosave(false);
+    h.setAutosave(true);
+    h.machine.resume();
+
+    await tick(FIRST_BACKOFF - 1);
+    expect(h.calls).toHaveLength(1);
+    await tick(1);
+    await flushed();
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1]).toEqual({ content: 'bodyX', baseVersion: 1, via: 'put' });
   });
 });
 
@@ -884,6 +999,141 @@ describe('the snapshot (§4)', () => {
   });
 });
 
+describe('the snapshot during the states where the machine will not write', () => {
+  // The editor is a controlled component bound to `snapshot().buffer`, and `snapshot()` is only
+  // republished by `notify()`. So an edit that updates the machine's own buffer and returns without
+  // notifying does not merely leave the pill stale: the character the user just typed disappears from
+  // the screen, while "keep mine" and "save as a new note" would save it. `conflict` and the two
+  // stopped rows are where the text matters most, which is why they are asserted here rather than
+  // trusted to the hook.
+  it('follows a keystroke made while a conflict is on the table', async () => {
+    const h = start({ content: 'server text', version: 3 });
+    h.reply(versionConflict('a stranger wrote this', 9));
+
+    h.machine.onEdit('typed');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot().state).toBe('conflict');
+
+    let fired = 0;
+    h.machine.subscribe(() => {
+      fired += 1;
+    });
+    h.machine.onEdit('typed while conflicted');
+
+    const snap = h.machine.snapshot();
+    expect(snap.buffer).toBe('typed while conflicted');
+    expect(snap.dirty).toBe(true);
+    // Still the same conflict, with the server's copy under it: typing is not an answer to the banner.
+    expect(snap.state).toBe('conflict');
+    expect(snap.conflict).toEqual({ serverContent: 'a stranger wrote this', serverVersion: 9 });
+    expect(fired).toBeGreaterThan(0);
+
+    // ...and the two buttons that act on the buffer now agree with what the screen showed.
+    h.reply(ok(10));
+    expect(h.machine.keepMine()).toBe('written');
+    expect(h.calls.at(-1)).toEqual({ content: 'typed while conflicted', baseVersion: 9, via: 'put' });
+  });
+
+  it('follows a keystroke made after a 401 stopped autosave, and sends nothing', async () => {
+    let signedOut = 0;
+    const h = start({ content: 'body', onUnauthorized: () => (signedOut += 1) });
+    h.reply(err(apiError(401, 'UNAUTHORIZED')));
+
+    h.machine.onEdit('x');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'error', stopped: true });
+    expect(signedOut).toBe(1);
+
+    let fired = 0;
+    h.machine.subscribe(() => {
+      fired += 1;
+    });
+    h.machine.onEdit('xy');
+
+    expect(h.machine.snapshot().buffer).toBe('xy');
+    expect(h.machine.snapshot().dirty).toBe(true);
+    expect(h.machine.snapshot().stopped).toBe(true);
+    expect(fired).toBeGreaterThan(0);
+    // §4: stopped means stopped. The text survives in the mirror and on the screen, not on the wire.
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it('follows a keystroke made after a 404 deleted the note, which is the text "save as new" must keep', async () => {
+    const h = start({ content: 'body' });
+    h.reply(err(apiError(404, 'NOT_FOUND')));
+
+    h.machine.onEdit('x');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'error', stopped: true });
+
+    h.machine.onEdit('xy');
+    h.machine.onEdit('xyz');
+
+    // The editor renders this, and the banner's button takes `getBuffer()`; if the two diverged, the
+    // escape hatch would quietly save a prefix of what the user can see.
+    expect(h.machine.snapshot().buffer).toBe('xyz');
+    expect(h.machine.getBuffer()).toBe('xyz');
+    expect(h.machine.snapshot().stopped).toBe(true);
+    expect(h.calls).toHaveLength(1);
+  });
+});
+
+describe('typing back to the saved text (§4’s `clean` row)', () => {
+  // A write is owed when the buffer differs from the server's text, and by no other test. Deleting a
+  // character one has just typed has to land the machine back on `clean`: `writeNow` answers
+  // `nothing-to-write` to an undirty buffer without touching the state, so a `dirty` machine with
+  // nothing unsaved has no path out of `dirty`, and the 10 s deadline re-arms itself forever beside it.
+  it('is clean, writes nothing, and stops the deadline from re-arming', async () => {
+    const h = start({ content: 'body', version: 4 });
+
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS / 2);
+    expect(h.machine.snapshot().dirty).toBe(true);
+
+    h.machine.onEdit('body');
+
+    await tick(AUTOSAVE_DEBOUNCE_MS * 4);
+    await tick(AUTOSAVE_MAX_UNFLUSHED_MS * 4);
+
+    expect(h.calls).toEqual([]);
+    expect(h.machine.snapshot()).toMatchObject({ state: 'clean', dirty: false, buffer: 'body' });
+    // The mirror exists to hold text the server does not have; this buffer is not that.
+    expect(h.mirror.at(-1)).toEqual({ op: 'clear', content: 'body' });
+  });
+
+  it('is clean with the flag off, where nothing would have written it back to rights', async () => {
+    const h = start({ content: 'body', autosave: false });
+
+    h.machine.onEdit('bodyX');
+    expect(h.machine.snapshot().state).toBe('dirty');
+    h.machine.onEdit('body');
+
+    expect(h.machine.snapshot().state).toBe('clean');
+    expect(h.machine.flush()).toBe('nothing-to-write');
+    expect(h.calls).toEqual([]);
+  });
+
+  it('stays dirty while a request carrying other text is still on the wire', async () => {
+    const h = start({ content: 'body' });
+    h.reply(hang());
+
+    h.machine.onEdit('bodyX');
+    await tick(AUTOSAVE_DEBOUNCE_MS);
+    expect(h.machine.snapshot().state).toBe('saving');
+
+    // The undo cannot retract a request that has already left, so the machine stays dirty and the
+    // answer decides: `onWriteSuccess` finds `buffer !== savedContent` and opens a new window.
+    h.machine.onEdit('body');
+    expect(h.machine.snapshot().state).toBe('dirty');
+
+    h.settle(0, ok(2));
+    await flushed();
+    expect(h.machine.snapshot()).toMatchObject({ state: 'dirty', dirty: true, version: 2 });
+  });
+});
 describe('classifyWriteFailure', () => {
   const cases: readonly [
     string,

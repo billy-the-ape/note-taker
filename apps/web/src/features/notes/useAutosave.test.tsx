@@ -600,6 +600,34 @@ describe('the states a caller has to see (§4, §6)', () => {
     expect(readDraft(NOTE_ID)).toBeUndefined();
     expect(fetch.sent).toHaveLength(1); // resolving with the server's copy writes nothing back
   });
+
+  it('republishes the buffer while a conflict is on the table, which is what a controlled editor renders', async () => {
+    const fetch = installFetch({
+      [`PUT ${CONTENT_PATH}`]: () => ({
+        status: 409,
+        body: versionConflictBody('what the other tab saved', 9),
+      }),
+    });
+    const { result } = boot({ autosave: true });
+
+    act(() => {
+      result.current.edit('my text, which is not saved');
+    });
+    await advance(1_200);
+    expect(result.current.snapshot.state).toBe('conflict');
+
+    act(() => {
+      result.current.edit('my text, and a sentence typed over the banner');
+    });
+
+    // PR-13's textarea renders `snapshot().buffer`. On a path that updates the machine without
+    // publishing it, the banner still says `Conflict` while every character typed under it disappears
+    // from the screen — and "keep mine" would then save text nobody can see.
+    expect(result.current.snapshot.buffer).toBe('my text, and a sentence typed over the banner');
+    expect(result.current.snapshot.dirty).toBe(true);
+    expect(result.current.snapshot.state).toBe('conflict');
+    expect(fetch.sent).toHaveLength(1); // typing is not an answer to the banner
+  });
 });
 
 describe('the draft mirror as a prompt (§6)', () => {

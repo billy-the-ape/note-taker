@@ -16,15 +16,23 @@
  * would be mutated by the next keystroke and would silently turn a lost response into a phantom
  * conflict — which is the one bug this file exists to prevent.
  *
- * ## Three rules that make the table safe (§4)
+ * ## Five rules that make the table safe (§4)
  *
- * 1. **At most one request in flight.** Every write path goes through {@link Autosaver#beginWrite},
- *    which refuses when `inFlight` is set.
+ * 1. **At most one request in flight.** Every write path goes through `beginWrite`, which refuses
+ *    when `inFlight` is set.
  * 2. **An edit during `saving` is never dropped.** It parks the machine in `dirty`; the next
  *    debounce window opens when the in-flight request settles, and always sends the newest buffer
  *    against the newest known `version`.
  * 3. **`VERSION_CONFLICT` is only a conflict after the comparison.** `equal` snapshot ⇒ adopt the
  *    server's `version` and carry on, to `clean` or to `dirty`; `different` ⇒ `conflict`. See §5.
+ * 4. **Nothing leaves while a reply is still owed.** A request that went out and never came back has
+ *    an answer we have not read, so `writeNow` sends *that* request and not the newest buffer —
+ *    whichever way it was asked (debounce, the 10 s cap, `blur`, a note switch, Ctrl+S). Newer text
+ *    follows in the window after that request settles, which is rule 2 in a different coat.
+ * 5. **Every state change is published.** `snapshot()` is cached, and `notify()` is the only thing
+ *    that clears the cache — so a path that changes the buffer without notifying makes a controlled
+ *    editor eat the keystroke it was called for. `onEdit` therefore publishes in the states where it
+ *    refuses to *schedule* (`stopped`, `conflict`) exactly as in the ones where it does.
  *
  * ## Why the machine reports a snapshot
  *
@@ -155,7 +163,11 @@ export type UnloadOutcome =
   /** §4's terminal half: autosave ended for this note. */
   | 'stopped';
 
-/** §4's "manual retry": a person pressed Retry or Ctrl+S. */
+/**
+ * What a flush attempt did. Every flush path answers with one of these — `blur`, the 10 s deadline, a
+ * note switch and an unmount as well as §4's "manual retry" (Retry, Ctrl+S), which is only the caller
+ * a person can hear.
+ */
 export type FlushOutcome =
   | 'written'
   | 'nothing-to-write'
@@ -356,15 +368,29 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     }, maxUnflushedMs);
   }
 
+  /**
+   * Send the request the backoff owes: the exact bytes that failed, against the `baseVersion` they
+   * carried. `attempt` deliberately survives — the schedule belongs to this failure — and a request
+   * started by a person from `error` is the fresh cycle instead (see {@link writeNow}).
+   */
+  function replayNow(): boolean {
+    const replay = pendingReplay;
+    if (replay === undefined) return false;
+    // What was owed is owed no longer. If this request comes back with an answer the next one is a
+    // fresh capture, and a `pendingReplay` left behind would hold every later write hostage.
+    pendingReplay = undefined;
+    clearTimer('retry');
+    return beginWrite('put', replay);
+  }
+
   function armRetry(delayMs: number): void {
     clearTimer('retry');
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
-      // Rule 1 still holds here: `inFlight` was cleared when the failed request settled. `attempt`
-      // deliberately survives — the backoff schedule belongs to this failure, and a write started by
-      // a keystroke in the meantime is a fresh cycle (see `writeNow`).
-      beginWrite('put', pendingReplay);
-      pendingReplay = undefined;
+      // Rule 1 still holds here: `inFlight` was cleared when the failed request settled. The schedule
+      // and the replayed bytes are {@link replayNow}'s business, and the same replay answers a flush
+      // that arrives before this timer does.
+      replayNow();
       notify();
     }, delayMs);
   }
@@ -380,6 +406,20 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
 
   function dirty(): boolean {
     return buffer !== savedContent;
+  }
+
+  /**
+   * The buffer is the server's text again: §4's `clean`, with the mirror, the failure message and the
+   * two write timers to match. A replay still owed is left alone on purpose — the ambiguity that
+   * request exists to resolve does not go away because the user deleted a character.
+   */
+  function normaliseClean(): void {
+    current = 'clean';
+    failure = undefined;
+    attempt = 0;
+    clearTimer('edit');
+    clearTimer('deadline');
+    dropMirror(buffer);
   }
 
   // --- the one write path -----------------------------------------------------------------------
@@ -513,6 +553,11 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
           clearTimer('deadline');
           armRetry(backoffMs[attempt - 1] ?? backoffMs.at(-1) ?? 30_000);
         } else {
+          // The budget is spent, but the ambiguity is not: one of those five requests may be sitting
+          // in the row right now. The owed replay outlives the schedule so a manual Retry re-sends
+          // those bytes rather than writing newer text against a version we have not read back — the
+          // same reason {@link writeNow} puts the replay first mid-backoff.
+          pendingReplay = { content: request.content, baseVersion: request.baseVersion };
           current = 'error';
           failure = { kind: 'unavailable', code, status, message, recoverable: true };
           clearAllTimers();
@@ -578,8 +623,21 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     // keystroke, the mirror has to hold this keystroke.
     mirror(content);
 
-    if (stopped) return; // §4: 401/404 keep the text, and nothing else
-    if (conflict !== undefined) return; // autosave is paused until the banner is answered
+    // The screen reads the machine through `snapshot()`, and `snapshot()` is only republished by
+    // `notify()`. Both early returns below are states where the user most needs to see the text they
+    // are typing — a conflict they have to read, a note that is gone — and an editor bound to
+    // `snapshot().buffer` would swallow the very character that woke this function, while "keep mine"
+    // and "save as a new note" quietly acted on it. Same for `dirty`: the pill describes this buffer.
+    if (stopped) {
+      // §4: 401/404 keep the text, and nothing else.
+      notify();
+      return;
+    }
+    if (conflict !== undefined) {
+      // autosave is paused until the banner is answered
+      notify();
+      return;
+    }
 
     if (inFlight !== undefined) {
       // Rule 2 — park it dirty; the window opens when the request settles.
@@ -593,6 +651,14 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
       // A backoff is already running for this buffer. The state stays `retrying` (the pill keeps
       // saying so), no second window is opened next to the scheduled replay, and no 10 s cap is armed
       // beside it — §4's schedule is exact, and a deadline firing mid-backoff would break it.
+      notify();
+      return;
+    }
+
+    // An undo back to the server's text is not a write, whatever the flag or the schedule is doing.
+    // Normalising here is what keeps `dirty` meaning "this buffer is newer than the row".
+    if (!dirty()) {
+      normaliseClean();
       notify();
       return;
     }
@@ -615,6 +681,8 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     conflict = undefined;
     failure = undefined;
     attempt = 0;
+    // The re-read is the answer to the question a owed replay exists to ask, so the replay is spent.
+    pendingReplay = undefined;
     clearAllTimers();
     notify();
   }
@@ -622,14 +690,31 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
   function writeNow(): FlushOutcome {
     if (stopped) return 'stopped';
     if (conflict !== undefined) return 'conflict';
-    if (buffer === savedContent) return 'nothing-to-write';
     if (inFlight !== undefined) return 'in-flight';
-    // A user-initiated write is a fresh failure cycle: the spent budget and the scheduled replay both
-    // belong to the cycle that just failed.
+    if (pendingReplay !== undefined) {
+      // One of these bytes left and never came back. Newer text sent now, against the same
+      // `baseVersion`, would be answered by a `VERSION_CONFLICT` carrying **our own** earlier write —
+      // and §5 would read that as a second writer, which is the phantom conflict this file exists to
+      // prevent. So the owed request goes first, and a flush arriving mid-backoff (a `blur`, a note
+      // switch, an unmount, the 10 s deadline, Ctrl+S) only moves that replay earlier: the spent
+      // budget stays spent, and anything typed since goes out in the window after it settles.
+      const started = replayNow();
+      notify(); // the pill is describing a request again, so the stale `attempt`/message must go
+      return started ? 'written' : 'nothing-to-write';
+    }
+    if (!dirty()) {
+      // Nothing this buffer owes the row. `dirty` has to mean "newer than the server", so a machine
+      // that arrives here with an undirty buffer goes back to `clean` instead of lighting
+      // "Unsaved changes" at a write that will never start.
+      normaliseClean();
+      notify();
+      return 'nothing-to-write';
+    }
+    // A user-initiated write with nothing owed: a fresh failure cycle, so the spent budget and any
+    // stale message are dropped with it.
     attempt = 0;
     failure = undefined;
     clearTimer('retry');
-    pendingReplay = undefined;
     const started = beginWrite('put');
     notify();
     return started ? 'written' : 'nothing-to-write';
@@ -671,8 +756,12 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     if (outcome === 'sent') {
       // The page is going away, so this is fire-and-forget: `keepalive` is the only transport with a
       // chance of outliving it, and `X-CSRF-Token` is why it is `fetch` and not `sendBeacon` (§6).
+      // It is also the one place that writes newer text while a reply is still owed: only one request
+      // can leave, and losing this buffer would be the worse loss. On the next load the row and the
+      // draft mirror disagree, which is what the restore prompt is for.
       attempt = 0;
       failure = undefined;
+      pendingReplay = undefined;
       clearAllTimers();
       beginWrite('keepalive');
     }
@@ -685,6 +774,9 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     if (!readAutosave(options.settings)) return;
     if (!dirty()) return;
     if (inFlight !== undefined) return; // rule 1; the settle will open the window
+    // A replay is owed: it owns this buffer, and a window beside it would only fire `flushAutomatic`
+    // (whose honest answer is that same request) while pretending to be a fresh debounce.
+    if (retryTimer !== undefined || pendingReplay !== undefined) return;
     armDebounce();
     armDeadline();
   }
@@ -697,6 +789,9 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     conflict = undefined;
     failure = undefined;
     attempt = 0;
+    // The banner just told us what the row holds and which version it holds; a replay of the bytes
+    // whose reply went missing would overwrite the stranger this resolution is choosing to step over.
+    pendingReplay = undefined;
     notify();
     return writeNow();
   }
@@ -715,6 +810,7 @@ export function createAutosaver(options: AutosaverOptions): Autosaver {
     attempt = 0;
     savedAt = now();
     current = 'clean';
+    pendingReplay = undefined; // as in `adopt`: the row's own answer supersedes the owed replay
     clearAllTimers();
     notify();
   }

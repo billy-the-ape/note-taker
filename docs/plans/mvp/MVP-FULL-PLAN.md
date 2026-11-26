@@ -738,14 +738,29 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
   reacts to the latter.
 
-**Four things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
+**Five things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
 
-- **A retry re-sends the request that failed, not a fresh capture of the buffer.** That is what §11.4's comparison
-  requires: the payload a `VERSION_CONFLICT` is checked against has to be the payload that request carried. Keystrokes
-  typed while a backoff is waiting stay in the buffer and go out in the debounce window after the replay settles, which
-  is the "to `dirty` if the user typed meanwhile" case above rather than a second interpretation of it.
-- **The 10 s force-flush stands down while a backoff is running.** Two schedules in the same machine would otherwise
-  interleave, and "the backoff is exactly 1 s, 2 s, 4 s, 8 s, 30 s" is a promise this section makes.
+- **Nothing leaves while a reply is owed.** A request that went out and never came back is an answer the client has
+  not read. So every flush that arrives during a backoff — the debounce, the 10 s cap, `blur`,
+  `visibilitychange → hidden`, a note switch, an unmount, `Ctrl/Cmd+S` — sends **the request that failed**, its bytes
+  and its `baseVersion` unchanged, and never a fresh capture of the buffer: newer text written against the version we
+  left on the wire is answered by a `VERSION_CONFLICT` carrying *our own* earlier write, which the fork would then
+  read as a second writer. Such a flush moves the replay earlier and leaves the spent retry budget spent; keystrokes
+  typed meanwhile go out in the window after it settles, which is the "to `dirty` if the user typed meanwhile" case
+  above rather than a second interpretation of it. The 10 s cap opens no second window beside a scheduled replay, and
+  no 10 s deadline is armed next to a 30 s backoff, because "the backoff is exactly 1 s, 2 s, 4 s, 8 s, 30 s" is a
+  promise this section makes.
+- **An explicit resolution supersedes the owed replay.** *Keep mine*, *Use server* and a re-read of the note each say
+  what the row holds and at which version, which is the only question a replay exists to ask, so each drops it. The
+  unload `keepalive` write is the one place that sends newer text while a reply is owed: only one request can leave an
+  exiting page, and losing the buffer would be the worse loss. On the next load the row and the draft mirror disagree,
+  which is what the restore prompt is for.
+- **The snapshot is the screen's only window.** `snapshot()` is cached and `notify()` is the only thing that clears the
+  cache, and the editor renders `snapshot().buffer` — so a path that updates the buffer without publishing makes a
+  controlled editor swallow the keystroke that woke it, in `conflict` and in the two stopped rows being exactly the
+  states where the text has to stay visible. `onEdit` publishes on every path, and `dirty` means "newer than the row"
+  everywhere: undoing back to the saved text is `clean`, not a pill reading "Unsaved changes" over a write that will
+  never start.
 - **The unload guard is the negation of the unload budget.** `beforeunload` is armed when the buffer is dirty *and*
   `pagehide` would not be able to write it — autosave off, over 60 KiB, or a request already in flight, because a
   browser will not queue a second `keepalive` behind one. So the prompt never covers a save that is already leaving,

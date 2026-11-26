@@ -115,7 +115,10 @@ export function ConflictBanner({
 export interface DeletedNoteBannerProps {
   /** Why autosave stopped, in the machine's words (§4: `404`, never a silent re-create). */
   readonly reason?: string;
-  /** Creates a new note from the retained buffer and hands it back for the caller to navigate to. */
+  /**
+   * Creates a new note from the retained buffer. The caller owns navigating to it; a rejection shows
+   * the banner's failure line.
+   */
   readonly onSaveAsNewNote: () => Promise<void>;
 }
 

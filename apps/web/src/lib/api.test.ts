@@ -373,17 +373,33 @@ describe('the 401 hook', () => {
 
   it('stays quiet for a 401 that denies the credentials in the body, not the session (docs/API.md #9)', async () => {
     const seen: ApiError[] = [];
-    const fetch = mockFetch([envelope(401, 'UNAUTHORIZED'), envelope(401, 'UNAUTHORIZED')]);
+    // Queue: the password route's `401`, then the probe's answer that the session is still there. Only
+    // `user` matters to the probe (§9.2 #8 answers `{user:null}` when there is no session), but a body
+    // that could come off a real server is cheaper to read than a bare `{user:{}}`.
+    const fetch = mockFetch([
+      envelope(401, 'UNAUTHORIZED'),
+      jsonResponse({
+        user: {
+          id: 'user-1',
+          username: 'ada.lovelace',
+          role: 'owner',
+          displayName: null,
+          createdAt: '2026-01-01T00:00:00.000Z',
+        },
+        expiresAt: '2026-02-01T00:00:00.000Z',
+      }),
+      envelope(401, 'UNAUTHORIZED'),
+    ]);
     const client = createApiClient({
       fetch: fetch.fetch,
       readCsrfToken: () => 'token-1',
       onUnauthorized: (error) => seen.push(error),
     });
 
-    // `POST /api/auth/password` answers `401` for a wrong `currentPassword` while the session that
-    // sent it stays alive (PR-07 rotates and keeps it), so this is the change-password form's inline
-    // message, not an expiry. Firing the hook here is what used to bounce a person to `/login` for a
-    // typo — see `isCredentialOnly401`, whose whole job is this line.
+    // `POST /api/auth/password` answers `401` for a wrong `currentPassword` while the session that sent
+    // it stays alive (PR-07 rotates and keeps it), so this is the change-password form's inline message,
+    // not an expiry. Firing the hook here is what used to bounce a person to `/login` for a typo — see
+    // `isCredentialBodyRoute`, whose whole job is this line.
     await expect(
       client.json(ROUTES.auth.password, {
         method: 'POST',
@@ -391,11 +407,66 @@ describe('the 401 hook', () => {
       }),
     ).rejects.toMatchObject({ status: 401, code: 'UNAUTHORIZED' });
     expect(seen).toEqual([]);
+    // The probe is exactly one request, to the route that answers the question (§9.2 #8), and it is a
+    // `GET` with no CSRF header — a second mutation here would be a second write to retry.
+    expect(fetch.calls.map((call) => call.url)).toEqual([ROUTES.auth.password, ROUTES.auth.session]);
+    expect(new Headers(fetch.calls[1]?.init.headers).get(CSRF_HEADER_NAME)).toBeNull();
 
-    // The exemption is one route wide: the next `401`, from anywhere else, is still the app-wide
-    // "the session is gone" event, and this is the assertion that keeps it that way.
+    // The exemption is one route wide: the next `401`, from anywhere else, is still the app-wide "the
+    // session is gone" event with no second request behind it, and this is what keeps it that way.
     await expect(client.request(ROUTES.tree)).rejects.toBeInstanceOf(ApiError);
     expect(seen).toHaveLength(1);
+    expect(fetch.calls.map((call) => call.url)).toEqual([
+      ROUTES.auth.password,
+      ROUTES.auth.session,
+      ROUTES.tree,
+    ]);
+  });
+
+  it('still fires for a 401 on that same route when the session really has gone', async () => {
+    const seen: ApiError[] = [];
+    // The reviewer's scenario, in two responses: the settings tab is left open past the TTL (or another
+    // tab signs out everywhere), so the guard answers the *same* code for the *other* reason, and the
+    // probe reports `{user: null}`. Swallowing this one strands a person on a dead page with a red form.
+    const fetch = mockFetch([envelope(401, 'UNAUTHORIZED'), jsonResponse({ user: null })]);
+    const client = createApiClient({
+      fetch: fetch.fetch,
+      readCsrfToken: () => 'token-1',
+      onUnauthorized: (error) => seen.push(error),
+    });
+
+    await expect(
+      client.json(ROUTES.auth.password, {
+        method: 'POST',
+        body: { currentPassword: 'still-the-old-one', newPassword: 'a-brand-new-password-1' },
+      }),
+    ).rejects.toMatchObject({ status: 401, code: 'UNAUTHORIZED' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ status: 401, code: 'UNAUTHORIZED' });
+    // Once, and no retry loop: the probe is a plain `GET`, never this route again.
+    expect(fetch.calls.map((call) => call.url)).toEqual([ROUTES.auth.password, ROUTES.auth.session]);
+  });
+
+  it('does not decide a person is signed out when the probe cannot be answered', async () => {
+    const seen: ApiError[] = [];
+    // A `500` (and a thrown network error) from the session route is not evidence about the session;
+    // PR-08's rule is that a dead API is explained by the page standing there, not answered by a
+    // redirect. So the caller still gets its `401`, and the hook stays quiet.
+    for (const probe of [envelope(500, 'INTERNAL'), new Error('offline')]) {
+      const fetch = mockFetch([envelope(401, 'UNAUTHORIZED'), probe]);
+      const client = createApiClient({
+        fetch: fetch.fetch,
+        readCsrfToken: () => 'token-1',
+        onUnauthorized: (error) => seen.push(error),
+      });
+      await expect(
+        client.request(ROUTES.auth.password, {
+          method: 'POST',
+          body: { currentPassword: 'x', newPassword: 'a-brand-new-password-1' },
+        }),
+      ).rejects.toMatchObject({ status: 401 });
+    }
+    expect(seen).toEqual([]);
   });
 
   it('does not trigger the CSRF replay, because a new cookie would not help an expired session', async () => {

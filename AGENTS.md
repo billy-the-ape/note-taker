@@ -152,6 +152,15 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `isError` usually means "these values may be stale", not "nothing loaded". Replace a working form with an error
   screen only when there is no row to show; otherwise say the refresh failed beside the controls (`/app/settings`'s
   `settings-refresh-error`). Silently stale is the other half of that same bug.
+- **A `401` from a route that takes a credential in its body does not say what it means** (PR-16):
+  `POST /api/auth/password` sits behind `guard.requireAuth`, so the *same* `401 UNAUTHORIZED` covers an
+  expired session, a wrong `currentPassword`, and a session deleted mid-write (`docs/API.md` #9) — the code
+  is derived from the status and only PR-07's prose differs, so neither a route exemption nor a message match
+  is correct. `apps/web/src/lib/api.ts` asks `GET /api/auth/session` instead (`sessionGoneError`; #8 answers
+  `{user:null}`, not `401`, so it cannot loop) and fires the app-wide expiry hook only when that says gone —
+  an unanswered probe (network, `5xx`) is *not* evidence, per PR-08's "a dead API is explained by the page".
+  A new authenticated credential route is added to `isCredentialBodyRoute`; a route whose `401` is only ever
+  about the session must stay out, and the login family stays out because it has no session to be about.
 - **Two mechanisms state a theme; one rule decides** (PR-16 + PR-08, settled at merge): PR-08's
   `components/layout/ThemeToggle.tsx` writes `data-theme` on `<html>` for *this* browser (localStorage, works signed
   out), and PR-16's `features/settings/theme.ts` writes `class="dark"`/`"light"` from the **account** setting —

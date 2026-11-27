@@ -164,10 +164,10 @@ because the next PR reads this file, not the commit messages.
   - **A wrong current password signed the user out.** `lib/api.ts` fired its app-wide `onUnauthorized` hook for *every*
     `401`, and `POST /api/auth/password` answers `401` for a typo in the current-password box. `features/auth/session.tsx`
     installs the handler, so production bounced the person to `/login` and never showed the inline message — while the
-    server session the same request had just proved alive stayed valid. The exemption is now `isCredentialOnly401` in
-    `lib/api.ts` (a route table, like `isCsrfExempt`, so no caller can forget it), asserted in `lib/api.test.ts`;
-    `docs/API.md` #9 says the same in prose. The header comment here used to say "whoever wires that hook has to exclude
-    this route" — it no longer has to, because the transport does.
+    session they were signed in with stayed valid. The first fix was a route exemption (`isCredentialOnly401` in
+    `lib/api.ts`, asserted in `lib/api.test.ts`); **round 3 found that exemption too broad** and it no longer exists —
+    see the next entry. The header comment here used to say "whoever wires that hook has to exclude this route", which
+    was already the wrong shape for the problem.
   - **A stored `light` lost to a dark OS.** `applyThemeClass` only ever added or removed `dark`, but
     `styles/globals.css`'s media-query block stands down only for `:not([data-theme="light"]):not(.light)`, so with
     account = light, OS = dark and no per-browser knob the page painted dark. `light` is now written as a class
@@ -182,6 +182,22 @@ because the next PR reads this file, not the commit messages.
     the *same* hook on another route.
   - One residual docs disagreement from round 1: plan §13's PR-05 passage still assigned the overall `apps/web/src` row
     to PR-16; §14's authority bullet is the one that says PR-08 owns it, and that passage now agrees.
+- **Review round 3 caught the over-correction in round 2's first fix.** Exempting `POST /api/auth/password` from the
+  expiry hook swallowed the expiry that route can also answer: it sits behind `guard.requireAuth`
+  (`apps/server/src/routes/auth.routes.ts`), whose `401 UNAUTHORIZED` for a missing or expired cookie is the *same* code
+  as `auth.service.ts`'s 'the current password is not right', and the service has a third `401` ('this session is no
+  longer signed in') for a row deleted between the guard and the write. A settings tab left open past the TTL therefore
+  showed a red form on a dead page instead of going to `/login`. `lib/api.ts` now neither guesses in nor guesses out on
+  that route: `sessionGoneError` asks `GET /api/auth/session` (#8, `{user:null}` rather than `401`, so no loop and no
+  prose matching) and the hook fires only when that says gone — with an unanswered probe (network failure, `5xx`)
+  deliberately *not* evidence, because PR-08's rule is that a dead API is explained by the page standing there. The
+  predicate is now `isCredentialBodyRoute` (the route is where the ambiguity lives; the answer is not
+  self-describing), the login-family routes stay out of the list because they have no session to be about, and
+  `docs/API.md` #9 states the three causes. Asserted three ways: `lib/api.test.ts` (wrong password + a live session
+  stays silent, and the probe is exactly one `GET`; a `401` on that route with `{user:null}` fires once; an
+  unanswered probe fires nothing) and `features/settings/change-password.test.tsx` (the same submit before and after
+  another tab signs out everywhere, which the fake already modeled at its `requireAuth` branch — what it lacked was a
+  test reaching that branch, and that is what round 2's `expiryEvents()` could not see).
 - **The settings reads validate their body.** `GET /api/settings` needs no `?includeDeleted` (the contract has no
   `SettingsIncludeDeleted`, §9.2 #22), and `SettingsUpdatedAt = z.iso.datetime()` rejects the millisecond-less strings
   a `::text` cast produces — which is a trap on another route, not a reason to skip parsing here. `lib/api.ts` offers

@@ -274,6 +274,11 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
 
     if (path === ROUTES.auth.password && method === 'POST') {
       const row = rowFor(jar);
+      // The guard's answer, mirrored deliberately: the real route sits behind `guard.requireAuth`, so
+      // this `401` carries the **same** `UNAUTHORIZED` code as the wrong-password answer below and only
+      // the message differs (`UnauthorizedError`'s default, `domain/errors.ts`). `lib/api.ts`'s
+      // `sessionGoneError` exists because of that ambiguity, and `change-password.test.tsx` drives both
+      // branches from here.
       if (row === undefined) return unauthorized();
 
       const payload = body as { currentPassword?: string; newPassword?: string };

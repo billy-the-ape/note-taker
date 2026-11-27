@@ -61,8 +61,9 @@ export interface RenderSettingsResult {
   readonly queryClient: ReturnType<typeof createQueryClient>;
   /**
    * The `401`s this document handed to the app-wide expiry hook — the app-wide "the session is gone"
-   * verdict. `0` after a failed password change is the assertion that a wrong current password is
-   * about the password, not the session (`lib/api.ts`'s `isCredentialOnly401`).
+   * verdict. `0` after a failed password change is the assertion that the transport asked
+   * `GET /api/auth/session` and were told the session is still there (`lib/api.ts`'s
+   * `sessionGoneError`); `1` after the same submit on a deleted session is the other half.
    */
   expiryEvents(): readonly string[];
   /** Signs the user in on a second tab, i.e. the same account in another browser tab. */

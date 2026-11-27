@@ -21,9 +21,10 @@
  * 4. **The 401 hook.** Session expiry is a single app-wide decision (route to the sign-in screen), so
  *    it is a callback the composition root sets rather than something each caller re-implements.
  *    `setUnauthorizedHandler` is how PR-08's session provider sets it: the client is created here,
- *    once, and the handler can only be chosen by whoever owns routing, which happens later. One route
- *    is exempt from the hook — `isCredentialOnly401` — because its `401` denies the password in the
- *    body while the session that sent it stays valid.
+ *    once, and the handler can only be chosen by whoever owns routing, which happens later. A `401`
+ *    from a route whose body carries a credential (`isCredentialBodyRoute`) is not taken at face value,
+ *    because that code is also what a wrong password in the body answers — `sessionGoneError` asks the
+ *    session route which of the two it was before the hook is offered anything.
  *
  * Nothing here touches `document` at import time: the cookie reader is injected, which is also what
  * lets the suite below run in the plain Node environment Vitest uses.
@@ -176,26 +177,29 @@ function errorMessageFor(status: number): { readonly code: ApiErrorCode; readonl
 }
 
 /**
- * The routes whose `401` is an answer about **the credentials in the request body**, not about the
- * session that sent them (docs/API.md #9).
+ * The routes reached **while signed in** whose request body carries a credential, which makes their
+ * `401` ambiguous: the same `UNAUTHORIZED` code covers a wrong `currentPassword` and a session that is
+ * gone (`docs/API.md` #9).
  *
- * `POST /api/auth/password` is the case that proves the distinction is not academic: it answers `401`
- * for a wrong `currentPassword` at the same instant the same request proves the acting session is
- * alive — PR-07 rotates that session and *keeps* it, and its integration test asserts the cookie still
- * works. Fire the app-wide expiry hook for this one path and a typo in the current-password box sends
- * the person to `/login` and hides the "the current password is not right" line the form exists to
- * show, while the server session they just proved they hold is untouched.
+ * `POST /api/auth/password` sits behind `guard.requireAuth` (`apps/server/src/routes/auth.routes.ts`),
+ * so a missing or expired cookie answers the guard's `401`; `auth.service.ts` answers `401` for
+ * 'the current password is not right', and answers `401` again for 'this session is no longer signed in'
+ * when the row is deleted between the guard and the write. Only the middle one is a form message
+ * rather than an expiry, and **no field of the envelope tells them apart** — `apiErrorCodeForStatus`
+ * derives the code from the status, and the three messages belong to PR-07 — so the client cannot sort
+ * them by reading the error, and must not guess from a table either. It asks instead
+ * (`sessionGoneError`), and this list is the set of routes worth asking about.
  *
- * A table here rather than a per-call flag, mirroring `isCsrfExempt` in `@note-taker/contracts`: the
- * answer belongs to the route, so no caller can forget to opt out and no new caller of the same route
- * has to know the rule exists.
+ * A table here rather than a per-call flag, mirroring `isCsrfExempt` in `@note-taker/contracts`, so no
+ * caller has to know the rule exists. The login-family routes are **not** in it on purpose: they carry
+ * credentials too, but they have no session for the answer to be about, so their `401` needs no probe.
  */
-const CREDENTIAL_ONLY_401_ROUTES: readonly string[] = [ROUTES.auth.password];
+const CREDENTIAL_BODY_ROUTES: readonly string[] = [ROUTES.auth.password];
 
-export function isCredentialOnly401(path: string): boolean {
+export function isCredentialBodyRoute(path: string): boolean {
   const queryStart = path.indexOf('?');
   const pathname = queryStart === -1 ? path : path.slice(0, queryStart);
-  return CREDENTIAL_ONLY_401_ROUTES.includes(pathname);
+  return CREDENTIAL_BODY_ROUTES.includes(pathname);
 }
 
 function isJsonContent(contentType: string | null): boolean {
@@ -314,6 +318,47 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     }
   }
 
+  /**
+   * Answers whether the session behind a `401` is really gone, for the routes whose `401` is ambiguous
+   * (`isCredentialBodyRoute`).
+   *
+   * `POST /api/auth/password` answers `401 UNAUTHORIZED` for a wrong `currentPassword` **and** for a
+   * cookie the guard no longer recognizes, and for a row deleted between the guard and the write — three
+   * causes, one code, and prose as the only difference (see the table above). So the client asks the one
+   * route that answers the question directly: `GET /api/auth/session` reports `{user: null}` rather than
+   * `401` (§9.2 #8), which keeps this one cheap, loop-free, and independent of message wording. Either
+   * answer counts as gone, because the two endpoints disagree only in shape, not in fact.
+   *
+   * Returns the error that *proves* the expiry, or `undefined` when the session is fine or the question
+   * could not be answered. An unanswered probe is not evidence that a person is signed out: a dead API
+   * is reported by the page that is standing there (PR-08's rule), not answered with a redirect.
+   */
+  async function sessionGoneError(signal?: AbortSignal): Promise<ApiError | undefined> {
+    let response: Response;
+    try {
+      response = await fetchImpl(`${baseUrl}${ROUTES.auth.session}`, {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { ...JSON_ACCEPT },
+        ...(signal === undefined ? {} : { signal }),
+      });
+    } catch {
+      return undefined;
+    }
+
+    try {
+      if (response.status === 401) return await apiErrorFrom(response);
+      if (!response.ok) return undefined;
+      const body: unknown = safeJsonParse(await response.text());
+      if (typeof body !== 'object' || body === null || !('user' in body)) return undefined;
+      if ((body as { user: unknown }).user !== null) return undefined;
+      const gone = errorMessageFor(401);
+      return new ApiError({ status: 401, code: gone.code, message: gone.message });
+    } catch {
+      return undefined;
+    }
+  }
+
   async function send(
     path: string,
     callOptions: ApiCallOptions | undefined,
@@ -345,10 +390,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       return send(path, callOptions, 1);
     }
 
-    // The one carve-out: a `401` from `POST /api/auth/password` is about the password in the body,
-    // not the session that sent it (`isCredentialOnly401` above), and the caller is a form that has
-    // the right message to show. Every other `401` is the app-wide "the session is gone" event.
-    if (error.status === 401 && !isCredentialOnly401(path)) options.onUnauthorized?.(error);
+    if (error.status === 401) {
+      // Every `401` is the app-wide "the session is gone" event — except on a route whose body carries
+      // a credential, where the same code is also what a wrong current password answers. There the hook
+      // waits for evidence: the probe below says whether *this* `401` was about the session, and the
+      // caller is left alone to show the form's own message when it was not.
+      const expiry = isCredentialBodyRoute(path) ? await sessionGoneError(signal) : error;
+      if (expiry !== undefined) options.onUnauthorized?.(expiry);
+    }
     throw error;
   }
 

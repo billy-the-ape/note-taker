@@ -78,9 +78,10 @@ describe('/app/settings — change password', () => {
     expect(queryClient.getQueryData(queryKeys.settings)).toBeDefined();
     // And the acting session is still a session: the `401` was about the password, not about it. The
     // transport is the one place that decides, and this tab's client is wired with the same 401 hook
-    // `features/auth/session.tsx` installs in production — so an empty list here means the hook was
-    // *offered* this error and declined it (`lib/api.ts`'s `isCredentialOnly401`), which is the whole
-    // difference between "the current password is not right" and a trip to `/login`.
+    // `features/auth/session.tsx` installs in production — so an empty list here means the transport
+    // asked `GET /api/auth/session`, was told the session is still there, and kept quiet
+    // (`lib/api.ts`'s `sessionGoneError`), which is the whole difference between "the current password
+    // is not right" and a trip to `/login`. The next test is the same submit with the opposite answer.
     expect(rendered.expiryEvents()).toEqual([]);
     const session = await tab.client.json(ROUTES.auth.session, { schema: sessionResponseSchema });
     expect(session.user?.username).toBe('ada.lovelace');
@@ -109,6 +110,40 @@ describe('/app/settings — change password', () => {
     // And the screen said so rather than bouncing anyone: `/login` is PR-08's route, and this harness
     // records the instruction instead of performing it.
     expect(rendered.view.getByTestId('settings-error')).toBeDefined();
+  });
+
+  /**
+   * The other half of that decision, and the case the round-2 fix used to swallow. The tab is still
+   * open, the session underneath it is gone — here because a second tab signed out everywhere, in real
+   * life because the TTL ran out — and the person submits anyway. `POST /api/auth/password` answers the
+   * **same** `401 UNAUTHORIZED` for that as for a typo: it sits behind the auth guard, so the guard
+   * rejects the cookie before the password is ever looked at, and no field of the envelope says which
+   * of the two it was (`docs/API.md` #9). So the transport asks (`lib/api.ts`'s `sessionGoneError`), and
+   * this is the assertion that it asks *and listens*: an empty `expiryEvents()` here is a red form on a
+   * page that has nothing left to save.
+   */
+  it('sends the person to the sign-in door when the session died while the form was open', async () => {
+    const server = createFakeServer();
+    const rendered = renderSettings({ server });
+    const { view } = rendered;
+
+    // Pull the rug out from under the open screen, the way the reviewer described it.
+    const other: FakeTab = rendered.otherTab();
+    await other.client.request(ROUTES.auth.logoutAll, { method: 'POST' });
+    expect(server.liveTokens()).toEqual([]);
+
+    await submit(view, userEvent.setup(), { current: FAKE_PASSWORD, next: FAKE_NEW_PASSWORD });
+
+    await waitFor(() => {
+      expect(rendered.expiryEvents()).toEqual(['401 UNAUTHORIZED']);
+    });
+    // Asked once, on the route that answers the question, and the mutation was not retried behind it.
+    expect(server.requests()).toContain('GET /api/auth/session');
+    expect(server.requests().filter((line) => line.startsWith('POST /api/auth/password'))).toHaveLength(1);
+    // Nothing was written, and the server's own sentence is still on screen for the person to read on
+    // the way out — the hook adds the redirect, it does not swallow the message.
+    expect(server.password()).toBe(FAKE_PASSWORD);
+    expect(view.getByTestId('change-password-error').textContent).toContain('not signed in');
   });
 
   it('refuses a weak new password locally, without spending a request', async () => {

@@ -1412,7 +1412,9 @@ decrypt it)
   name, folder path and body with NFD accent-folded keys, scoring (`name hit > body hit > recency`), and return
   ≤ 25 results with an ~120-**code-point** snippet generated from plaintext (empty for a name-only match). Both
   statements are scoped by `user_id`; a note whose envelope fails to authenticate is skipped from both passes and
-  its id is logged, never a `500` and never blank content.
+  its id is logged, never a `500` and never blank content. (The one honest exception, stated in `AGENTS.md`: a
+  corrupt body *outside* the window can still be named by the SQL branch, which never decrypts it — that is the
+  same fact as "name search needs no key".)
 - **Accepted asymmetry:** folding cannot run in the SQL branch (`unaccent` is not installed and a fold is not a
   `LIKE` pattern), so `cafe` finds an in-window `café` and only the exact `café` matches outside the 500-window —
   stated in `docs/API.md` #21, asserted in both directions by `search.service.int.test.ts`, and closed by **PR-29**

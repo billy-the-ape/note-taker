@@ -239,8 +239,10 @@ client renders it as it came and never re-sorts on `score` alone. An empty `resu
 same response, which is what lets this endpoint answer about another user's words without admitting they exist.
 
 A snippet carries no ellipsis and no highlight markers: it is raw text from the note, cut on a code-point boundary
-so an emoji cannot arrive as half a character, and the match is always inside it. PR-17 highlights the match from
-the query it still has.
+so an emoji cannot arrive as half a character, and it is placed around the match. The one corner where it cannot be
+— a query whose case fold differs between whole-string and per-character folding, which is what a Greek final sigma
+does — quotes the front of the body instead of dropping the result, and `search.service.test.ts` pins that
+degradation. PR-17 highlights the match from the query it still has.
 
 **Why a name hit can be missing a body hit, and vice versa.** Bodies are encrypted, so no index can see them
 (ADR-0002). A query therefore runs twice: once in SQL over names and folder names, which covers every note the
@@ -255,9 +257,10 @@ reads the body. The consequence is a documented asymmetry rather than a bug to c
 The same rule in one sentence: `cafe` finds a note named `café` whenever that note is inside the 500-candidate
 window, and only the exact `café` matches outside it. Making name search uniformly accent-insensitive needs a folded
 generated column or `unaccent`, which is backlog **PR-29**; until then `search.service.int.test.ts` asserts the
-miss, so the gap can be neither closed quietly nor mistaken for a regression. Body search has no such asymmetry
-inside the window — it is only ever the in-process pass — and 500 notes is where plan §6 puts the MVP corpus, with
-`pg_trgm`/`tsvector` as the scale-out path past a few thousand.
+miss, so the gap can be neither closed quietly nor mistaken for a regression. Body search has no comparable gap to
+document, because it never runs outside the window at all: a body match beyond the 500 newest notes is simply not
+found, accents folded or not. 500 notes is where plan §6 puts the MVP corpus, with `pg_trgm`/`tsvector` as the
+scale-out path past a few thousand.
 
 ### `GET /api/nope` — 404 from the route table
 

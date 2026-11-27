@@ -21,12 +21,14 @@ import {
   contentUpdateStatement,
   createNote,
   deleteNote,
+  likeContainsPattern,
   listAllNotes,
   listNotes,
   noteByFolderAndName,
   noteById,
   patchNote,
   recentNotes,
+  searchNotesByMetadata,
   writeNoteContent,
 } from './notes.repo.js';
 
@@ -375,5 +377,41 @@ describe('notes.repo', () => {
     );
     expect(Number(remaining[0]?.total)).toBe(0);
     expect(await listNotes(db, { userId: owner.id, folderId: folder.id })).toStrictEqual([]);
+  });
+
+  it('searches metadata with `%` and `_` literal in **both** halves of the predicate (PR-11)', async () => {
+    const db = testDb();
+    const { owner } = await pair();
+    const underscore = await createFolder(db, { userId: owner.id, name: 'a_b' });
+    const xletter = await createFolder(db, { userId: owner.id, name: 'axb' });
+
+    await makeNote(db, owner.id, { name: '100% cotton' });
+    await makeNote(db, owner.id, { name: 'a_b note' });
+    await makeNote(db, owner.id, { name: 'axb note' });
+    await makeNote(db, owner.id, { name: 'plain' });
+    // Two rows whose **names** cannot match, so what follows can only be answered by the folder half — a second
+    // `LIKE … ESCAPE` living inside the `exists` subquery, escaped separately and able to break separately.
+    await makeNote(db, owner.id, { name: 'inside-underscore', folderId: underscore.id });
+    await makeNote(db, owner.id, { name: 'inside-xletter', folderId: xletter.id });
+
+    const searchBy = async (q: string): Promise<string[]> => {
+      const rows = await searchNotesByMetadata(db, {
+        userId: owner.id,
+        pattern: likeContainsPattern(q),
+        // The scan bound the service passes; the corpus is six rows, so this number decides nothing here.
+        limit: 500,
+      });
+      return rows.map((row) => row.name).sort();
+    };
+
+    // The control: the statement is matching *something*, so an empty or short answer below means "literal".
+    expect(await searchBy('note')).toStrictEqual(['a_b note', 'axb note']);
+
+    // Unescaped, `100%` would become `%%%` (the whole corpus) and `a_b` would reach `axb note`; an ESCAPE clause
+    // that Postgres reads as empty turns both queries into searches for a literal backslash, which is nothing.
+    expect(await searchBy('100%')).toStrictEqual(['100% cotton']);
+    expect(await searchBy('%')).toStrictEqual(['100% cotton']);
+    expect(await searchBy('a_b')).toStrictEqual(['a_b note', 'inside-underscore']);
+    expect(await searchBy('_')).toStrictEqual(['a_b note', 'inside-underscore']);
   });
 });

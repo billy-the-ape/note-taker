@@ -374,25 +374,44 @@ function searchRowBase(row: Record<string, unknown>): NoteSearchRow {
   };
 }
 
-/** The escape character of both `LIKE`s, spelled the way Postgres wants a backslash inside a string literal. */
-const LIKE_ESCAPE = sql`escape '\'`;
+/**
+ * The character that makes a `%`, `_` or `\` in the caller's text mean itself: one backslash.
+ *
+ * It is **bound as a parameter** below rather than written into the SQL text, and that choice is the whole reason
+ * this constant exists. A backslash inside a JS template literal is cooked by JavaScript before Postgres ever sees
+ * it: this file used to write `escape '\'` and Postgres received `escape ''` — an empty escape character, which
+ * *disables* escaping, so each backslash {@link likeContainsPattern} had added became a literal character of the
+ * pattern, and a search for `100%` asked for a name containing a backslash instead (PR-11 review, inline
+ * `r4721929072`). Even a cooked-correct `'\'` would leave the statement's behaviour depending on a second reader's
+ * opinion of `standard_conforming_strings`. Interpolated, the fragment carries no backslash to cook or to re-quote,
+ * and the `ESCAPE` clause and the pattern's escaping are literally the same value instead of two spellings that can
+ * drift apart.
+ */
+const LIKE_ESCAPE_CHAR = '\\';
+
+/** The `ESCAPE` clause of both `LIKE`s, its character bound as a parameter (see {@link LIKE_ESCAPE_CHAR}). */
+const LIKE_ESCAPE = sql`escape ${LIKE_ESCAPE_CHAR}`;
 
 /**
  * The `LIKE` pattern that means "the caller's text, as a substring, literally".
  *
- * Two characters have to survive translation. `%` and `_` are the wildcards, and a search box that typed
+ * Three characters have to survive translation. `%` and `_` are the wildcards, and a search box that typed
  * `100%` means the discount, not "everything" — which is exactly what an unescaped `%` would answer, for the
  * whole corpus, in the one branch that is guaranteed to see the whole corpus. `\` is the escape character, so a
- * backslash in the text has to escape itself or it would silently eat the character after it.
+ * backslash in the text has to escape itself or it would silently eat the character after it — and it is escaped
+ * **first**, because the escapes added by the next two rules must not be escaped again.
+ *
+ * `[` and `]` need no rule of their own: they are wildcards in `SIMILAR TO`, not in `LIKE`.
  *
  * Escaping happens here rather than in the service because this file owns the meaning of the string it puts in
  * the `WHERE`: handing a caller's `%` to `LIKE` from the service would be a repository whose pattern means two
  * things depending on who built it.
  */
 export function likeContainsPattern(term: string): string {
-  const escaped = term.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
-  // `[` and `]` are not wildcards in Postgres `LIKE` (they are in `SIMILAR TO`), so they need no third rule —
-  // and `escape '\'` is what makes the backslashes above the escape character rather than a literal `\`.
+  const escaped = term
+    .replaceAll(LIKE_ESCAPE_CHAR, LIKE_ESCAPE_CHAR + LIKE_ESCAPE_CHAR)
+    .replaceAll('%', `${LIKE_ESCAPE_CHAR}%`)
+    .replaceAll('_', `${LIKE_ESCAPE_CHAR}_`);
   return `%${escaped}%`;
 }
 

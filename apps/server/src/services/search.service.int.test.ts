@@ -166,6 +166,49 @@ describe('GET /api/search — wildcards are literal (§6)', () => {
     });
     expect(namesOf((await search(owner.id, '\\')).results)).toEqual(['escaped']);
   });
+
+  it('finds a wildcard query one row past the 500-candidate window, where only SQL can see it', async () => {
+    const owner = await createOwner(db);
+    await seedNotes(db, {
+      userId: owner.id,
+      keyring,
+      notes: [
+        // Newer than every filler, so it is inside the window and either pass could return it…
+        {
+          name: '100% cotton-new',
+          body: 'a tag nobody is searching for',
+          contentUpdatedAt: new Date(at(0).getTime() + 60_000),
+        },
+        ...fillerNotes(SEARCH_CANDIDATE_SCAN, 'filler', { baseTime: at(0) }),
+        // …and its twin a year older, i.e. the 501st row and beyond the scan bound. It can only come back through
+        // the metadata statement, which is the half whose "whole corpus" promise this query actually tests.
+        // An ESCAPE clause Postgres reads as empty makes both rows vanish, not just this one.
+        {
+          name: '100% cotton-old',
+          body: 'a tag nobody is searching for',
+          contentUpdatedAt: at(365),
+        },
+      ],
+    });
+
+    // Recency inside the tier, so the in-window row is first and the out-of-window row second: the second element
+    // is the assertion this test exists for (PR-11 review, inline `r4721929072`).
+    expect(namesOf((await search(owner.id, '100%')).results)).toEqual(['100% cotton-new', '100% cotton-old']);
+
+    // The same shape for `_`, which is the wildcard that turns a name into a wildcard match on one character.
+    await seedNotes(db, {
+      userId: owner.id,
+      keyring,
+      notes: [
+        { name: 'a_b-new', body: 'nothing', contentUpdatedAt: new Date(at(0).getTime() + 60_000) },
+        { name: 'a_b-old', body: 'nothing', contentUpdatedAt: at(365) },
+        // The foil: one character away from `a_b`, and outside the window too, so an unescaped `_` would answer
+        // three names here and this assertion would fail on the SQL half it is meant to protect.
+        { name: 'axb-old', body: 'nothing', contentUpdatedAt: at(366) },
+      ],
+    });
+    expect(namesOf((await search(owner.id, 'a_b')).results)).toEqual(['a_b-new', 'a_b-old']);
+  });
 });
 
 describe('GET /api/search — folders, paths and the shape of a result', () => {

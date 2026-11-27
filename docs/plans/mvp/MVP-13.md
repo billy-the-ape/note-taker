@@ -195,3 +195,37 @@ Four more, two of them real bugs in the new source rather than in a spec:
   drives the whole banner flow and asserts the arrival at the new note, which is also the first route test to
   exercise a note that dies while it is open — the tree fake grew `PUT /api/notes/:id/content` and
   `POST /api/notes` for it, so the write path is answered as a server answers it instead of with a `500`.
+### Review round 3 (reading the transforms, `2d8040f`)
+
+Four findings, all valid, none of them visible in CI — three of them because the unit suite asserted the
+wrong string, one because the failure needs a second note:
+
+- **An inserted block glued itself to the paragraph after it** (`insertBlock`'s `needsGap`). `line.end` is
+  the index of the line's `
+`, so `tail` always *starts* with that newline and `!tail.startsWith('
+')`
+  was false whenever a following line existed at all: the doc comment's "cannot glue itself to the following
+  paragraph" never held, and a GFM table ends only at a blank line — so pressing **Table** turned the next
+  sentence into a table row. `tail.length > 1 && !tail.startsWith('
+
+')` looks one character past the
+  terminator. The unit case "replaces the empty line a table is inserted at" asserted the glued output, so
+  the suite had encoded the bug; it and the rule case now assert the gap, plus the two cases where *no* gap
+  is right (EOF, and a gap that is already there).
+- **Blank lines inside a multi-line selection are separators, not content.** `allLinesMatch` ignores them
+  when it picks a mode, but the per-line callback ran on them anyway: `- [ ] ` on a blank line in
+  task-list `'remove'` mode (a stray empty checkbox in the preview), `# ` on an empty line from the heading
+  button, and in `orderedList` a separator that spent a number, so the list counted 1, 2, 4. `contentLines`
+  is the shared rule for all five prefix transforms — untouched separators, and an ordinal over content
+  lines — while a *collapsed* caret on an empty line still starts a block there. The named trade-off is
+  `blockquote`: a multi-paragraph quote whose separator stays blank renders as two quotes, and the caret on
+  that line is how the separator gets its `>`.
+- **The caret-after-create was frozen at first mount** (`NoteEditorPage`'s `useState(() =>
+  takesEditorFocus(client, noteId))`). A route component stays mounted while only its param changes, so the
+  initializer ran once per page lifetime: create note B while A is open and B is never focused, and a page
+  that first opened a just-created note focused every note after it. The read moved into the keyed
+  `NoteEditor` — the component that mounts per note — and the test drives A → B → A and asserts the focus
+  follows the note, not the page (verified to fail against the old placement).
+- **AGENTS said 16 toolbar items; there are 15** (`toolbar-h1/h2/h3` are three buttons over one
+  `heading(level)` factory). Corrected in AGENTS, in the PR description, and in `lib/markdown.test.ts`'s
+  wording is unchanged because it already said "the fifteen buttons" — the count that drifted was the prose.

@@ -194,6 +194,43 @@ function eachLine(text: string, caret: Caret, fn: (line: string, index: number) 
 }
 
 /** True when every line the caret touches satisfies `predicate` — the "already a list" half of a toggle. */
+/**
+ * A per-line callback for the line-prefix transforms, with two rules `eachLine` alone cannot know.
+ *
+ * **A blank line inside a multi-line selection is a separator, not content.** `allLinesMatch` already
+ * ignores blank lines when it picks the mode, so a callback that wrote a marker onto a separator decided
+ * one thing and did its opposite: three checked items with a blank line between two of them are in
+ * `'remove'` mode, the items went back to plain text — and the blank came back as `- [ ] `, a stray empty
+ * checkbox in the preview. `'add'` and `'check'` insert empty boxes on separators the same way, and the
+ * heading button can put a `#` on a line that has nothing in it.
+ *
+ * A **collapsed** caret on an empty line is still a request to start a block there (that is §6's "a table
+ * at an empty line" case, one line deep), which is why the test is "does the selection span more than one
+ * line" rather than "is this line blank". One consequence is worth naming for `blockquote`: a
+ * multi-paragraph quote whose separator stays blank renders as two quotes, and pressing the button again
+ * with the caret on that line is how the separator gets its `>`. The alternative — a transform writing
+ * lines nobody selected content on — is what made the other four wrong, so the rule is uniform.
+ *
+ * **The ordinal counts content lines.** `1. 2. 3.` has to survive a blank between two items; a separator
+ * that consumes a number is a list that counts 1, 2, 4.
+ */
+function contentLines(
+  text: string,
+  caret: Caret,
+  fn: (line: string, ordinal: number) => string,
+): (line: string) => string {
+  const lines = linesOf(text);
+  const spans = lineIndexAt(lines, caret.end) > lineIndexAt(lines, caret.start);
+  let ordinal = 0;
+  return (line: string): string => {
+    if (line.trim().length === 0) {
+      if (spans) return line;
+      return fn(line, ordinal);
+    }
+    return fn(line, ordinal++);
+  };
+}
+
 function allLinesMatch(text: string, caret: Caret, predicate: (line: string) => boolean): boolean {
   const lines = linesOf(text);
   const first = lineIndexAt(lines, caret.start);
@@ -285,11 +322,15 @@ export function heading(level: 1 | 2 | 3): Transform {
   return (rawSelection, text) => {
     const caret = normalize(rawSelection, text);
     const remove = allLinesMatch(text, caret, (line) => thisHeading.test(line));
-    return eachLine(text, caret, (line) => {
-      const stripped = line.replace(anyHeading, '');
-      // Toggle-off keeps the text; a different level keeps it too, which is what makes H1→H2 one click.
-      return remove ? stripped : `${marker} ${stripped}`;
-    });
+    return eachLine(
+      text,
+      caret,
+      contentLines(text, caret, (line) => {
+        const stripped = line.replace(anyHeading, '');
+        // Toggle-off keeps the text; a different level keeps it too, which is what makes H1→H2 one click.
+        return remove ? stripped : `${marker} ${stripped}`;
+      }),
+    );
   };
 }
 
@@ -298,7 +339,11 @@ export const blockquote: Transform = (rawSelection, text) => {
   const caret = normalize(rawSelection, text);
   const quote = /^ {0,3}>\s?/u;
   const remove = allLinesMatch(text, caret, (line) => quote.test(line));
-  return eachLine(text, caret, (line) => (remove ? line.replace(quote, '') : `> ${line}`));
+  return eachLine(
+    text,
+    caret,
+    contentLines(text, caret, (line) => (remove ? line.replace(quote, '') : `> ${line}`)),
+  );
 };
 
 /** `- ` on every touched line. An ordered or task sibling is *replaced*, so the markers cannot stack. */
@@ -306,10 +351,14 @@ export const bulletList: Transform = (rawSelection, text) => {
   const caret = normalize(rawSelection, text);
   const marker = /^ {0,3}([-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?/u;
   const remove = allLinesMatch(text, caret, (line) => /^ {0,3}[-*+]\s+(?!\[[ xX]\])/u.test(line));
-  return eachLine(text, caret, (line) => {
-    const stripped = line.replace(marker, '');
-    return remove ? stripped : `- ${stripped}`;
-  });
+  return eachLine(
+    text,
+    caret,
+    contentLines(text, caret, (line) => {
+      const stripped = line.replace(marker, '');
+      return remove ? stripped : `- ${stripped}`;
+    }),
+  );
 };
 
 /** `1. 2. 3.` — renumbered from the first touched line, because a list that counts 1,1,1 is not a list. */
@@ -317,10 +366,17 @@ export const orderedList: Transform = (rawSelection, text) => {
   const caret = normalize(rawSelection, text);
   const marker = /^ {0,3}([-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?/u;
   const remove = allLinesMatch(text, caret, (line) => /^ {0,3}\d+[.)]\s+/u.test(line));
-  return eachLine(text, caret, (line, index) => {
-    const stripped = line.replace(marker, '');
-    return remove ? stripped : `${index + 1}. ${stripped}`;
-  });
+  // The ordinal comes from `contentLines`, so a separator between two items costs a number: a list that
+  // counts 1, 2, 4 is the bug the blank-line rule above is here to prevent, and renumbering is the half of
+  // "a list that counts 1,1,1 is not a list" that a blank line can break on its own.
+  return eachLine(
+    text,
+    caret,
+    contentLines(text, caret, (line, ordinal) => {
+      const stripped = line.replace(marker, '');
+      return remove ? stripped : `${ordinal + 1}. ${stripped}`;
+    }),
+  );
 };
 
 /**
@@ -339,25 +395,29 @@ export const taskList: Transform = (rawSelection, text) => {
   const everyChecked = everyTask && allLinesMatch(text, caret, (line) => checked.test(line));
   const mode: 'add' | 'check' | 'remove' = !everyTask ? 'add' : everyChecked ? 'remove' : 'check';
 
-  return eachLine(text, caret, (line) => {
-    const found = task.exec(line);
-    if (found === null) {
-      const stripped = line.replace(/^ {0,3}([-*+]|\d+[.)])\s+/u, '');
-      return `- ${mode === 'check' ? '[x]' : '[ ]'} ${stripped}`;
-    }
-    // The third press takes the whole task item back to a plain line: leaving `- milk` behind would
-    // make this button half of a toggle and the bullet button somebody else's business.
-    if (mode === 'remove') return line.slice(found.index).replace(task, '');
-    // A line that already has a box is left exactly as it is when the button is only filling in the
-    // missing ones. `mode === 'add'` means "not every touched line has a box", and a mixed selection is
-    // the ordinary case — a list halfway down, a paste of two lines, a caret on one row of a five-row
-    // list — so ticking the box the person left open would be the button deciding an item is finished.
-    // That is `'check'`'s job, and `'check'` is only ever reached when *every* touched line is a task
-    // item and at least one is still open.
-    if (mode === 'add') return line;
-    const after = line.slice(found.index + found[0].length);
-    return `- [x] ${after}`;
-  });
+  return eachLine(
+    text,
+    caret,
+    contentLines(text, caret, (line) => {
+      const found = task.exec(line);
+      if (found === null) {
+        const stripped = line.replace(/^ {0,3}([-*+]|\d+[.)])\s+/u, '');
+        return `- ${mode === 'check' ? '[x]' : '[ ]'} ${stripped}`;
+      }
+      // The third press takes the whole task item back to a plain line: leaving `- milk` behind would
+      // make this button half of a toggle and the bullet button somebody else's business.
+      if (mode === 'remove') return line.slice(found.index).replace(task, '');
+      // A line that already has a box is left exactly as it is when the button is only filling in the
+      // missing ones. `mode === 'add'` means "not every touched line has a box", and a mixed selection is
+      // the ordinary case — a list halfway down, a paste of two lines, a caret on one row of a five-row
+      // list — so ticking the box the person left open would be the button deciding an item is finished.
+      // That is `'check'`'s job, and `'check'` is only ever reached when *every* touched line is a task
+      // item and at least one is still open.
+      if (mode === 'add') return line;
+      const after = line.slice(found.index + found[0].length);
+      return `- [x] ${after}`;
+    }),
+  );
 };
 
 // ────────────────────────────────────────────── link ───────────────────────────────────────────────
@@ -424,7 +484,14 @@ export function insertBlock(block: string): Transform {
     const at = empty ? line.start : line.end;
     const before = text.slice(0, at);
     const pad = before.length === 0 || before.endsWith('\n\n') ? '' : before.endsWith('\n') ? '\n' : '\n\n';
-    const needsGap = tail.length > 0 && !tail.startsWith('\n');
+    // `line.end` is the index of the `\n` that ends the line, so `tail` *starts with* that newline
+    // whenever the line is terminated — which means `!tail.startsWith('\n')` is false in every case where
+    // there is a following line at all, and the gap the doc comment above promises would never happen.
+    // The real question is whether a **blank** line follows, so the test goes one character past the
+    // terminator: `tail.slice(1)` is what comes after the block's own line. It matters most for a table,
+    // which in GFM ends only at a blank line — without the gap the next paragraph is a table body row,
+    // and a person who pressed "Table" watching their prose become cells.
+    const needsGap = tail.length > 1 && !tail.startsWith('\n\n');
     const inserted = `${pad}${block}${needsGap ? '\n' : ''}`;
     const next = `${before}${inserted}${tail}`;
     const position = clamp(at + pad.length + block.length, next.length);

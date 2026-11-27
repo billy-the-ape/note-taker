@@ -261,9 +261,61 @@ describe('task lists', () => {
     );
   });
 
+  it('leaves the blank line between items alone, in every mode', () => {
+    // `'remove'` mode: three checked items with a separator between two of them. The mode decision skips
+    // blank lines, so the items revert to plain text — and the separator has to stay a separator. It used
+    // to come back as `- [ ] `, which the preview renders as a stray empty checkbox nobody asked for.
+    const checked = '- [x] milk\n\n- [x] bread\n- [x] milk';
+    expect(run(taskList, checked, { start: 0, end: checked.length }).text).toBe('milk\n\nbread\nmilk');
+    // `'add'` and `'check'` insert boxes, and a separator is not an item.
+    const plain = 'milk\n\nbread';
+    expect(run(taskList, plain, { start: 0, end: plain.length }).text).toBe('- [ ] milk\n\n- [ ] bread');
+    const open = '- [ ] milk\n\n- [x] bread';
+    expect(run(taskList, open, { start: 0, end: open.length }).text).toBe('- [x] milk\n\n- [x] bread');
+    // A caret parked on the empty line *is* the request to start a list there (§6's "table at an empty
+    // line" rule, one line deep), which is why the rule is about multi-line selections and not about blank
+    // lines as such.
+    const between = 'milk\n\nbread';
+    // Position 5 is the empty line itself (between the two newlines); `+ 2` would be inside `bread`, and a
+    // test that thinks it is on the separator while it is on a word asserts the wrong transform.
+    const onBlank = between.indexOf('\n\n') + 1;
+    // The blank line *becomes* the item — it is not a blank line plus a new one, since there was nothing to
+    // keep: `milk`, then the item, then `bread`.
+    expect(run(taskList, between, caretAt(between, onBlank)).text).toBe('milk\n- [ ] \nbread');
+  });
+
   it('converts a numbered item, so the markers cannot stack', () => {
     const text = '1. milk';
     expect(run(taskList, text, caretAt(text, 3)).text).toBe('- [ ] milk');
+  });
+});
+
+describe('the blank separators inside a multi-line selection', () => {
+  const cases: readonly (readonly [string, Transform, string, string])[] = [
+    ['heading', heading(1), 'Title\n\nStandalone', '# Title\n\n# Standalone'],
+    ['blockquote', blockquote, 'quoted\n\nmore', '> quoted\n\n> more'],
+    ['bullet', bulletList, 'milk\n\nbread', '- milk\n\n- bread'],
+    ['ordered', orderedList, 'milk\n\nbread', '1. milk\n\n2. bread'],
+  ];
+
+  for (const [name, transform, text, expected] of cases) {
+    it(`${name}: adds its marker to the content lines and never to the separator`, () => {
+      expect(run(transform, text, { start: 0, end: text.length }).text).toBe(expected);
+    });
+  }
+
+  it('numbering does not spend a number on a separator', () => {
+    // The other half of the same rule: `1. 2. 3.` is renumbered from the content, so a list split by a
+    // blank line still counts, instead of arriving 1, 2, 4.
+    const text = 'milk\n\nbread\nmilk';
+    expect(run(orderedList, text, { start: 0, end: text.length }).text).toBe('1. milk\n\n2. bread\n3. milk');
+  });
+
+  it('and the separator survives being turned back off', () => {
+    const text = '# Title\n\n# Standalone';
+    expect(run(heading(1), text, { start: 0, end: text.length }).text).toBe('Title\n\nStandalone');
+    const quoted = '> quoted\n\n> more';
+    expect(run(blockquote, quoted, { start: 0, end: quoted.length }).text).toBe('quoted\n\nmore');
   });
 });
 
@@ -363,13 +415,36 @@ describe('links', () => {
 });
 
 describe('inserted blocks', () => {
-  it('replaces the empty line a table is inserted at (§6)', () => {
+  it('replaces the empty line a table is inserted at, and leaves a blank line on both sides (§6)', () => {
     const text = 'Summary\n\n\nNext\n';
     // The caret is on the second empty line: that line becomes the table, and the blank line above it
     // survives, so the table is separated from the paragraph rather than glued under it.
+    //
+    // …and so is the one *below*. `tail` starts with the terminator of the caret's own line, which is why
+    // the gap check has to look past it: a GFM table ends only at a blank line, so a table glued to
+    // `Next` renders `Next` as a body row — the person who pressed "Table" watches their prose turn into
+    // cells. This assertion used to encode the glued output, which is how a wrong expectation keeps a bug
+    // green.
     const at = text.indexOf('\n\n') + 2;
     const applied = run(table, text, caretAt(text, at));
-    expect(applied.text).toBe(`Summary\n\n${tableText()}\nNext\n`);
+    expect(applied.text).toBe(`Summary\n\n${tableText()}\n\nNext\n`);
+  });
+
+  it('does not let an inserted block glue itself to the following paragraph', () => {
+    // The same rule with no blank line to inherit: the caret's line has text on it, the next line has text
+    // on it, and the block has to arrive with a blank line of its own underneath.
+    const text = 'Summary\nNext';
+    expect(run(table, text, caretAt(text, 3)).text).toBe(`Summary\n\n${tableText()}\n\nNext`);
+    // A rule needs the gap for a different reason: `---` on the line above a paragraph is the shape a
+    // setext underline is parsed from, which is §5's reason the block is separated at all.
+    expect(run(horizontalRule, 'Title\nbody', caretAt('Title\nbody', 2)).text).toBe('Title\n\n---\n\nbody');
+    // What the rule does *not* do is manufacture a blank line at EOF, or widen a gap that is already one:
+    // both are the difference between a tidy document and one full of holes.
+    expect(run(horizontalRule, 'Title', caretAt('Title', 5)).text).toBe('Title\n\n---');
+    // Three, not four: the table *is* the blank line the caret sat on, so it spends one of them.
+    expect(run(table, 'Summary\n\n\n\nNext', caretAt('Summary\n\n\n\nNext', 8)).text).toContain(
+      `${tableText()}\n\n\nNext`,
+    );
   });
 
   it('puts a table on its own lines when the caret’s line has text on it', () => {
@@ -379,9 +454,9 @@ describe('inserted blocks', () => {
     expect(applied.selection.start).toBe(applied.text.length);
   });
 
-  it('never leaves a rule that a setext heading could be mistaken for', () => {
+  it('never leaves a rule that a setext heading could be mistaken for, and never on a paragraph', () => {
     const text = 'Title\nbody';
-    expect(run(horizontalRule, text, caretAt(text, 2)).text).toBe('Title\n\n---\nbody');
+    expect(run(horizontalRule, text, caretAt(text, 2)).text).toBe('Title\n\n---\n\nbody');
   });
 
   it('inserts a rule at EOF without a trailing blank line', () => {

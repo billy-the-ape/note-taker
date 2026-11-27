@@ -86,13 +86,6 @@ export const Route = createFileRoute('/app/note/$noteId')({
 function NoteEditorPage() {
   const { noteId } = Route.useParams();
   const note = useNote(noteId);
-  const client = useQueryClient();
-
-  // PR-15's "after create, the note is open in the editor, **focused**". Read once, on mount, against the id
-  // in the path: the intent entry is a fact about the tab, and `takesEditorFocus` is deliberately a *read*
-  // rather than a consume, because `main.tsx`'s StrictMode double mount would eat a one-shot and the caret
-  // would appear in production and not in tests, or the other way round.
-  const [focusOnMount] = useState(() => takesEditorFocus(client, noteId));
 
   // Two different blank pages. PR-16's rule from `/app/settings` applies verbatim: gate on
   // `isError && !hasData`, never on `isError`, because a background refetch that fails while the row is on
@@ -120,7 +113,10 @@ function NoteEditorPage() {
     );
   }
 
-  return <NoteEditor key={noteId} note={note.data} focusOnMount={focusOnMount} />;
+  // `key={noteId}` is not only the autosave machine's story (one machine per note, the outgoing one flushed
+  // on its way out): it is also what makes the caret read below happen *per note*, because this component —
+  // the route component — stays mounted while only the param changes.
+  return <NoteEditor key={noteId} note={note.data} />;
 }
 
 /**
@@ -181,14 +177,23 @@ function EditorProblem({
   );
 }
 
-function NoteEditor({
-  note,
-  focusOnMount,
-}: {
-  readonly note: import('@note-taker/contracts').NoteWithContent;
-  readonly focusOnMount: boolean;
-}) {
+function NoteEditor({ note }: { readonly note: import('@note-taker/contracts').NoteWithContent }) {
   const { tree, openNote } = useApp();
+  const client = useQueryClient();
+
+  // PR-15's "after create, the note is open in the editor, **focused**". Read once, on mount, against the id
+  // this component was mounted for: the intent entry is a fact about the tab, and `takesEditorFocus` is
+  // deliberately a *read* rather than a consume, because `main.tsx`'s StrictMode double mount would eat a
+  // one-shot and the caret would appear in production and not in tests, or the other way round.
+  //
+  // It lives **here** rather than in `NoteEditorPage`, and the difference is a bug: TanStack keeps a route
+  // component mounted when only its param changes, so state initialised in the page is initialised once for
+  // the page's lifetime — create note B while note A is open and B never gets its caret, and a page that
+  // *first* opens a just-created note would focus every note opened after it. `NoteEditor` is mounted with
+  // `key={noteId}`, so a read at this mount is one read per note visit, which is the unit the intent is
+  // written against.
+  const [focusOnMount] = useState(() => takesEditorFocus(client, note.id));
+
   const autosave = useAutosave({
     id: note.id,
     content: note.content,

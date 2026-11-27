@@ -370,7 +370,8 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   PR-14's contract (the buffer is one string owned by the machine; `blur`/`visibilitychange`/`pagehide` own the flush; PR-19's
   specs read the control with `toHaveValue`) is a contract about a *text control*, so a 60 KB editor library would have been
   bought to re-wrap the field that already worked — `lib/markdown.ts` is pure, transform-per-`data-testid`, surrogate-safe, and
-  unit-tested (16 toolbar items, 3 chords), and the DOM half is one `applyToElement` that writes through `execCommand` where
+  unit-tested (15 toolbar items — `toolbar-h1/h2/h3` are three buttons over one `heading(level)` factory — and 3 chords),
+  and the DOM half is one `applyToElement` that writes through `execCommand` where
   the browser has one and through the **prototype's** `value` setter where it does not (React's own value tracker swallows a
   plain `element.value = x` + `input` pair, which would repaint the pane and never dirty the note).
   `PreviewPane.tsx` is `react-markdown` + `remark-gfm` + `rehype-sanitize` with **no `rehype-raw`, ever** — raw HTML in a note

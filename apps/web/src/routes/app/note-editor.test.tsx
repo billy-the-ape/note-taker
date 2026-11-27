@@ -26,7 +26,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { queryClient, queryKeys, TREE_KEY_PREFIX } from '../../lib/queryClient';
 import { bootAuth, callsTo } from '../../test/authHarness';
 import { sessionUser } from '../../test/fakeApi';
-import { folderNode, makeTreeServer, noteNode, testId } from '../../test/treeApi';
+import { DEFAULT_NOTE_CONTENT, folderNode, makeTreeServer, noteNode, testId } from '../../test/treeApi';
 
 const F_WORK = testId('folder', 1);
 const N_DRAFT = testId('note', 2);
@@ -116,6 +116,29 @@ describe('the note the URL names', () => {
     // PR-15's "after create, the note is open in the editor, **focused**". It is a read rather than a
     // consume, so this assertion survives whatever `main.tsx`'s StrictMode does to the mount.
     expect(document.activeElement).toBe(editor());
+  });
+
+  it('takes the caret on the note created while another one is open', async () => {
+    await bootNote();
+    await waitFor(() => expect(editor().value).toBe(DRAFT_BODY));
+    expect(document.activeElement).not.toBe(editor());
+
+    // The create, from *inside* this page: PR-15 writes the intent entry and navigates. What makes this a
+    // case worth a test is that the route component is not re-mounted — only `$noteId` changes — so any
+    // per-note decision that was initialised in the page still holds the first note's answer. Here the read
+    // lives in the keyed `NoteEditor`, so the caret arrives; in `NoteEditorPage` it never did.
+    queryClient.setQueryData(queryKeys.editorFocus, N_IDEAS);
+    openNoteRow(N_IDEAS);
+
+    await waitFor(() => expect(editor().value).toBe(DEFAULT_NOTE_CONTENT));
+    expect(document.activeElement).toBe(editor());
+
+    // …and the decision is per *visit*, not per page lifetime: with no intent entry, the next note in the
+    // same mounted page is an ordinary read and nobody's caret is moved.
+    queryClient.removeQueries({ queryKey: queryKeys.editorFocus });
+    openNoteRow(N_DRAFT);
+    await waitFor(() => expect(editor().value).toBe(DRAFT_BODY));
+    expect(document.activeElement).not.toBe(editor());
   });
 
   it('does not steal the caret on a plain visit', async () => {

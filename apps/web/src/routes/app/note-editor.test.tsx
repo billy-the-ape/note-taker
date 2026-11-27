@@ -225,19 +225,33 @@ describe('leaving with an unsaved buffer', () => {
     fireEvent.click(screen.getByTestId('unsaved-prompt-save'));
 
     await waitFor(() => expect(screen.queryByTestId('unsaved-prompt')).toBeNull());
-    // What is *not* asserted here is the destination rendering. Two navigations in one blocked
-    // transaction (the router continues the original one after `proceed()`, and the save's tree
-    // invalidation lands in between) leave the incoming note's first fetch unresolved under
-    // `@testing-library` + jsdom, which is a property of this double-navigation harness rather than of the
-    // guard: the clean case below proves the destination renders, and the browser-level proof is
-    // `e2e/autosave.spec.ts`'s dirty-navigation case, which drives the compiled app against a real router
-    // and a real server. Open follow-up, recorded in the PR body.
     // The write is the ordinary one PR-14 owns — same route, same body shape — not a special "flush on
-    // leave" endpoint, which does not exist.
-    // The content route, not the row route: `PUT /api/notes/:id/content` with `{content, baseVersion}` is
-    // PR-14's write (§9.2 #18), and it is the same request a debounce would have made — the guard has no
-    // endpoint of its own.
-    expect(callsTo(fake, `/api/notes/${N_DRAFT}/content`).length).toBeGreaterThan(0);
+    // leave" endpoint, which does not exist. The content route, not the row route: `PUT /api/notes/:id/content`
+    // with `{content, baseVersion}` is PR-14's write (§9.2 #18), and it is the same request a debounce would
+    // have made — the guard has no endpoint of its own.
+    const writes = callsTo(fake, `/api/notes/${N_DRAFT}/content`);
+    expect(writes.length).toBeGreaterThan(0);
+    // The buffer it wrote is the one on screen, not whatever the machine last adopted: that is what "Save"
+    // owes the person who pressed it.
+    const last = writes[writes.length - 1] as { readonly body: unknown };
+    expect((last.body as { readonly content?: string }).content).toBe(`${DRAFT_BODY}and a new sentence`);
+
+    // …and the person *arrives*. An earlier version of this test asserted the write and then excused the
+    // missing destination as "a property of this double-navigation harness" — jsdom never settling the
+    // incoming note's first fetch — and pointed at `e2e/autosave.spec.ts`'s dirty-navigation case as the
+    // browser-level proof. Both halves of that excuse were wrong, and expensively: no such e2e case exists
+    // (so nothing proved the arrival at any level), and the destination does render here as soon as you
+    // wait for it. What was actually happening was this test polling for the prompt to disappear and then
+    // reading the header in the same tick, i.e. a race, not a router or a harness limit. Asserting the
+    // arrival is the whole point of a guard, so it is asserted at this level; `e2e/autosave.spec.ts` covers
+    // the pill and the two-page conflict, and adding a dirty-navigation spec there is a separate call,
+    // recorded as not-taken in `docs/plans/mvp/MVP-13.md` §9 — an e2e case nobody can run is how the last two
+    // review rounds started.
+    await waitFor(() => expect(textOf('note-title')).toBe('ideas.md'));
+    expect(screen.queryByTestId('unsaved-prompt')).toBeNull();
+    // The destination's own body — a different note, so a different document. Reaching *this* screen is the
+    // proof the guard's Save path continues the navigation it was asked to continue.
+    expect(editor().value).toBe(DEFAULT_NOTE_CONTENT);
   });
 
   it('leaves nothing in the draft mirror when the answer is Discard', async () => {
@@ -249,7 +263,10 @@ describe('leaving with an unsaved buffer', () => {
     fireEvent.click(screen.getByTestId('unsaved-prompt-discard'));
 
     await waitFor(() => expect(screen.queryByTestId('unsaved-prompt')).toBeNull());
-    expect(callsTo(fake, `PATCH /api/notes/${N_DRAFT}`)).toHaveLength(0);
+    // Not one request went out — the write is `PUT /api/notes/:id/content` (see `callsTo`: it compares the
+    // recorded **path**, which carries no method, so an assertion naming a method never matches anything and
+    // can only pass. It used to say `PATCH /api/notes/<id>`, and that line was unfalsifiable.)
+    expect(callsTo(fake, `/api/notes/${N_DRAFT}/content`)).toHaveLength(0);
     // PR-14's conditional clear: the key held exactly the abandoned text, so Discard means it.
     expect(localStorage.getItem(`note-draft:${N_DRAFT}`)).toBeNull();
   });

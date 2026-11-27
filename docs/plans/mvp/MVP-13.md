@@ -229,3 +229,36 @@ wrong string, one because the failure needs a second note:
 - **AGENTS said 16 toolbar items; there are 15** (`toolbar-h1/h2/h3` are three buttons over one
   `heading(level)` factory). Corrected in AGENTS, in the PR description, and in `lib/markdown.test.ts`'s
   wording is unchanged because it already said "the fifteen buttons" — the count that drifted was the prose.
+### Review round 4 (reading the transforms again, `da7149c`)
+
+Five findings, all accepted; three wrong results in `lib/markdown.ts` and two in the tests, none of them
+visible to CI (two because the inputs were never used, one because the assertion could not fail):
+
+- **Italic on `**bold**` removed the bold** instead of stacking. `emphasis` unwraps by *slicing*
+  `open.length` characters off the buffer, and one asterisk of a `**` pair is an asterisk — so the italic
+  button found "its own" marker inside somebody else's and took it off, downgrading `**bold**` to `*bold*`
+  precisely when the person asked for more emphasis. `markerIsOwn` now requires the adjacent run to be
+  exactly this marker's length, or 3 long (`***x***` is bold **and** italic in Markdown, so taking one layer
+  off is the honest answer for both buttons). Selection is guarded the same way through the second unwrap
+  step, which had the same hole.
+- **A fence did not begin a line.** `codeBlock` wrapped the selection wherever it fell, so `'foo ```bar```
+  baz'` is not a code block at all — three backticks mid-line are inline code, and the sentence is mangled.
+  The selection is now lifted onto its own lines (neighbours keep theirs, including their spaces), matching
+  what `insertBlock` already does for tables and rules.
+- **The caret arithmetic was inexact on removal.** `eachLine`'s `shift` added a line's whole delta whenever
+  `line.start <= position`, so a caret at column 0 of the next line — or anywhere inside a prefix about to
+  be deleted — travelled backwards onto the line above (`'a\n- b'`, bullet removed, caret at 0), and a
+  selection's `start` did the same thing silently, so the *next* toolbar press edited text the person had
+  deliberately left out. A removal may now take back at most the distance from the line's own start.
+- **`expect(callsTo(fake, \`PATCH /api/notes/…\`)).toHaveLength(0)` could never fail** (`callsTo` compares
+  recorded *paths*, which carry no method). The Discard case now asserts the route a write would actually
+  use, `PUT /api/notes/:id/content`, and the Save case additionally asserts the recorded body — the buffer
+  on screen, not whatever the machine last adopted.
+- **The Save case cited an e2e test that does not exist.** Worse, it excused the missing destination as a
+  jsdom limitation ("the incoming note's first fetch never settles"), which was a *race in the test*: the
+  arrival renders fine once you wait for it. The test now waits for `note-title` = `ideas.md`, asserts the
+  prompt stays gone, and asserts the destination holds its own body. `e2e/autosave.spec.ts` has no
+  dirty-navigation spec, and adding one is deliberately **not** taken here: this PR has already shipped two
+  acceptance assertions that were never run, so a third unverifiable one is the wrong trade. The unit level
+  now proves the arrival; PR-19's suite remains the place to add the browser case, and saying so is cheaper
+  than pointing at a file that isn't there.

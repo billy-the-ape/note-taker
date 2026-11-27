@@ -290,6 +290,63 @@ describe('task lists', () => {
   });
 });
 
+describe('the `*` family: `*x*`, `**x**`, `***x***`, and nothing mangled', () => {
+  it('stacks italic onto bold instead of trading one for the other', () => {
+    // The word is already bold. Pressing italic has to *add* a layer; an unwrap here silently downgrades
+    // somebody's emphasis because they asked for more of it.
+    const text = '**bold** x';
+    const applied = run(italic, text, caretAt(text, text.indexOf('bold') + 2));
+    expect(applied.text).toBe('***bold*** x');
+    expect(selected(applied)).toBe('bold');
+  });
+
+  it('stacks when the whole `**bold**` run is selected', () => {
+    // …the same request made the other way round (a double-click that swallowed the asterisks), which used
+    // to fail through the second unwrap step rather than the first.
+    const text = '**bold**';
+    const applied = run(italic, text, { start: 0, end: text.length });
+    expect(applied.text).toBe('***bold***');
+    expect(applied.text.split('x')).toHaveLength(1);
+  });
+
+  it('takes one layer off a `***x***`, for both buttons', () => {
+    // Markdown says `***x***` is bold *and* italic, so there is a real answer to "remove the italic" and it
+    // is not "delete both".
+    const both = '***both***';
+    expect(run(italic, both, caretAt(both, 5)).text).toBe('**both**');
+    expect(run(bold, both, caretAt(both, 5)).text).toBe('*both*');
+  });
+
+  it('stacks bold onto italic too (the direction that already worked)', () => {
+    // The single asterisks are outside the target, so wrapping adds its two inside them and the word ends up
+    // with three on each side — which is Markdown for "bold and italic", not for a six-asterisk typo.
+    const text = '*italic* x';
+    expect(run(bold, text, caretAt(text, text.indexOf('italic') + 2)).text).toBe('***italic*** x');
+  });
+});
+
+describe('the caret a transform hands back', () => {
+  it('stays on its own line when a prefix is removed', () => {
+    // `bulletList` on a bullet whose caret sits *before* the marker: the caret used to travel by the whole
+    // removal and land on the line above, so the next toolbar press edited a line nobody had selected.
+    const text = 'a\n- b';
+    const applied = run(bulletList, text, { start: 2, end: 2 });
+    expect(applied.text).toBe('a\nb');
+    expect(applied.selection).toEqual({ start: 2, end: 2 });
+    expect(applied.selection.start).toBe(text.indexOf('- b'));
+  });
+
+  it('keeps a selection inside the lines it started in', () => {
+    // The same arithmetic on a selection's `start`: `{start: 2}` pulled back to 0 would put `x` — a line the
+    // person never selected — inside the next transform's target.
+    const text = 'x\n> a\n> b';
+    const applied = run(blockquote, text, { start: 2, end: 9 });
+    expect(applied.text).toBe('x\na\nb');
+    expect(applied.selection).toEqual({ start: 2, end: 5 });
+    expect(selected(applied)).toBe('a\nb');
+  });
+});
+
 describe('the blank separators inside a multi-line selection', () => {
   const cases: readonly (readonly [string, Transform, string, string])[] = [
     ['heading', heading(1), 'Title\n\nStandalone', '# Title\n\n# Standalone'],
@@ -467,6 +524,29 @@ describe('inserted blocks', () => {
   it('inserts the first block into an empty buffer, which is a real first keystroke', () => {
     expect(run(table, '', caretAt('', 0)).text).toBe(tableText());
     expect(run(horizontalRule, '', caretAt('', 0)).text).toBe('---');
+  });
+
+  it('lifts a mid-line selection onto its own lines', () => {
+    // A fence that does not begin a line is inline code, not a code block: `'foo ```bar``` baz'` is one
+    // mangled sentence, and the person asked for a block. Both neighbours keep their own lines.
+    const text = 'foo bar baz';
+    const applied = run(codeBlock, text, caretOf(text, 'bar'));
+    // The spaces that were around `bar` are the neighbours' punctuation, not the fence's: they stay with
+    // `foo ` and ` baz` rather than being "tidied" away — a transform deletes selection, not whitespace.
+    expect(applied.text).toBe('foo \n```\nbar\n```\n baz');
+    expect(selected(applied)).toBe('bar');
+  });
+
+  it('opens a fence on its own lines when the caret is mid-sentence', () => {
+    const text = 'foo bar';
+    const applied = run(codeBlock, text, caretAt(text, 3));
+    expect(applied.text).toBe('foo\n```\n\n```\n bar');
+    // The caret is at the start of the empty line inside the fence — after a newline, and after the opening
+    // fence — which is where the code goes.
+    expect(applied.selection).toEqual({ start: 8, end: 8 });
+    expect(applied.text.charAt(applied.selection.start - 1)).toBe('\n');
+    expect(applied.text.indexOf('```')).toBeLessThan(applied.selection.start);
+    expect(applied.text.indexOf('```', applied.selection.start)).toBeGreaterThan(applied.selection.start);
   });
 
   it('fences a selection on its own lines and keeps the code selected', () => {

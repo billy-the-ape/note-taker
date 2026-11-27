@@ -176,7 +176,17 @@ function eachLine(text: string, caret: Caret, fn: (line: string, index: number) 
   const shift = (position: number): number => {
     let moved = 0;
     for (let index = first; index <= last; index += 1) {
-      if ((lines[index] as Line).start <= position) moved += (edits[index - first] as LineEdit).delta;
+      const line = lines[index] as Line;
+      if (line.start > position) break; // a line that starts after the position never touched it
+      const delta = (edits[index - first] as LineEdit).delta;
+      // Adding the deltas is exact for *insertion*, and wrong for removal: a caret at column 0 of its own
+      // line, or anywhere inside a prefix that is about to be deleted, would move by the whole removal and
+      // land on the line **above** — `'a\n- b'` with the caret before the `- ` of line 2 came back at
+      // offset 0, i.e. inside line 1, and a selection's `start` pulled the same trick turned `{start: 2}`
+      // into `{start: 0}` so that the *next* toolbar press acted on text this one had deliberately left
+      // out. A removal can therefore never pull a position past the start of the line it sits on: the most
+      // it may take back is the distance from that line's start.
+      moved += delta < 0 ? Math.max(delta, -(position - line.start)) : delta;
     }
     return moved;
   };
@@ -249,8 +259,60 @@ function allLinesMatch(text: string, caret: Caret, predicate: (line: string) => 
 
 // ──────────────────────────────────────────── emphasis ─────────────────────────────────────────────
 
+/** The longest run of one marker character Markdown itself distinguishes: `***x***` is bold **and** italic. */
+const STACK_MAX = 3;
+
+/**
+ * How far a run of `marker`'s character extends from a boundary.
+ *
+ * `dir: 1` counts from `at` rightwards (the run *starts* at `at`); `dir: -1` counts from `at - 1` leftwards
+ * (the run *ends* at `at`). Every marker here is a repeated single character, so the boundary-adjacent end
+ * of the marker names the character to count.
+ */
+function runFrom(text: string, at: number, marker: string, dir: 1 | -1): number {
+  const char = dir === 1 ? marker.charAt(marker.length - 1) : marker.charAt(0);
+  let count = 0;
+  for (let index = dir === 1 ? at : at - 1; index >= 0 && index < text.length; index += dir) {
+    if (text.charAt(index) !== char) break;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Is the marker touching the target **this** marker, or a slice of somebody else's longer run?
+ *
+ * The unwrap steps below match a marker by slicing `open.length`/`close.length` characters off the buffer,
+ * and slicing is not reading: with `**bold**` and the italic button, the slice one character outside the
+ * word *is* an asterisk, so italic "unwrapped" itself and the bold went with it — `*bold*`, a person's
+ * emphasis quietly downgraded because they asked for more of it. The rule that makes the family behave:
+ * the run has to be exactly this marker's length, or long enough (3) to hold this marker *inside* another
+ * one, which is precisely what Markdown's `***x***` means — there, taking one layer off is the honest
+ * answer for both buttons (`*x*` for bold, `**x**` for italic).
+ *
+ * `inward` picks the direction the run is read from: outside the target for step 1's
+ * `**|bold|**`, inside it for step 2's `**|**bold**|**`.
+ */
+function markerIsOwn(
+  text: string,
+  start: number,
+  end: number,
+  open: string,
+  close: string,
+  inward: boolean,
+): boolean {
+  const before = inward ? runFrom(text, start, open, 1) : runFrom(text, start, open, -1);
+  const after = inward ? runFrom(text, end, close, -1) : runFrom(text, end, close, 1);
+  if (before === open.length && after === close.length) return true;
+  return Math.max(before, after) >= STACK_MAX;
+}
+
 /**
  * Wrapping emphasis: `**bold**`, `*italic*`, `~~strikethrough~~`, `` `code` ``.
+ *
+ * `*` and `**` share a character, so the family has three states and they are all reachable: `*x*`,
+ * `**x**`, `***x***`. Pressing the *other* button **stacks** (`**x**` + italic → `***x***`), and pressing it
+ * on a `***x***` takes one layer off — which is why steps 1 and 2 ask {@link markerIsOwn} before unwrapping.
  *
  * Three moves, in this order, and the order is the whole behaviour:
  *
@@ -273,12 +335,13 @@ export function emphasis(open: string, close: string = open): Transform {
         : caret;
     const { start, end } = target;
 
-    // 1. markers immediately outside the target.
+    // 1. markers immediately outside the target — and only when they are this transform's own.
     if (
       end > start &&
       start >= open.length &&
       text.slice(start - open.length, start) === open &&
-      text.slice(end, end + close.length) === close
+      text.slice(end, end + close.length) === close &&
+      markerIsOwn(text, start, end, open, close, false)
     ) {
       const before = text.slice(0, start - open.length);
       const inner = text.slice(start, end);
@@ -289,11 +352,12 @@ export function emphasis(open: string, close: string = open): Transform {
       };
     }
 
-    // 2. the target carries its own markers.
+    // 2. the target carries its own markers, again this transform's own and not a longer run's edge.
     if (
       end - start >= open.length + close.length &&
       text.slice(start, start + open.length) === open &&
-      text.slice(end - close.length, end) === close
+      text.slice(end - close.length, end) === close &&
+      markerIsOwn(text, start, end, open, close, true)
     ) {
       const inner = text.slice(start + open.length, end - close.length);
       const next = `${text.slice(0, start)}${inner}${text.slice(end)}`;
@@ -510,23 +574,31 @@ export const horizontalRule: Transform = insertBlock('---');
  * block" and the reason it is *not* `emphasis('```')` (three backticks in `emphasis` would fight the
  * inline-code button for the same text).
  */
+/**
+ * A fenced code block — and the fence always begins a **line**.
+ *
+ * `insertBlock` already does this for tables and rules; the fence needs it for a sharper reason. Three
+ * backticks that do not start a line are not a fence at all: Markdown reads them as inline code, so
+ * `'foo ```\nbar\n``` baz'` is a mangled line rather than a block — and the person asked for a code block,
+ * not for a pair of literal backticks in their sentence. So the selection is lifted onto its own lines: the
+ * text before it keeps its line, the text after it keeps its line, and nothing is deleted on either side.
+ * A selection that already spans whole lines is unaffected, which is what the §6 cases assert.
+ */
 export const codeBlock: Transform = (rawSelection, text) => {
   const caret = normalize(rawSelection, text);
   const selected = text.slice(caret.start, caret.end);
+  const before = text.slice(0, caret.start);
+  const after = text.slice(caret.end);
   const fence = '```';
+  // Only a *mid-line* boundary needs a newline: at a line start or end the fence is already alone.
+  const lead = before.length === 0 || before.endsWith('\n') ? '' : '\n';
+  const trail = after.length === 0 || after.startsWith('\n') ? '' : '\n';
 
-  if (selected.length === 0) {
-    const inserted = `${fence}\n\n${fence}`;
-    const next = `${text.slice(0, caret.start)}${inserted}${text.slice(caret.end)}`;
-    // The empty line inside the fence: the caret is where the code goes.
-    const at = caret.start + fence.length + 1;
-    return { text: next, selection: { start: at, end: at } };
-  }
-
-  const inserted = `${fence}\n${selected}\n${fence}`;
-  const next = `${text.slice(0, caret.start)}${inserted}${text.slice(caret.end)}`;
-  // The fenced text stays selected, so the next transform acts on the code rather than on a fence mark.
-  const start = caret.start + fence.length + 1;
+  const inserted = `${lead}${fence}\n${selected}\n${fence}${trail}`;
+  const next = `${before}${inserted}${after}`;
+  // The fenced text stays selected (or, when it is empty, the caret sits on the line the code goes on), so
+  // the next transform acts on the code rather than on a fence mark.
+  const start = caret.start + lead.length + fence.length + 1;
   return { text: next, selection: { start, end: start + selected.length } };
 };
 

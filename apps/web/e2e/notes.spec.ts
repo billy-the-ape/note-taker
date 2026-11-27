@@ -94,7 +94,12 @@ test.describe('the naming rule, in the tree', () => {
     },
   );
 
-  test('a heading and a toolbar bold render <strong>, and the text is still there after a reload', async ({
+  // PR-19's title for this case was "a heading and a toolbar bold render `<strong>`", and the heading half
+  // of that sentence is not what Markdown does: `# A heading` is an `<h1>`, and `PreviewPane` has no override
+  // that turns headings into `<strong>` (nor should it — see the schema, which whitelists attributes rather
+  // than rewriting elements). The claim survives with its two halves named properly: the heading renders *as a
+  // heading*, the bold renders *as a `<strong>`*, and the toolbar reaches the buffer.
+  test('a heading renders h1 and a bold renders <strong>, the toolbar reaches the buffer, and the text survives a reload', async ({
     page,
   }) => {
     await signInNewAccount(page, ACCOUNT.noteNaming);
@@ -106,12 +111,21 @@ test.describe('the naming rule, in the tree', () => {
     const editor = page.getByTestId('editor');
     await editor.fill('# A heading\nand **bold** words\n');
 
-    // The render comes first, and the order is the point: `<strong>` exactly twice — one from the ATX
-    // heading, one from the typed `**bold**` — is a claim about *this* buffer, so it is measured before the
-    // toolbar gets a chance to move it. `mode-preview` then hides the source without unmounting it
-    // (`lib/editorMode.ts`), which is why the count is read from `preview` and not from a new page.
+    // The render comes first, and the order is the point: both assertions are about *this* buffer, so they are
+    // measured before the toolbar gets a chance to move it. `mode-preview` hides the source without
+    // unmounting it (`lib/editorMode.ts`), which is why both are read from `preview`.
+    //
+    // `**bold**` is exactly one `<strong>`, and `# A heading` is exactly one `<h1>` — asserted as two
+    // selectors rather than one count, because the two are different claims about the renderer: the first is
+    // that inline emphasis reaches an element (and so went through `rehype-sanitize`'s allow-list with its
+    // text intact), the second that an ATX heading is a heading, which is what makes the preview a document
+    // and not a paragraph.
     await page.getByTestId('mode-preview').click();
-    await expect(page.getByTestId('preview').locator('strong')).toHaveCount(2);
+    const preview = page.getByTestId('preview');
+    await expect(preview.locator('strong')).toHaveCount(1);
+    await expect(preview.locator('strong')).toHaveText('bold');
+    await expect(preview.locator('h1')).toHaveCount(1);
+    await expect(preview.locator('h1')).toHaveText('A heading');
 
     // The toolbar, second: `toolbar-bold` has to reach the buffer. It is asserted as a value that *changed*
     // rather than as a particular string, because a bare `click()` puts the caret wherever the element's

@@ -368,6 +368,13 @@ describe('the preview', () => {
     expect(preview().querySelector('strong')?.textContent).toBe('bold');
     expect(html).toContain('<del>');
     expect(html).toContain('<code>');
+    // The exact counts, not just "an element of that kind exists", because `e2e/notes.spec.ts` asserts these
+    // two numbers in a browser and cannot be run here (no docker daemon): `**bold**` is *one* `<strong>`, and
+    // `# Title` is *one* `<h1>` — a heading is not emphasis, whatever a first reading of "renders
+    // `<strong>`" suggests. Pinned at the level the component can be measured, so the spec's numbers have a
+    // local proof behind them.
+    expect(preview().querySelectorAll('strong')).toHaveLength(1);
+    expect(preview().querySelectorAll('h1')).toHaveLength(1);
   });
 
   it('renders a GFM table and a task list, which are the two §6 names', async () => {

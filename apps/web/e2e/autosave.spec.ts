@@ -123,7 +123,11 @@ test.describe('two pages, one note', () => {
     // holds A's text, so "no silent overwrite" is a claim about the database and not only about the screen.
     const banner = fresh.getByTestId('conflict-banner');
     await expect(banner).toBeVisible();
-    await expect(fresh.getByTestId('conflict-server-version')).toHaveText(String(firstWrite.body.version));
+    // The banner says `v7`, not `7`: `ConflictBanner.tsx` renders the version with the `v` on it, because in a
+    // conflict what a person needs to read is "theirs is v7, yours is v4" and not two bare numbers that could
+    // be word counts. `components/editor/banners.test.tsx` is where that prefix is pinned, and a `toHaveText`
+    // here is exact, so it has to carry the prefix too.
+    await expect(fresh.getByTestId('conflict-server-version')).toHaveText(`v${firstWrite.body.version}`);
     await expect(fresh.getByTestId('conflict-server-text')).toContainText('written by page A');
 
     // …and the row still says what the winning page wrote, at the winning version. B's text is nowhere in it:

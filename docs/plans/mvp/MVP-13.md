@@ -161,3 +161,37 @@ recorded here rather than only in code comments.
 Not done, deliberately: `byte-counter`/`editor` have no e2e case of their own yet (the unit tests cover the
 thresholds and the DOM test covers the line; §6's 900 KiB fixture stays out of the browser), and the note editor
 has no keyboard-only "focus the buffer" affordance beyond the click/Enter path PR-12 shipped.
+### Review round 1 (CI `e2e`, `97dfb08` → `ba9717b`)
+
+Two of this PR's own assertions failed in CI because they were written against controls they had not read: the
+conflict spec expected the version without the banner's `v` prefix, and the preview spec counted two
+`<strong>`s where Markdown renders one `<strong>` and one `<h1>`. Both were fixed against the components, and
+`editor-pane.test.tsx` now pins the two element counts at component level so a browser-only assertion has a
+local witness.
+
+### Review round 2 (CI `e2e` + reading, `ba9717b`)
+
+Four more, two of them real bugs in the new source rather than in a spec:
+
+- **`e2e/notes.spec.ts` needed its own account.** The naming-rule describe resets the instance once in
+  `beforeAll` and registration is unique on `username`, so a second `signInNewAccount` with the same key is a
+  guaranteed `409` — not retry noise, as an earlier comment on this PR claimed. `ACCOUNT.noteRender` is now
+  scenario 2's second account, with the rule written down in `e2e/fixtures.ts` and AGENTS.
+- **A spec cannot click a CSS-hidden pane.** Moving the preview assertion before the toolbar step left the
+  source hidden, so the later `editor.click()` waited out Playwright's timeout on an invisible textarea. The
+  case now switches back with `mode-write`, asserts `toBeVisible`, and flushes with `Ctrl/Cmd+S` before the
+  reload — which also makes "the text is still there after a reload" a claim about the row rather than about
+  this tab's draft mirror, and keeps the reload from becoming a native leave-site prompt that Playwright
+  dismisses.
+- **`taskList` ticked a box it was only meant to fill in** (`lib/markdown.ts`): in `'add'` mode a line that
+  already had a marker fell through to the checked branch, so `- [ ] a\nplain` became `- [x] a\n- [ ] plain` —
+  silently finishing somebody's item and rewriting their marker. `'add'` now returns the line untouched;
+  `'check'` (every touched line a task item, at least one open) is the mode that ticks. The mixed-selection
+  case, the `*`-marker case and the should-tick case are unit-tested side by side.
+- **"Save as a new note" was blocked by this PR's own guard** (`useAutosave.saveAsNewNote`): it created the row
+  and cleared the draft mirror, but the machine stayed `dirty`, so the navigation into the rescued note opened
+  the `Save / Discard` prompt instead — offering a write to the deleted row and the adoption of its content.
+  `saveAsNewNote` now `adopt`s the created row (`stopped` stays set: that row is gone); `note-editor.test.tsx`
+  drives the whole banner flow and asserts the arrival at the new note, which is also the first route test to
+  exercise a note that dies while it is open — the tree fake grew `PUT /api/notes/:id/content` and
+  `POST /api/notes` for it, so the write path is answered as a server answers it instead of with a `500`.

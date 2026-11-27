@@ -348,6 +348,13 @@ export const taskList: Transform = (rawSelection, text) => {
     // The third press takes the whole task item back to a plain line: leaving `- milk` behind would
     // make this button half of a toggle and the bullet button somebody else's business.
     if (mode === 'remove') return line.slice(found.index).replace(task, '');
+    // A line that already has a box is left exactly as it is when the button is only filling in the
+    // missing ones. `mode === 'add'` means "not every touched line has a box", and a mixed selection is
+    // the ordinary case — a list halfway down, a paste of two lines, a caret on one row of a five-row
+    // list — so ticking the box the person left open would be the button deciding an item is finished.
+    // That is `'check'`'s job, and `'check'` is only ever reached when *every* touched line is a task
+    // item and at least one is still open.
+    if (mode === 'add') return line;
     const after = line.slice(found.index + found[0].length);
     return `- [x] ${after}`;
   });

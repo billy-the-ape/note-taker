@@ -238,6 +238,29 @@ describe('task lists', () => {
     expect(run(taskList, text, { start: 0, end: text.length }).text).toBe('- [x] milk\n- [ ] bread');
   });
 
+  it('fills in the missing box without ticking one that is open', () => {
+    // The other half of the same promise, and the half the case above cannot see: an unchecked box is a
+    // decision that the item is **not** finished, and a person pressing the button to give the pasted line
+    // a box has said nothing about the one they left open. `mode` is `'add'` here (not every touched line
+    // is a task item), and `'add'` adds; ticking is `'check'`, which is only reached when every touched
+    // line already has a box.
+    const text = '- [ ] milk\nbread';
+    expect(run(taskList, text, { start: 0, end: text.length }).text).toBe('- [ ] milk\n- [ ] bread');
+    // The marker a line arrived with is not the button's to normalise either: `*` stays `*`, or a five-line
+    // list written with `+` comes back with one row in `-` and everybody's diff blames the toolbar.
+    expect(run(taskList, '* [ ] milk\nbread', { start: 0, end: '* [ ] milk\nbread'.length }).text).toBe(
+      '* [ ] milk\n- [ ] bread',
+    );
+  });
+
+  it('ticks every box when every touched line is a task item and one is open', () => {
+    // …which is the case that *should* tick, kept beside the one above so the two cannot be confused.
+    const text = '- [ ] milk\n- [x] bread\n- [ ] milk';
+    expect(run(taskList, text, { start: 0, end: text.length }).text).toBe(
+      '- [x] milk\n- [x] bread\n- [x] milk',
+    );
+  });
+
   it('converts a numbered item, so the markers cannot stack', () => {
     const text = '1. milk';
     expect(run(taskList, text, caretAt(text, 3)).text).toBe('- [ ] milk');

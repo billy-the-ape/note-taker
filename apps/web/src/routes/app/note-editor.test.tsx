@@ -242,6 +242,52 @@ describe('leaving with an unsaved buffer', () => {
   });
 });
 
+describe('the note that died while it was open', () => {
+  /**
+   * Delete the row behind the open page, type, and *ask* for the write, so the next request is the `404`
+   * that stops the machine.
+   *
+   * `Control+S` rather than the debounce: PR-14's window is 800 ms, which `waitFor`'s default timeout
+   * clears only on a fast machine, and a test whose subject is "what the machine does with a `404`" has no
+   * business timing a debounce (that is `lib/autosave.test.ts`'s measurement, with fake timers). An
+   * explicit flush is also what a person whose save keeps failing would actually press.
+   */
+  async function loseTheNote(tree: { set(next: TreeResponse): void }): Promise<string> {
+    await waitFor(() => expect(editor().value).toBe(DRAFT_BODY));
+    const typed = `${DRAFT_BODY}a sentence typed after the delete`;
+    tree.set({ folders: fixture().folders, notes: fixture().notes.filter((note) => note.id !== N_DRAFT) });
+    fireEvent.change(editor(), { target: { value: typed } });
+    fireEvent.keyDown(document, { key: 's', ctrlKey: true });
+    await waitFor(() => expect(screen.getByTestId('deleted-note-banner')).toBeTruthy(), { timeout: 4_000 });
+    return typed;
+  }
+
+  it('saves the text somewhere else, and opens the note it made', async () => {
+    const { tree, fake } = await bootNote();
+    const typed = await loseTheNote(tree);
+
+    // The buffer is the whole point of the banner: the row is gone, the text is not, and nothing here
+    // resurrects the dead id.
+    expect(editor().value).toBe(typed);
+    fireEvent.click(screen.getByTestId('deleted-note-save-as-new'));
+
+    // **The arrival**, which is what the pairing in `useAutosave.saveAsNewNote` exists to make possible.
+    // That call used to put the text on the server and leave the machine dirty, and `dirty` is what
+    // `useNavigationGuard` blocks on — so the button that rescued the text answered itself with
+    // "This note has changes that are not saved", offering a Save that `PUT`s to the deleted row and a
+    // Discard that adopts its content. Adopting the created row is what lets this navigation through.
+    await waitFor(() => expect(screen.getByTestId('note-title').textContent).toMatch(/^new-file-\d+\.md$/u));
+    expect(screen.queryByTestId('unsaved-prompt')).toBeNull();
+    // The new row's text, not the dead one's defaults, and the machine is no longer stopped: this page is a
+    // different note now, with a row that exists and can be written to.
+    expect(editor().value).toBe(typed);
+    // The rescue is a *create*, never a write to the dead id: `POST /api/notes` (PR-14's
+    // `createNoteFromBuffer`), and not one `PUT` to the note that is gone.
+    expect(callsTo(fake, '/api/notes').length).toBeGreaterThan(0);
+    expect(callsTo(fake, `/api/notes/${N_DRAFT}/content`)).toHaveLength(1);
+  });
+});
+
 describe('a note the server will not hand over', () => {
   it('says the note is gone, and offers the folder it is not in any more', async () => {
     const initial = fixture();

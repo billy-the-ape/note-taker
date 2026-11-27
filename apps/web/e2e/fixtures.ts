@@ -25,6 +25,12 @@ export const ACCOUNT = {
   renameMove: 'e2e.scenario3.owner',
   typedDelete: 'e2e.scenario4.owner',
   emptyFolderDelete: 'e2e.scenario4b.owner',
+  // The second account inside scenario 2's file. `resetTestInstance()` runs once per describe and
+  // `POST /api/auth/register` is unique on `username`, so **every** test that signs in inside one describe
+  // needs its own name — sharing one is not a stylistic choice but a guaranteed `409 username is already
+  // taken` for whichever test signs in second. The naming case keeps `noteNaming`; the editor case below it
+  // has this one, and the dialog `fixme` will want a third the day something mounts `useNewNoteDialog()`.
+  noteRender: 'e2e.scenario2b.owner',
   autosave: 'e2e.scenario5.owner',
   conflict: 'e2e.scenario6.owner',
   // Not a scenario of its own: the cookie/CSRF test in `auth.spec.ts` needs an account it can sign in as in both

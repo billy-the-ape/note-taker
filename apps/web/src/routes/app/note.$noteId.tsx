@@ -327,6 +327,10 @@ function NoteEditor({
             const created = await autosave.saveAsNewNote();
             // The tree invalidation is PR-14's (`saveAsNewNote` does it); navigating through `openNote` keeps
             // the URL the single source of "which note is open" that `routes/app/route.tsx` just argued for.
+            // What makes this navigation *pass* the guard below is inside `saveAsNewNote` — it adopts the row
+            // it created, so the machine stops being dirty on the way out. Without that pairing the person who
+            // just rescued their text is asked "Save or discard?" about a note that no longer exists; the test
+            // in `note-editor.test.tsx` pins the pairing rather than trusting either half.
             openNote({ id: created.id, name: withMd(created.name) });
           }}
         />

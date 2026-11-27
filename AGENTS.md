@@ -81,8 +81,16 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   puts a trigger on the chrome that spec has no element to click. Deleting a `fixme` is the same edit as
   before: the assertion changes only where the control says PR-19 chose the wrong phrase, and the spec says so
   (PR-13 changed three of them from `toContainText` to `toHaveValue`, because a textarea's text is its
-  `value`); scenario 7 — "DB rows are ciphertext", the DB leg of the MVP proof — may never be skipped or
-  `fixme`'d, and a run where it does not execute is a red build.
+  `value`; and its first round of fixes changed two more to what the control actually renders — the conflict
+  banner's `v`-prefixed version, and one `<h1>` plus one `<strong>` rather than two `<strong>`s, because a
+  heading is not emphasis). **Read the component before deleting the word**: an assertion written against a
+  control you have not read is the same bug as an unrun test. Two harness rules the same round taught:
+  **one account per sign-in inside a `describe`** (`resetTestInstance()` runs once in `beforeAll` and
+  `POST /api/auth/register` is unique on `username`, so a shared `ACCOUNT` key is a guaranteed `409` for
+  whichever test signs in second — the `409` in a CI log is the second test, not the retry), and **a
+  `data-testid` mode switch is an actionability constraint** — `mode-preview` hides the source pane in CSS,
+  so a spec that goes on to click `editor` must switch back and assert `toBeVisible`, or Playwright waits
+  out its 60 s timeout on a hidden textarea.
 - **Scripts that do not exist yet stay that way**: nothing is outstanding — `check:env` arrived with PR-18 and
   `test:e2e` with PR-19, each in the PR that created the files it runs. Adding a script before those exist is a
   plan violation, and so is adding one that cannot go green.
@@ -377,8 +385,20 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `keydown` handler may be added anywhere else for these chords; `Ctrl/Cmd+S` is not bound here (PR-14's document listener is
   the only owner). `useNavigationGuard.ts` blocks *client-side* navigation with `Save / Discard / Stay` and passes
   `enableBeforeUnload: false`, because the unload prompt is PR-14's and two owners of it is two prompts on a tab close.
-  `test/treeApi.ts` now answers `GET /api/notes/:id` (row + `content`, from a body map the tree rows cannot see), so the
-  whole-app web tests can boot at a note URL; `test/match-media.ts` answers the width query too.
+  `test/treeApi.ts` now answers `GET /api/notes/:id` (row + `content`, from a body map the tree rows cannot see),
+  `PUT /api/notes/:id/content` (optimistic lock: `200` with a bumped `version`, `404` for a gone row, `409
+  VERSION_CONFLICT` carrying the row's content/version) and `POST /api/notes` (no name ⇒ generated
+  `new-file-<msepoch>`), so the whole-app web tests can boot at a note URL and drive a *write*;
+  `test/match-media.ts` answers the width query too. Two invariants that only exist across a file boundary, so they are
+  named here once: **`useAutosave.saveAsNewNote` adopts the row it created** (`adopt(created.content,
+  created.version)`) before its caller navigates — the machine that typed the text is `dirty` until something
+  adopts, `dirty` is what PR-13's guard blocks on, and the `404` escape hatch is the one flow where the rescue
+  *is* a navigation, so without the adopt the person who just saved their text is answered with "Save or
+  discard?" over a note that no longer exists (`stopped` is deliberately not cleared: that row is gone and must
+  never be written to again; `note-editor.test.tsx` clicks the banner and asserts the arrival). And
+  **`lib/markdown.ts`'s task-list button only ticks in `'check'` mode** — `'add'` ("not every touched line has a
+  box") leaves an existing box exactly as it is, marker and all, because a half-converted list is a person
+  mid-edit and ticking their open item is the button deciding the work is done.
 
 - **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
   cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`

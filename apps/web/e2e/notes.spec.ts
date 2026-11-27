@@ -102,7 +102,12 @@ test.describe('the naming rule, in the tree', () => {
   test('a heading renders h1 and a bold renders <strong>, the toolbar reaches the buffer, and the text survives a reload', async ({
     page,
   }) => {
-    await signInNewAccount(page, ACCOUNT.noteNaming);
+    // Its **own** account, and the reason is the instance rather than the retry: this describe resets the
+    // instance once in `beforeAll`, `POST /api/auth/register` is unique on `username`, and the naming case
+    // above has already taken `ACCOUNT.noteNaming`. Sharing it is not a style preference the CI log happens
+    // to disagree with — it is a guaranteed `409 username is already taken` for whichever test signs up
+    // second, which is why `ACCOUNT.noteRender` exists.
+    await signInNewAccount(page, ACCOUNT.noteRender);
     await page.goto('/app');
 
     const note = await createNote(page, { name: 'heading', content: 'plain words\n' });
@@ -127,6 +132,16 @@ test.describe('the naming rule, in the tree', () => {
     await expect(preview.locator('h1')).toHaveCount(1);
     await expect(preview.locator('h1')).toHaveText('A heading');
 
+    // Back to a mode that shows the source, before anything touches the textarea. The modes are CSS
+    // (`lib/editorMode.ts`), so `editor` is still mounted and still holds everything typed into it — which
+    // is the point of the design, and exactly what makes this step mandatory rather than cosmetic: a hidden
+    // element never satisfies Playwright's actionability check, so `editor.click()` here would wait for the
+    // 60 s timeout instead of failing, and `inputValue()` on the way in would have read a control nobody can
+    // see. `toBeVisible` is the assertion that the pane came back *and* that the mode switch did not take
+    // the buffer with it.
+    await page.getByTestId('mode-write').click();
+    await expect(editor).toBeVisible();
+
     // The toolbar, second: `toolbar-bold` has to reach the buffer. It is asserted as a value that *changed*
     // rather than as a particular string, because a bare `click()` puts the caret wherever the element's
     // centre happens to fall in a textarea — the transform's exact output for that is `lib/markdown.ts`'s
@@ -135,15 +150,25 @@ test.describe('the naming rule, in the tree', () => {
     await editor.click();
     await page.getByTestId('editor-toolbar').getByTestId('toolbar-bold').click();
     await expect(editor).not.toHaveValue(before);
+    // The transform is an edit, not a replace: what was typed is still in there.
+    expect(await editor.inputValue()).toContain('A heading');
 
-    // `toHaveValue`, three times, and not `toContainText`: a textarea's text is its `value`, not a text
-    // node, so "the text is still there" has one honest form for a control (the same reason
-    // `autosave.spec.ts` reads the editor with `toHaveValue` everywhere). The reload is the interesting
-    // one of the three — it can land before the 800 ms debounce has written, in which case what puts
-    // 'A heading' back on screen is PR-14's `localStorage` mirror, and either way the person's text is
-    // there, which is the promise §5 makes about the buffer and not about the network.
+    // `toHaveValue`, and not `toContainText`: a textarea's text is its `value`, not a text node, so "the
+    // text is still there" has one honest form for a control (the same reason `autosave.spec.ts` reads the
+    // editor with `toHaveValue` everywhere).
     await expect(editor).toHaveValue(/\*\*bold\*\*/u);
+
+    // `Ctrl/Cmd+S` first (PR-14's explicit flush, §6), and the pill saying *Saved* is what the wait is for.
+    // Two reasons it is in the test rather than left to the debounce: "the text is still there after a
+    // reload" is then a claim about the **row** instead of about this tab's `localStorage` mirror — the
+    // version that passes for the wrong reason is the one that reads a draft back to itself — and a
+    // still-dirty buffer arms PR-14's `beforeunload` guard, which would turn the reload into a native
+    // leave-site prompt that Playwright dismisses, i.e. a reload that never happens.
+    await page.keyboard.press('Control+s');
+    await expect(page.getByTestId('save-status')).toContainText(/Saved/u);
+
     await page.reload();
+    await expect(editor).toBeVisible();
     await expect(editor).toHaveValue(/A heading/u);
     await expect(editor).toHaveValue(/\*\*bold\*\*/u);
   });

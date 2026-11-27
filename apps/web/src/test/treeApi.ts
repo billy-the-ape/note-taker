@@ -135,6 +135,24 @@ function idOf(path: string, prefix: string): string | undefined {
   return id.length > 0 && !id.includes('/') ? id : undefined;
 }
 
+/** The note a `PUT /api/notes/:id/content` names — `idOf` cannot answer it, it refuses a two-segment path. */
+function contentIdOf(path: string): string | undefined {
+  const found = /^\/api\/notes\/([^/]+)\/content$/u.exec(path);
+  return found?.[1];
+}
+
+/**
+ * The metadata a write re-derives from the new plaintext, exactly as PR-10's service does: `contentBytes`
+ * is UTF-8 bytes (not characters — the counter in the editor and the cap in the contract both count bytes),
+ * and `wordCount` is whitespace-separated words.
+ */
+function sizeOf(content: string): { readonly contentBytes: number; readonly wordCount: number } {
+  return {
+    contentBytes: new TextEncoder().encode(content).length,
+    wordCount: content.split(/\s+/u).filter((word) => word.length > 0).length,
+  };
+}
+
 const noCascade = (): Reply => ({
   status: 409,
   body: errorBody('CONFLICT', 'that folder is not empty', { requestId: requestId() }),
@@ -257,6 +275,35 @@ export function makeTreeServer(
         return { status: 201, body: folder };
       }
 
+      case 'POST /api/notes': {
+        // PR-14's escape hatch (`createNoteFromBuffer`) and PR-15's dialog both land here: `{content,
+        // folderId}`, no name. §9.2 #16 is the rule that makes this route worth modelling rather than
+        // stubbing: a name the client did not type is the server's to invent, `new-file-<msepoch>`, and it
+        // is the one name that may be re-picked on a clash instead of answered `409`. The epoch plus this
+        // fake's monotone id counter is what keeps two creates in the same millisecond apart — a fake that
+        // answered `409` there would be testing the retry budget of a route that has one only by accident.
+        const body = (request.body ?? {}) as { name?: string; content?: string; folderId?: string | null };
+        const folderId = body.folderId ?? null;
+        if (folderId !== null && !folders.some((folder) => folder.id === folderId)) return notFound('folder');
+        const name = body.name ?? `new-file-${Date.now() + issued}`;
+        const taken = notes.find(
+          (note) => siblingKey(note.folderId, note.name) === siblingKey(folderId, name),
+        );
+        if (body.name !== undefined && taken !== undefined)
+          return clash('a sibling already has that name', taken.id);
+        const content = body.content ?? DEFAULT_NOTE_CONTENT;
+        const note: NoteNode = {
+          ...noteNode(newId('note'), name, folderId),
+          ...sizeOf(content),
+          contentUpdatedAt: T1,
+        };
+        notes = [...notes, note];
+        bodies.set(note.id, content);
+        // `NoteWithContent`, not a tree row: the caller adopts this row as its new baseline, and a response
+        // without `content` would send PR-14's `adopt` off with an empty buffer.
+        return { status: 201, body: { ...note, content } };
+      }
+
       default:
         break;
     }
@@ -314,6 +361,40 @@ export function makeTreeServer(
       folders = folders.filter((candidate) => !gone.has(candidate.id));
       notes = notes.filter((candidate) => candidate.folderId === null || !gone.has(candidate.folderId));
       return { status: 204 };
+    }
+
+    // The autosave write. Modelled rather than left to the `no stub` answer at the bottom, because PR-13's
+    // route does the one thing a stub cannot fake: it reacts to the *difference* between `200`, `404` and
+    // `409 VERSION_CONFLICT` — `deleted` stops the machine, a conflict opens a banner, a success adopts a
+    // version. A fake that answered `500` to everything would let the route pass while the machine under it
+    // had never been asked to do any of that.
+    if (request.method === 'PUT' && contentIdOf(request.path) !== undefined) {
+      const id = contentIdOf(request.path) as string;
+      const note = notes.find((candidate) => candidate.id === id);
+      if (note === undefined) return notFound('note');
+      const body = (request.body ?? {}) as { content?: string; baseVersion?: number };
+      const content = body.content ?? '';
+      // PR-10's optimistic lock, in the same shape the contract gives it: the loser gets the row's current
+      // content and version, which is the input PR-14's comparison needs.
+      if (body.baseVersion !== note.version) {
+        return {
+          status: 409,
+          body: errorBody('VERSION_CONFLICT', 'someone saved this note first', {
+            data: { content: bodies.get(id) ?? DEFAULT_NOTE_CONTENT, version: note.version },
+            requestId: requestId(),
+          }),
+        };
+      }
+      const updated: NoteNode = {
+        ...note,
+        version: note.version + 1,
+        ...sizeOf(content),
+        contentUpdatedAt: T1,
+        updatedAt: T1,
+      };
+      notes = notes.map((candidate) => (candidate.id === id ? updated : candidate));
+      bodies.set(id, content);
+      return { status: 200, body: { ...updated, content } };
     }
 
     if (request.method === 'PATCH' && noteId !== undefined) {

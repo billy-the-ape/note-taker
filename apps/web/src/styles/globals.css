@@ -130,3 +130,145 @@
     -webkit-font-smoothing: antialiased;
   }
 }
+
+/*
+ * The Markdown preview (docs/plans/mvp/MVP-13.md §5).
+ *
+ * This is CSS rather than utility classes for one reason: the elements being styled are created by
+ * `react-markdown`, and a class cannot be put on a `<th>` that a library builds from a string. Tailwind's
+ * preflight has already removed every one of these elements' browser defaults — table borders, list markers,
+ * the blockquote's indent, the heading's size — so a preview without this block is a wall of equal-sized
+ * text, and "the table renders" (§6) would be true in the DOM and invisible on screen.
+ *
+ * Everything here is descendant-scoped to `.markdown-preview`, because these are the only rules in the
+ * stylesheet that style bare element names: the app's own markup is classed, and `h1` inside the preview is a
+ * note's heading rather than the page's, which is also why the sizes are relative to the container.
+ */
+.markdown-preview {
+  overflow-wrap: anywhere;
+}
+
+.markdown-preview > :first-child {
+  margin-top: 0;
+}
+
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4 {
+  margin: 1.25rem 0 0.5rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--color-ink);
+}
+
+.markdown-preview h1 {
+  font-size: 1.35em;
+}
+
+.markdown-preview h2 {
+  font-size: 1.2em;
+}
+
+.markdown-preview h3,
+.markdown-preview h4 {
+  font-size: 1.05em;
+}
+
+.markdown-preview p,
+.markdown-preview ul,
+.markdown-preview ol,
+.markdown-preview blockquote,
+.markdown-preview pre,
+.markdown-preview table {
+  margin: 0 0 0.75rem;
+}
+
+.markdown-preview ul,
+.markdown-preview ol {
+  padding-left: 1.4rem;
+}
+
+.markdown-preview ul {
+  list-style: disc;
+}
+
+.markdown-preview ol {
+  list-style: decimal;
+}
+
+/* `remark-gfm` marks a task-list item up with a class, and the checkbox has to sit on the line it belongs
+   to — hence `none` for the marker and a small offset for the input. */
+.markdown-preview li.task-list-item {
+  list-style: none;
+  margin-left: -1.1rem;
+}
+
+.markdown-preview li.task-list-item input[type="checkbox"] {
+  margin-right: 0.4rem;
+  vertical-align: middle;
+}
+
+.markdown-preview blockquote {
+  border-left: 2px solid var(--color-line);
+  padding-left: 0.75rem;
+  color: var(--color-ink-muted);
+}
+
+.markdown-preview code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background-color: var(--color-paper-2);
+  border: 1px solid var(--color-line);
+  border-radius: 3px;
+  padding: 0.05em 0.3em;
+}
+
+.markdown-preview pre {
+  background-color: var(--color-paper-2);
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+}
+
+.markdown-preview pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.85em;
+}
+
+.markdown-preview table {
+  width: auto;
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdown-preview th,
+.markdown-preview td {
+  border: 1px solid var(--color-line);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}
+
+.markdown-preview th {
+  background-color: var(--color-paper-2);
+  font-weight: 600;
+}
+
+.markdown-preview hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 1rem 0;
+}
+
+.markdown-preview img {
+  height: auto;
+}
+
+.markdown-preview del {
+  color: var(--color-ink-muted);
+}

@@ -75,10 +75,22 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   because pnpm does not expose one workspace's dependencies to another and the assertion must not drift onto a
   second driver — is read-only down to `SET TRANSACTION READ ONLY`, so nothing that reads a row can write one.
   A scenario that has no element to happen to is `test.fixme` with the missing file named in its title, never a
-  passing test that asserts nothing and never a deletion: today those are the editor scenarios (`routes/app/note/$noteId.tsx`,
-  PR-13) and the new-note dialog's own fields (`useNewNoteDialog()` is merged but mounted by nobody). Deleting a
-  `fixme` is how PR-13 finishes its own acceptance; scenario 7 — "DB rows are ciphertext", the DB leg of the MVP
-  proof — may never be skipped or `fixme`'d, and a run where it does not execute is a red build.
+  passing test that asserts nothing and never a deletion. PR-13 deleted its own (`notes.spec.ts`'s
+  heading/toolbar/preview case and both `autosave.spec.ts` cases), so **the only `fixme` left in the suite is
+  the new-note dialog's own fields** — `useNewNoteDialog()` is merged and mounted by nothing, and until a PR
+  puts a trigger on the chrome that spec has no element to click. Deleting a `fixme` is the same edit as
+  before: the assertion changes only where the control says PR-19 chose the wrong phrase, and the spec says so
+  (PR-13 changed three of them from `toContainText` to `toHaveValue`, because a textarea's text is its
+  `value`; and its first round of fixes changed two more to what the control actually renders — the conflict
+  banner's `v`-prefixed version, and one `<h1>` plus one `<strong>` rather than two `<strong>`s, because a
+  heading is not emphasis). **Read the component before deleting the word**: an assertion written against a
+  control you have not read is the same bug as an unrun test. Two harness rules the same round taught:
+  **one account per sign-in inside a `describe`** (`resetTestInstance()` runs once in `beforeAll` and
+  `POST /api/auth/register` is unique on `username`, so a shared `ACCOUNT` key is a guaranteed `409` for
+  whichever test signs in second — the `409` in a CI log is the second test, not the retry), and **a
+  `data-testid` mode switch is an actionability constraint** — `mode-preview` hides the source pane in CSS,
+  so a spec that goes on to click `editor` must switch back and assert `toBeVisible`, or Playwright waits
+  out its 60 s timeout on a hidden textarea.
 - **Scripts that do not exist yet stay that way**: nothing is outstanding — `check:env` arrived with PR-18 and
   `test:e2e` with PR-19, each in the PR that created the files it runs. Adding a script before those exist is a
   plan violation, and so is adding one that cannot go green.
@@ -302,7 +314,7 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   `// @vitest-environment jsdom` on line 1; `@testing-library/jest-dom` is deliberately **not** a dependency —
   assert on `textContent`/`getAttribute`/`.value`. Server state is TanStack Query, routing is the router, and
   `src/lib/uiStore.ts` is the tiny persisted-UI box (`nt.`-prefixed `localStorage`); there is no global client
-  store, and PR-12 added its keys there (`theme`, `sidebarCollapsed`, `treeCollapsed` — the last a **sparse**
+  store, and PR-12 added its keys there (`theme`, `sidebarCollapsed`, `treeCollapsed`, `editorMode` — the third a **sparse**
   `Set<folderId>` where a collapsed folder is a member and the root is always expanded, so a new folder is open
   and no empty folder costs a stored id) rather than inventing a fifth.
 - **Autosave is one pure machine, and its in-flight snapshot is the contract** (PR-14): `apps/web/src/lib/autosave.ts`
@@ -348,6 +360,47 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   the prompt does not lock the editor, so by the time either acts the mirror may hold a newer paragraph than the one
   being discarded or saved, and clearing it unconditionally would delete a crash fallback nobody has saved. `SaveStatus`/`ConflictBanner`/`DraftPrompt` in `components/editor` are allowed to say
   only what the machine knows: never `Saved` for a buffer that could not be flushed, and never a silent overwrite.
+- **The editor is a textarea, the preview is a sanitiser, and the mode is CSS** (PR-13):
+  `apps/web/src/routes/app/note/$noteId.tsx` is the page PR-12's placeholder index was waiting for, and it owns the wiring
+  order rather than the behaviour — `useAutosave` per note id (`key={noteId}`), the buffer from `snapshot.buffer` and nothing
+  else, the note's *facts* (`app-note-facts`) from whichever of `['note', id]` and `['tree', userId]` has the newer
+  `updatedAt` (a rename bumps the tree row and never touches the note's `version`, which is the whole reason the header reads
+  the tree cache: `note-title` is a **heading**, not a field — the tree owns rename and a second input writing that row is
+  AGENTS' one-renderer bug). `components/editor/MarkdownEditor.tsx` is a `<textarea>`, deliberately: §5 named CodeMirror, and
+  PR-14's contract (the buffer is one string owned by the machine; `blur`/`visibilitychange`/`pagehide` own the flush; PR-19's
+  specs read the control with `toHaveValue`) is a contract about a *text control*, so a 60 KB editor library would have been
+  bought to re-wrap the field that already worked — `lib/markdown.ts` is pure, transform-per-`data-testid`, surrogate-safe, and
+  unit-tested (15 toolbar items — `toolbar-h1/h2/h3` are three buttons over one `heading(level)` factory — and 3 chords),
+  and the DOM half is one `applyToElement` that writes through `execCommand` where
+  the browser has one and through the **prototype's** `value` setter where it does not (React's own value tracker swallows a
+  plain `element.value = x` + `input` pair, which would repaint the pane and never dirty the note).
+  `PreviewPane.tsx` is `react-markdown` + `remark-gfm` + `rehype-sanitize` with **no `rehype-raw`, ever** — raw HTML in a note
+  is not markup, `<script>`/`on*`/`javascript:` never reach a node, and the two `components` overrides name the attributes they
+  set (`rel="noopener noreferrer"`) instead of spreading props, because they run *after* the sanitiser. Modes are
+  `lib/editorMode.ts` (`split|write|preview`, persisted in `uiStore`, default from `matchMedia('(min-width: 1024px)')`) applied
+  as `hidden` on both panes — **never a conditional mount**, which is what keeps the caret, the browser undo stack and the
+  scroll-sync pair alive across a switch; the byte counter is `lib/note-size.ts` reading the contract's own caps (900 KiB warns,
+  1 MiB is the server's), so no fixture near a megabyte is needed and the one DOM test that uses a real one is skipped under
+  `VITEST_COVERAGE=1` like PR-12's absolute timing number. `Ctrl/Cmd+B/I/K` are bound **on the textarea only**, with
+  `stopPropagation()` — that single call is PR-17's precedence rule (the editor wins `Ctrl/Cmd+K` while it has focus) and no
+  `keydown` handler may be added anywhere else for these chords; `Ctrl/Cmd+S` is not bound here (PR-14's document listener is
+  the only owner). `useNavigationGuard.ts` blocks *client-side* navigation with `Save / Discard / Stay` and passes
+  `enableBeforeUnload: false`, because the unload prompt is PR-14's and two owners of it is two prompts on a tab close.
+  `test/treeApi.ts` now answers `GET /api/notes/:id` (row + `content`, from a body map the tree rows cannot see),
+  `PUT /api/notes/:id/content` (optimistic lock: `200` with a bumped `version`, `404` for a gone row, `409
+  VERSION_CONFLICT` carrying the row's content/version) and `POST /api/notes` (no name ⇒ generated
+  `new-file-<msepoch>`), so the whole-app web tests can boot at a note URL and drive a *write*;
+  `test/match-media.ts` answers the width query too. Two invariants that only exist across a file boundary, so they are
+  named here once: **`useAutosave.saveAsNewNote` adopts the row it created** (`adopt(created.content,
+  created.version)`) before its caller navigates — the machine that typed the text is `dirty` until something
+  adopts, `dirty` is what PR-13's guard blocks on, and the `404` escape hatch is the one flow where the rescue
+  *is* a navigation, so without the adopt the person who just saved their text is answered with "Save or
+  discard?" over a note that no longer exists (`stopped` is deliberately not cleared: that row is gone and must
+  never be written to again; `note-editor.test.tsx` clicks the banner and asserts the arrival). And
+  **`lib/markdown.ts`'s task-list button only ticks in `'check'` mode** — `'add'` ("not every touched line has a
+  box") leaves an existing box exactly as it is, marker and all, because a half-converted list is a person
+  mid-edit and ticking their open item is the button deciding the work is done.
+
 - **A note name is only ever as long as `lib/name.ts`** (PR-15): every name rule — the character set, the 120-char
   cap, `stripMd`/`withMd`, `uniquify`, the `new-file-<msepoch>.md` format — stays in `@note-taker/contracts`
   `names.ts`, and `apps/web/src/lib/name.ts` is the app's single import site for them (it re-exports the contract API

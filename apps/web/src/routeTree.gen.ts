@@ -16,6 +16,7 @@ import { Route as AuthSetupRouteImport } from './routes/_auth/setup'
 import { Route as AuthSignupRouteImport } from './routes/_auth/signup'
 import { Route as AppIndexRouteImport } from './routes/app/index'
 import { Route as AppSettingsRouteImport } from './routes/app/settings'
+import { Route as AppNoteNoteIdRouteImport } from './routes/app/note.$noteId'
 
 const AuthRoute = AuthRouteImport.update({
   id: '/_auth',
@@ -51,6 +52,11 @@ const AppSettingsRoute = AppSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => AppRouteRoute,
 } as any)
+const AppNoteNoteIdRoute = AppNoteNoteIdRouteImport.update({
+  id: '/note/$noteId',
+  path: '/note/$noteId',
+  getParentRoute: () => AppRouteRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/app': typeof AppRouteRouteWithChildren
@@ -60,6 +66,7 @@ export interface FileRoutesByFullPath {
   '/signup': typeof AuthSignupRoute
   '/app/settings': typeof AppSettingsRoute
   '/app/': typeof AppIndexRoute
+  '/app/note/$noteId': typeof AppNoteNoteIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof AuthRouteWithChildren
@@ -68,6 +75,7 @@ export interface FileRoutesByTo {
   '/signup': typeof AuthSignupRoute
   '/app/settings': typeof AppSettingsRoute
   '/app': typeof AppIndexRoute
+  '/app/note/$noteId': typeof AppNoteNoteIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -78,13 +86,28 @@ export interface FileRoutesById {
   '/_auth/signup': typeof AuthSignupRoute
   '/app/settings': typeof AppSettingsRoute
   '/app/': typeof AppIndexRoute
+  '/app/note/$noteId': typeof AppNoteNoteIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/app' | '/' | '/login' | '/setup' | '/signup' | '/app/settings' | '/app/'
+    | '/app'
+    | '/'
+    | '/login'
+    | '/setup'
+    | '/signup'
+    | '/app/settings'
+    | '/app/'
+    | '/app/note/$noteId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/login' | '/setup' | '/signup' | '/app/settings' | '/app'
+  to:
+    | '/'
+    | '/login'
+    | '/setup'
+    | '/signup'
+    | '/app/settings'
+    | '/app'
+    | '/app/note/$noteId'
   id:
     | '__root__'
     | '/app'
@@ -94,6 +117,7 @@ export interface FileRouteTypes {
     | '/_auth/signup'
     | '/app/settings'
     | '/app/'
+    | '/app/note/$noteId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -152,17 +176,26 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsRouteImport
       parentRoute: typeof AppRouteRoute
     }
+    '/app/note/$noteId': {
+      id: '/app/note/$noteId'
+      path: '/note/$noteId'
+      fullPath: '/app/note/$noteId'
+      preLoaderRoute: typeof AppNoteNoteIdRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
   }
 }
 
 interface AppRouteRouteChildren {
   AppSettingsRoute: typeof AppSettingsRoute
   AppIndexRoute: typeof AppIndexRoute
+  AppNoteNoteIdRoute: typeof AppNoteNoteIdRoute
 }
 
 const AppRouteRouteChildren: AppRouteRouteChildren = {
   AppSettingsRoute: AppSettingsRoute,
   AppIndexRoute: AppIndexRoute,
+  AppNoteNoteIdRoute: AppNoteNoteIdRoute,
 }
 
 const AppRouteRouteWithChildren = AppRouteRoute._addFileChildren(

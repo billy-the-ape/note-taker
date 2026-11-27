@@ -260,6 +260,19 @@ export function useAutosave(options: UseAutosaveOptions): UseAutosaveResult {
     // still holds exactly the text that got saved (§6's rule for this key).
     clearDraftIf(id, saved);
     syncSavedNote(client, created.id, created);
+    // The text is on the server now, so this machine may not keep calling it unsaved. `dirty()` is
+    // `buffer !== savedContent` (`lib/autosave.ts`), and a machine left dirty after the insert that just
+    // took that buffer does two: the editor's own row says "changes that are not saved" about text that
+    // is saved (and arms PR-14's `beforeunload` guard over it), and — because PR-13's editor guards a
+    // dirty subtree (`routes/app/note/$noteId.tsx`) — the navigation to the note that was just created is
+    // answered by the Save/Discard prompt instead of by the note, where "Save" writes to the dead row and
+    // "Discard" adopts its content. `adopt` is the primitive for a write this machine should treat as its
+    // own (§docstring): buffer, version and clean state now describe the row that exists. `stopped` stays
+    // set, correctly — the row this machine was writing to is gone and it must never write to it again,
+    // which is why no `404`-doomed flush is waiting here either. A keystroke landing inside the `POST` is
+    // text the new row will not have, exactly as captured above, and the mirror under the dead id keeps it
+    // (§6's rule, unchanged).
+    machine.adopt(created.content, created.version);
     // A new row belongs in the sidebar, so this invalidation is a real refetch and not a `refetchType:
     // 'none'` marking.
     await client.invalidateQueries({ queryKey: TREE_KEY_PREFIX });

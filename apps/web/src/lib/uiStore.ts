@@ -20,7 +20,7 @@
 export const UI_STORAGE_PREFIX = 'nt.';
 
 /** The names this store knows about. PR-12/13 add to this union; nothing else names a key ad hoc. */
-export type UiKey = 'theme' | 'sidebarCollapsed' | 'treeCollapsed';
+export type UiKey = 'theme' | 'sidebarCollapsed' | 'treeCollapsed' | 'editorMode';
 
 /** The storage key a name lands on: `theme` is `nt.theme`. */
 export function uiStorageKey(key: UiKey): string {
@@ -46,9 +46,11 @@ function storage(): Storage | undefined {
  * every default, because a default is a fact about the feature: PR-12's sidebar collapse and its collapsed
  * folder ids both belong to the components that draw them, not to this file.
  *
- * Note the union is three names wide as of PR-12 and this function still knows nothing about any of them.
- * `treeCollapsed`'s value is a comma-joined list of ids (see `features/tree/tree.expansion.ts`) and
- * `sidebarCollapsed`'s is the word `true`: encoding is the feature's business, storage is the store's.
+ * Note the union is four names wide as of PR-13 and this function still knows nothing about any of them.
+ * `treeCollapsed`'s value is a comma-joined list of ids (see `features/tree/tree.expansion.ts`),
+ * `sidebarCollapsed`'s is the word `true`, and `editorMode`'s is one of `split`/`write`/`preview`
+ * (`lib/editorMode.ts` owns both the vocabulary and the viewport default): encoding is the feature's
+ * business, storage is the store's.
  */
 export function readUi(key: UiKey, fallback: string): string {
   const store = storage();

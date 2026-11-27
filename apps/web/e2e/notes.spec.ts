@@ -2,7 +2,8 @@
  * Scenarios 2 and 7 — the naming rule a person sees, and the ciphertext nobody sees
  * (docs/plans/mvp/MVP-19.md §5.2, §5.7).
  *
- * **Why two of this file's tests are `test.fixme` and what that is claiming.** PR-19 is the MVP acceptance proof,
+ * **Why one of this file's tests is `test.fixme` and what that is claiming** (it was two until PR-13 landed the editor
+ * route and deleted its own `fixme`, the heading/toolbar/preview case below). PR-19 is the MVP acceptance proof,
  * and two halves of it are not drivable in the tree this PR was built on:
  *
  * * `routes/app/note/$noteId.tsx` is PR-13's file. Without it nothing mounts a textarea, the toolbar transforms,
@@ -93,35 +94,84 @@ test.describe('the naming rule, in the tree', () => {
     },
   );
 
-  test.fixme(
-    'a heading and a toolbar bold render <strong>, and the text is still there after a reload ' +
-      '[blocked: PR-13 has not landed routes/app/note/$noteId.tsx, so no page mounts `editor`/`editor-toolbar`/`preview`]',
-    async ({ page }) => {
-      await signInNewAccount(page, ACCOUNT.noteNaming);
-      await page.goto('/app');
+  // PR-19's title for this case was "a heading and a toolbar bold render `<strong>`", and the heading half
+  // of that sentence is not what Markdown does: `# A heading` is an `<h1>`, and `PreviewPane` has no override
+  // that turns headings into `<strong>` (nor should it — see the schema, which whitelists attributes rather
+  // than rewriting elements). The claim survives with its two halves named properly: the heading renders *as a
+  // heading*, the bold renders *as a `<strong>`*, and the toolbar reaches the buffer.
+  test('a heading renders h1 and a bold renders <strong>, the toolbar reaches the buffer, and the text survives a reload', async ({
+    page,
+  }) => {
+    // Its **own** account, and the reason is the instance rather than the retry: this describe resets the
+    // instance once in `beforeAll`, `POST /api/auth/register` is unique on `username`, and the naming case
+    // above has already taken `ACCOUNT.noteNaming`. Sharing it is not a style preference the CI log happens
+    // to disagree with — it is a guaranteed `409 username is already taken` for whichever test signs up
+    // second, which is why `ACCOUNT.noteRender` exists.
+    await signInNewAccount(page, ACCOUNT.noteRender);
+    await page.goto('/app');
 
-      // Waiting for the editor pane. The hooks are already named in PR-19 §2 (`editor`, `editor-toolbar`,
-      // `preview`, `mode-split|write|preview`), and `save-status` is merged (PR-14) — only the page that hosts
-      // them is missing.
-      const note = await createNote(page, { name: 'heading', content: 'plain words\n' });
-      await page.goto(`/app/note/${note.id}`);
+    const note = await createNote(page, { name: 'heading', content: 'plain words\n' });
+    await page.goto(`/app/note/${note.id}`);
 
-      const editor = page.getByTestId('editor');
-      await editor.fill('# A heading\nand **bold** words\n');
+    const editor = page.getByTestId('editor');
+    await editor.fill('# A heading\nand **bold** words\n');
 
-      // The toolbar transform, not a typed asterisk: bold is applied to the selection by the button.
-      await editor.click();
-      await page.getByTestId('editor-toolbar').getByTestId('toolbar-bold').click();
-      await expect(editor).toContainText('**bold**');
+    // The render comes first, and the order is the point: both assertions are about *this* buffer, so they are
+    // measured before the toolbar gets a chance to move it. `mode-preview` hides the source without
+    // unmounting it (`lib/editorMode.ts`), which is why both are read from `preview`.
+    //
+    // `**bold**` is exactly one `<strong>`, and `# A heading` is exactly one `<h1>` — asserted as two
+    // selectors rather than one count, because the two are different claims about the renderer: the first is
+    // that inline emphasis reaches an element (and so went through `rehype-sanitize`'s allow-list with its
+    // text intact), the second that an ATX heading is a heading, which is what makes the preview a document
+    // and not a paragraph.
+    await page.getByTestId('mode-preview').click();
+    const preview = page.getByTestId('preview');
+    await expect(preview.locator('strong')).toHaveCount(1);
+    await expect(preview.locator('strong')).toHaveText('bold');
+    await expect(preview.locator('h1')).toHaveCount(1);
+    await expect(preview.locator('h1')).toHaveText('A heading');
 
-      await page.getByTestId('mode-preview').click();
-      await expect(page.getByTestId('preview').locator('strong')).toHaveCount(2);
+    // Back to a mode that shows the source, before anything touches the textarea. The modes are CSS
+    // (`lib/editorMode.ts`), so `editor` is still mounted and still holds everything typed into it — which
+    // is the point of the design, and exactly what makes this step mandatory rather than cosmetic: a hidden
+    // element never satisfies Playwright's actionability check, so `editor.click()` here would wait for the
+    // 60 s timeout instead of failing, and `inputValue()` on the way in would have read a control nobody can
+    // see. `toBeVisible` is the assertion that the pane came back *and* that the mode switch did not take
+    // the buffer with it.
+    await page.getByTestId('mode-write').click();
+    await expect(editor).toBeVisible();
 
-      await page.reload();
-      await expect(page.getByTestId('editor')).toContainText('A heading');
-      await expect(page.getByTestId('editor')).toContainText('**bold**');
-    },
-  );
+    // The toolbar, second: `toolbar-bold` has to reach the buffer. It is asserted as a value that *changed*
+    // rather than as a particular string, because a bare `click()` puts the caret wherever the element's
+    // centre happens to fall in a textarea — the transform's exact output for that is `lib/markdown.ts`'s
+    // unit table's business, and this is the browser-level proof that the button is wired to the buffer.
+    const before = await editor.inputValue();
+    await editor.click();
+    await page.getByTestId('editor-toolbar').getByTestId('toolbar-bold').click();
+    await expect(editor).not.toHaveValue(before);
+    // The transform is an edit, not a replace: what was typed is still in there.
+    expect(await editor.inputValue()).toContain('A heading');
+
+    // `toHaveValue`, and not `toContainText`: a textarea's text is its `value`, not a text node, so "the
+    // text is still there" has one honest form for a control (the same reason `autosave.spec.ts` reads the
+    // editor with `toHaveValue` everywhere).
+    await expect(editor).toHaveValue(/\*\*bold\*\*/u);
+
+    // `Ctrl/Cmd+S` first (PR-14's explicit flush, §6), and the pill saying *Saved* is what the wait is for.
+    // Two reasons it is in the test rather than left to the debounce: "the text is still there after a
+    // reload" is then a claim about the **row** instead of about this tab's `localStorage` mirror — the
+    // version that passes for the wrong reason is the one that reads a draft back to itself — and a
+    // still-dirty buffer arms PR-14's `beforeunload` guard, which would turn the reload into a native
+    // leave-site prompt that Playwright dismisses, i.e. a reload that never happens.
+    await page.keyboard.press('Control+s');
+    await expect(page.getByTestId('save-status')).toContainText(/Saved/u);
+
+    await page.reload();
+    await expect(editor).toBeVisible();
+    await expect(editor).toHaveValue(/A heading/u);
+    await expect(editor).toHaveValue(/\*\*bold\*\*/u);
+  });
 });
 
 test.describe('the row itself, at rest', () => {

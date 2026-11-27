@@ -127,3 +127,138 @@ split|write|preview modes, sanitize via rehype-sanitize, byte counter + 900 KiB 
   undo integrity, mode persistence
 - screenshot/GIF: toolbar + live preview in split mode
 ```
+
+---
+
+## 9. What PR-13 actually shipped, where it differed from this brief
+
+Implemented on `feat/pr-13-editor`. Four decisions moved during implementation; each is a plan change, so it is
+recorded here rather than only in code comments.
+
+1. **No CodeMirror: the buffer is a `<textarea>`.** §5/§4 named CodeMirror as the editor and this brief's own risk
+   section said "if the spike fails, ship a `<textarea>`". The spike was not a bundle-size question but a contract
+   question: PR-14's autosave owns the buffer and its flush triggers (`blur`, `visibilitychange`, `pagehide`,
+   `beforeunload`, `Ctrl/Cmd+S`), PR-14's spec suite asserts the buffer with plain DOM values, and PR-19 wrote its
+   e2e assertions as `page.getByTestId('editor').fill(...)`/`toHaveValue(...)` — all of which are textarea
+   semantics. A textarea with no third-party editor library keeps every one of those true and adds nothing to
+   install; `MarkdownEditor.tsx` is ~180 lines and `lib/markdown.ts` is pure. If a later PR wants syntax colouring
+   or a per-token decoration, this is the file it will replace and the transforms will not move.
+2. **`note-title` is a heading, not a field.** §5 called it "an editable title field" while §4/PR-12 give rename to
+   the tree, and AGENTS' one-renderer rule names two inputs writing one row as the bug. The acceptance criterion —
+   "`note-title` shows the renamed note in the tree **without a reload**" — is satisfied by reading the name from
+   `['tree', userId]` (invalidated by rename), which is what the heading does.
+3. **PR-12's note summary moved here, with its test ids.** `routes/app/index.tsx`'s own header predicted this
+   ("when PR-13 adds `routes/app/note.$noteId.tsx`, this page keeps the recent list and loses the summary").
+   `openNote` is a navigation now, `openedNote` is derived from the location, and `app-note-summary` /
+   `app-note-location` / `app-note-facts` / `app-note-close` render on the note page, so `folders.spec.ts` and
+   `notes.spec.ts` keep their meaning. `app-note-location` deliberately stays the id PR-12 pinned rather than
+   growing a second breadcrumb under §5's `note-location`; PR-17 wants `breadcrumbFor()`, which is exported.
+4. **Three e2e assertions became `toHaveValue`.** `toContainText` reads text nodes and a textarea's text is its
+   `value`; PR-19 wrote them before the control existed. `preview`'s `<strong>` count is asserted **before** the
+   toolbar click, because a bare `click()` inside a textarea puts the caret at a coordinate rather than on a
+   selection, and "the button reached the buffer" is honestly a changed value.
+
+Not done, deliberately: `byte-counter`/`editor` have no e2e case of their own yet (the unit tests cover the
+thresholds and the DOM test covers the line; §6's 900 KiB fixture stays out of the browser), and the note editor
+has no keyboard-only "focus the buffer" affordance beyond the click/Enter path PR-12 shipped.
+### Review round 1 (CI `e2e`, `97dfb08` → `ba9717b`)
+
+Two of this PR's own assertions failed in CI because they were written against controls they had not read: the
+conflict spec expected the version without the banner's `v` prefix, and the preview spec counted two
+`<strong>`s where Markdown renders one `<strong>` and one `<h1>`. Both were fixed against the components, and
+`editor-pane.test.tsx` now pins the two element counts at component level so a browser-only assertion has a
+local witness.
+
+### Review round 2 (CI `e2e` + reading, `ba9717b`)
+
+Four more, two of them real bugs in the new source rather than in a spec:
+
+- **`e2e/notes.spec.ts` needed its own account.** The naming-rule describe resets the instance once in
+  `beforeAll` and registration is unique on `username`, so a second `signInNewAccount` with the same key is a
+  guaranteed `409` — not retry noise, as an earlier comment on this PR claimed. `ACCOUNT.noteRender` is now
+  scenario 2's second account, with the rule written down in `e2e/fixtures.ts` and AGENTS.
+- **A spec cannot click a CSS-hidden pane.** Moving the preview assertion before the toolbar step left the
+  source hidden, so the later `editor.click()` waited out Playwright's timeout on an invisible textarea. The
+  case now switches back with `mode-write`, asserts `toBeVisible`, and flushes with `Ctrl/Cmd+S` before the
+  reload — which also makes "the text is still there after a reload" a claim about the row rather than about
+  this tab's draft mirror, and keeps the reload from becoming a native leave-site prompt that Playwright
+  dismisses.
+- **`taskList` ticked a box it was only meant to fill in** (`lib/markdown.ts`): in `'add'` mode a line that
+  already had a marker fell through to the checked branch, so `- [ ] a\nplain` became `- [x] a\n- [ ] plain` —
+  silently finishing somebody's item and rewriting their marker. `'add'` now returns the line untouched;
+  `'check'` (every touched line a task item, at least one open) is the mode that ticks. The mixed-selection
+  case, the `*`-marker case and the should-tick case are unit-tested side by side.
+- **"Save as a new note" was blocked by this PR's own guard** (`useAutosave.saveAsNewNote`): it created the row
+  and cleared the draft mirror, but the machine stayed `dirty`, so the navigation into the rescued note opened
+  the `Save / Discard` prompt instead — offering a write to the deleted row and the adoption of its content.
+  `saveAsNewNote` now `adopt`s the created row (`stopped` stays set: that row is gone); `note-editor.test.tsx`
+  drives the whole banner flow and asserts the arrival at the new note, which is also the first route test to
+  exercise a note that dies while it is open — the tree fake grew `PUT /api/notes/:id/content` and
+  `POST /api/notes` for it, so the write path is answered as a server answers it instead of with a `500`.
+### Review round 3 (reading the transforms, `2d8040f`)
+
+Four findings, all valid, none of them visible in CI — three of them because the unit suite asserted the
+wrong string, one because the failure needs a second note:
+
+- **An inserted block glued itself to the paragraph after it** (`insertBlock`'s `needsGap`). `line.end` is
+  the index of the line's `
+`, so `tail` always *starts* with that newline and `!tail.startsWith('
+')`
+  was false whenever a following line existed at all: the doc comment's "cannot glue itself to the following
+  paragraph" never held, and a GFM table ends only at a blank line — so pressing **Table** turned the next
+  sentence into a table row. `tail.length > 1 && !tail.startsWith('
+
+')` looks one character past the
+  terminator. The unit case "replaces the empty line a table is inserted at" asserted the glued output, so
+  the suite had encoded the bug; it and the rule case now assert the gap, plus the two cases where *no* gap
+  is right (EOF, and a gap that is already there).
+- **Blank lines inside a multi-line selection are separators, not content.** `allLinesMatch` ignores them
+  when it picks a mode, but the per-line callback ran on them anyway: `- [ ] ` on a blank line in
+  task-list `'remove'` mode (a stray empty checkbox in the preview), `# ` on an empty line from the heading
+  button, and in `orderedList` a separator that spent a number, so the list counted 1, 2, 4. `contentLines`
+  is the shared rule for all five prefix transforms — untouched separators, and an ordinal over content
+  lines — while a *collapsed* caret on an empty line still starts a block there. The named trade-off is
+  `blockquote`: a multi-paragraph quote whose separator stays blank renders as two quotes, and the caret on
+  that line is how the separator gets its `>`.
+- **The caret-after-create was frozen at first mount** (`NoteEditorPage`'s `useState(() =>
+  takesEditorFocus(client, noteId))`). A route component stays mounted while only its param changes, so the
+  initializer ran once per page lifetime: create note B while A is open and B is never focused, and a page
+  that first opened a just-created note focused every note after it. The read moved into the keyed
+  `NoteEditor` — the component that mounts per note — and the test drives A → B → A and asserts the focus
+  follows the note, not the page (verified to fail against the old placement).
+- **AGENTS said 16 toolbar items; there are 15** (`toolbar-h1/h2/h3` are three buttons over one
+  `heading(level)` factory). Corrected in AGENTS, in the PR description, and in `lib/markdown.test.ts`'s
+  wording is unchanged because it already said "the fifteen buttons" — the count that drifted was the prose.
+### Review round 4 (reading the transforms again, `da7149c`)
+
+Five findings, all accepted; three wrong results in `lib/markdown.ts` and two in the tests, none of them
+visible to CI (two because the inputs were never used, one because the assertion could not fail):
+
+- **Italic on `**bold**` removed the bold** instead of stacking. `emphasis` unwraps by *slicing*
+  `open.length` characters off the buffer, and one asterisk of a `**` pair is an asterisk — so the italic
+  button found "its own" marker inside somebody else's and took it off, downgrading `**bold**` to `*bold*`
+  precisely when the person asked for more emphasis. `markerIsOwn` now requires the adjacent run to be
+  exactly this marker's length, or 3 long (`***x***` is bold **and** italic in Markdown, so taking one layer
+  off is the honest answer for both buttons). Selection is guarded the same way through the second unwrap
+  step, which had the same hole.
+- **A fence did not begin a line.** `codeBlock` wrapped the selection wherever it fell, so `'foo ```bar```
+  baz'` is not a code block at all — three backticks mid-line are inline code, and the sentence is mangled.
+  The selection is now lifted onto its own lines (neighbours keep theirs, including their spaces), matching
+  what `insertBlock` already does for tables and rules.
+- **The caret arithmetic was inexact on removal.** `eachLine`'s `shift` added a line's whole delta whenever
+  `line.start <= position`, so a caret at column 0 of the next line — or anywhere inside a prefix about to
+  be deleted — travelled backwards onto the line above (`'a\n- b'`, bullet removed, caret at 0), and a
+  selection's `start` did the same thing silently, so the *next* toolbar press edited text the person had
+  deliberately left out. A removal may now take back at most the distance from the line's own start.
+- **`expect(callsTo(fake, \`PATCH /api/notes/…\`)).toHaveLength(0)` could never fail** (`callsTo` compares
+  recorded *paths*, which carry no method). The Discard case now asserts the route a write would actually
+  use, `PUT /api/notes/:id/content`, and the Save case additionally asserts the recorded body — the buffer
+  on screen, not whatever the machine last adopted.
+- **The Save case cited an e2e test that does not exist.** Worse, it excused the missing destination as a
+  jsdom limitation ("the incoming note's first fetch never settles"), which was a *race in the test*: the
+  arrival renders fine once you wait for it. The test now waits for `note-title` = `ideas.md`, asserts the
+  prompt stays gone, and asserts the destination holds its own body. `e2e/autosave.spec.ts` has no
+  dirty-navigation spec, and adding one is deliberately **not** taken here: this PR has already shipped two
+  acceptance assertions that were never run, so a third unverifiable one is the wrong trade. The unit level
+  now proves the arrival; PR-19's suite remains the place to add the browser case, and saying so is cheaper
+  than pointing at a file that isn't there.

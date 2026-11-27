@@ -688,6 +688,20 @@ describe('the states a caller has to see (§4, §6)', () => {
     // The dead note's mirror goes with it, and the new row is in the cache under its own id.
     expect(readDraft(NOTE_ID)).toBeUndefined();
     expect(client.getQueryData(queryKeys.note(OTHER_ID))).toMatchObject({ version: 1 });
+    // …and the machine that typed it is **clean**. Nothing in this call's contract says so out loud, but
+    // everything downstream assumes it: PR-13's editor guards a dirty subtree, so a machine still dirty
+    // here hands the person who just saved their text an "unsaved changes" prompt on the way to the note
+    // that now holds it — and a prompt whose two answers are both wrong, because the note it would
+    // "Save" to is gone and the content it would "Discard" is the dead row's. `adopt` is the primitive
+    // that ends the dirtiness: buffer, version and state all describe the row that exists.
+    const after = result.current.snapshot;
+    expect(after).toMatchObject({ state: 'clean', dirty: false, version: 1 });
+    expect(after.buffer).toBe('the text I kept');
+    // `stopped` is *not* cleared, and that is the other half of the same story: the row this machine was
+    // writing to is gone, so it must never write again — which is also why the `404`-doomed flush this
+    // moment used to invite is already impossible. A clean machine additionally stops arming PR-14's
+    // `beforeunload` guard over text that is, in fact, saved.
+    expect(after.stopped).toBe(true);
   });
 
   it('conflict: the banner state, then “use server” replaces the buffer and clears the mirror', async () => {

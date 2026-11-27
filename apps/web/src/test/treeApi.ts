@@ -105,6 +105,15 @@ export interface TreeServer {
    * the second half and passes while proving the first.
    */
   hold(method: string, path: string): { readonly release: (reply: Reply) => void };
+  /**
+   * The plaintext behind `GET /api/notes/:id` for one row (PR-13's editor route reads it; the tree never
+   * sees it, §9.2 #12).
+   *
+   * The body lives *outside* the note row for the same reason it lives in a different column on the server:
+   * a fake whose tree rows carried `content` would let a test assert that the sidebar had decrypted
+   * something.
+   */
+  setNoteContent(id: string, content: string): void;
   /** The ids the model has handed out, so a test can assert on what a create made without reading its stub. */
   created(): readonly string[];
 }
@@ -126,6 +135,24 @@ function idOf(path: string, prefix: string): string | undefined {
   return id.length > 0 && !id.includes('/') ? id : undefined;
 }
 
+/** The note a `PUT /api/notes/:id/content` names — `idOf` cannot answer it, it refuses a two-segment path. */
+function contentIdOf(path: string): string | undefined {
+  const found = /^\/api\/notes\/([^/]+)\/content$/u.exec(path);
+  return found?.[1];
+}
+
+/**
+ * The metadata a write re-derives from the new plaintext, exactly as PR-10's service does: `contentBytes`
+ * is UTF-8 bytes (not characters — the counter in the editor and the cap in the contract both count bytes),
+ * and `wordCount` is whitespace-separated words.
+ */
+function sizeOf(content: string): { readonly contentBytes: number; readonly wordCount: number } {
+  return {
+    contentBytes: new TextEncoder().encode(content).length,
+    wordCount: content.split(/\s+/u).filter((word) => word.length > 0).length,
+  };
+}
+
 const noCascade = (): Reply => ({
   status: 409,
   body: errorBody('CONFLICT', 'that folder is not empty', { requestId: requestId() }),
@@ -141,9 +168,29 @@ function requestId(): string {
  * `initial` defaults to an empty tree — the empty state is a state worth testing, and an empty starting point
  * makes each test's fixtures the only thing a reader has to hold in their head.
  */
-export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer {
+/**
+ * Two words, eleven bytes — deliberately the same shape as `noteNode`'s default `wordCount: 2` and
+ * `contentBytes: 12`, so a test that reads a fixture's metadata and then asks for its body is not
+ * surprised by a different note. Above all it is not `''`: an empty body is a state worth testing, and
+ * a default that is empty cannot tell you the difference between "the fake had nothing" and "the note is
+ * blank".
+ */
+export const DEFAULT_NOTE_CONTENT = 'lorem ipsum';
+
+/**
+ * The fake: `stub` answers every tree route over an in-memory model of PR-09's rules.
+ *
+ * `initial` defaults to an empty tree — the empty state is a state worth testing, and an empty starting point
+ * makes each test's fixtures the only thing a reader has to hold in their head.
+ */
+export function makeTreeServer(
+  initial: Partial<TreeResponse> & { readonly contents?: Record<string, string> } = {},
+): TreeServer {
   let folders: FolderNode[] = [...(initial.folders ?? [])];
   let notes: NoteNode[] = [...(initial.notes ?? [])];
+  // One note's plaintext, keyed by id, absent until somebody says what it is. A missing entry is not "empty
+  // note": the row still exists, so `GET /api/notes/:id` answers it with {@link DEFAULT_NOTE_CONTENT}.
+  const bodies = new Map<string, string>(Object.entries(initial.contents ?? {}));
   const queued: Queued[] = [];
   const created: string[] = [];
   // Ids this fake hands out start at 50 so they cannot collide with a test's own fixtures, which count from 1.
@@ -228,6 +275,35 @@ export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer 
         return { status: 201, body: folder };
       }
 
+      case 'POST /api/notes': {
+        // PR-14's escape hatch (`createNoteFromBuffer`) and PR-15's dialog both land here: `{content,
+        // folderId}`, no name. §9.2 #16 is the rule that makes this route worth modelling rather than
+        // stubbing: a name the client did not type is the server's to invent, `new-file-<msepoch>`, and it
+        // is the one name that may be re-picked on a clash instead of answered `409`. The epoch plus this
+        // fake's monotone id counter is what keeps two creates in the same millisecond apart — a fake that
+        // answered `409` there would be testing the retry budget of a route that has one only by accident.
+        const body = (request.body ?? {}) as { name?: string; content?: string; folderId?: string | null };
+        const folderId = body.folderId ?? null;
+        if (folderId !== null && !folders.some((folder) => folder.id === folderId)) return notFound('folder');
+        const name = body.name ?? `new-file-${Date.now() + issued}`;
+        const taken = notes.find(
+          (note) => siblingKey(note.folderId, note.name) === siblingKey(folderId, name),
+        );
+        if (body.name !== undefined && taken !== undefined)
+          return clash('a sibling already has that name', taken.id);
+        const content = body.content ?? DEFAULT_NOTE_CONTENT;
+        const note: NoteNode = {
+          ...noteNode(newId('note'), name, folderId),
+          ...sizeOf(content),
+          contentUpdatedAt: T1,
+        };
+        notes = [...notes, note];
+        bodies.set(note.id, content);
+        // `NoteWithContent`, not a tree row: the caller adopts this row as its new baseline, and a response
+        // without `content` would send PR-14's `adopt` off with an empty buffer.
+        return { status: 201, body: { ...note, content } };
+      }
+
       default:
         break;
     }
@@ -235,6 +311,13 @@ export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer 
     // Ids are only known at runtime, so the two `:id` routes are matched by prefix instead of by table key.
     const folderId = idOf(request.path, '/api/folders');
     const noteId = idOf(request.path, '/api/notes');
+
+    // PR-13's editor read: the row, plus the body the tree is not allowed to carry.
+    if (request.method === 'GET' && noteId !== undefined) {
+      const note = notes.find((candidate) => candidate.id === noteId);
+      if (note === undefined) return notFound('note');
+      return { status: 200, body: { ...note, content: bodies.get(noteId) ?? DEFAULT_NOTE_CONTENT } };
+    }
 
     if (request.method === 'PATCH' && folderId !== undefined) {
       const folder = folders.find((candidate) => candidate.id === folderId);
@@ -278,6 +361,40 @@ export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer 
       folders = folders.filter((candidate) => !gone.has(candidate.id));
       notes = notes.filter((candidate) => candidate.folderId === null || !gone.has(candidate.folderId));
       return { status: 204 };
+    }
+
+    // The autosave write. Modelled rather than left to the `no stub` answer at the bottom, because PR-13's
+    // route does the one thing a stub cannot fake: it reacts to the *difference* between `200`, `404` and
+    // `409 VERSION_CONFLICT` — `deleted` stops the machine, a conflict opens a banner, a success adopts a
+    // version. A fake that answered `500` to everything would let the route pass while the machine under it
+    // had never been asked to do any of that.
+    if (request.method === 'PUT' && contentIdOf(request.path) !== undefined) {
+      const id = contentIdOf(request.path) as string;
+      const note = notes.find((candidate) => candidate.id === id);
+      if (note === undefined) return notFound('note');
+      const body = (request.body ?? {}) as { content?: string; baseVersion?: number };
+      const content = body.content ?? '';
+      // PR-10's optimistic lock, in the same shape the contract gives it: the loser gets the row's current
+      // content and version, which is the input PR-14's comparison needs.
+      if (body.baseVersion !== note.version) {
+        return {
+          status: 409,
+          body: errorBody('VERSION_CONFLICT', 'someone saved this note first', {
+            data: { content: bodies.get(id) ?? DEFAULT_NOTE_CONTENT, version: note.version },
+            requestId: requestId(),
+          }),
+        };
+      }
+      const updated: NoteNode = {
+        ...note,
+        version: note.version + 1,
+        ...sizeOf(content),
+        contentUpdatedAt: T1,
+        updatedAt: T1,
+      };
+      notes = notes.map((candidate) => (candidate.id === id ? updated : candidate));
+      bodies.set(id, content);
+      return { status: 200, body: { ...updated, content } };
     }
 
     if (request.method === 'PATCH' && noteId !== undefined) {
@@ -338,6 +455,9 @@ export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer 
         }),
       });
       return { release };
+    },
+    setNoteContent: (id, content) => {
+      bodies.set(id, content);
     },
     created: () => created,
   };

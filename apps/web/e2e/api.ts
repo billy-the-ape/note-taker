@@ -69,7 +69,7 @@ async function send<T>(page: Page, method: string, path: string, payload?: Json)
   });
 
   const text = await response.text();
-  const body = (text === '' ? {} : (JSON.parse(text) as T)) as T;
+  const body = (text === '' ? {} : JSON.parse(text)) as T;
   return { status: response.status(), body };
 }
 
@@ -104,7 +104,7 @@ export async function setupInstance(page: Page): Promise<'created' | 'already-se
 /**
  * `POST /api/auth/register` — one account per spec file, because one user is one tree.
  *
- * Five files sharing the owner would make "the tree is empty" unassertable and would let one file's rename
+ * Four files sharing the owner would make "the tree is empty" unassertable and would let one file's rename
  * satisfy another file's assertion. Registration is open in the suite only because `ALLOW_REGISTRATION=true`
  * is in `e2e/env.ts`'s `serverEnv()`, with the reason spelled out there.
  */

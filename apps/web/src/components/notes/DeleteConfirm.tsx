@@ -99,8 +99,14 @@ export function DeleteConfirm({
           Delete {kind === 'folder' ? 'folder' : 'note'}
         </DialogTitle>
         <DialogDescription className="text-sm text-ink-muted">
-          <span className="font-medium text-ink">{displayName}</span> is in {where}.
-          {alsoDeletes === undefined ? null : <span> {alsoDeletes}</span>} This cannot be undone.
+          {/* The name is its own element with its own hook, so a UI test can read *the name* rather than parse a
+              sentence around it. PR-19's typed-delete spec is the consumer (`e2e/fixtures.ts`); the wording of
+              "Type “…” to confirm" below is copy, and copy changes. */}
+          <span className="font-medium text-ink" data-testid="delete-confirm-display-name">
+            {displayName}
+          </span>{' '}
+          is in {where}.{alsoDeletes === undefined ? null : <span> {alsoDeletes}</span>} This cannot be
+          undone.
         </DialogDescription>
 
         <form className="flex flex-col gap-4" onSubmit={submit} noValidate>

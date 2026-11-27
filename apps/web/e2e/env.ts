@@ -120,7 +120,7 @@ export const NOTE_ENCRYPTION_KEY_VERSION = setting('NOTE_ENCRYPTION_KEY_VERSION'
  * runs), and so is every value the specs assert on. Three of them are not defaults a production host would
  * choose, each for one reason the suite cannot do without:
  *
- * * `ALLOW_REGISTRATION` — five spec files need five *separate* accounts, because one user is one tree and a
+ * * `ALLOW_REGISTRATION` — the four spec files need separate accounts, because one user is one tree and a
  *   tree shared between files makes "the tree is empty" unassertable. `POST /api/auth/register` is the only
  *   door a member can come through, and it needs an owner to already exist — which is why `auth.spec.ts` is
  *   the file that walks `/setup`.

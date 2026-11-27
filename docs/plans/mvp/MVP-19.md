@@ -29,7 +29,8 @@ ratchet every coverage threshold to the post-PR-19 column.
 - PR-18's image/compose exist; the server serves the built SPA on one port (`plugins/static-spa.ts`); migrations run at
   boot; `GET /api/healthz` is the probe.
 - Every UI PR left `data-testid` hooks on the elements its tests assert: `tree`, `folder-row-<id>`, `note-row-<id>`,
-  `new-folder`, `rename-dialog`, `move-dialog`, `delete-confirm`, `delete-confirm-name-input`, `editor`,
+  `new-folder`, `rename-dialog`, `move-dialog`, `delete-confirm`, `delete-confirm-name-input`, `delete-confirm-display-name`,
+  `editor`,
   `editor-toolbar`, `preview`, `mode-split|write|preview`, `save-status`, `new-note` dialog fields, `search-input`,
   `search-results`, `settings-autosave-toggle`, `sign-out-everywhere`, … If one is missing, **add it in this PR** (the
   rule from the testing strategy: `data-testid` on everything a UI test needs).
@@ -129,7 +130,7 @@ page that does not exist is how this suite goes quietly useless:
 | 1 auth | **runs** — `auth.spec.ts`, 3 tests: fresh instance opens `/setup`, the owner it creates lands on `/app`, sign out lands on `/login`, the same credentials land back; and the cookie pair plus the CSRF guard, asserted from a real same-origin `fetch` that carries the cookie and withholds the header | — |
 | 2 notes | **its generated-name half runs** (`notes.spec.ts` › "a note nobody named lands in the folder that was open, as `new-file-<msepoch>.md`"); the dialog-prefill and the heading/bold-preview-then-reload halves are `fixme` | the dialog's mount point (PR-12's buttons never call `useNewNoteDialog()`), and `routes/app/note/$noteId.tsx` (PR-13) |
 | 3 rename / move | **runs** — `folders.spec.ts` › rename lands with `.md`, move changes where the note says it lives, both re-read through the sidebar | — |
-| 4 typed delete | **runs** — `folders.spec.ts`, 2 tests: a folder with something in it refuses until its name is typed and then takes the note too; an empty one needs no typing | — |
+| 4 typed delete | **runs** — `folders.spec.ts`, 2 tests: a folder with something in it refuses until its name is typed and then takes the note too; an empty one needs no typing. The name to type is read from `delete-confirm-display-name`, the hook this PR added to `DeleteConfirm` rather than parsed out of the label's sentence (AGENTS.md: add the hook in the PR that needs it) | — |
 | 5 autosave | `fixme` | PR-13's page: PR-14's `useAutosave`/`SaveStatus`/debounce are merged and `save-status` exists, but nothing mounts them, so there is no buffer to pause over and no `Ctrl+S` to press. PR-16's `settings-autosave-toggle` is exercised by PR-16's own suite in the meantime |
 | 6 conflict | `fixme` | the same page: two pages on one note need a page that holds a buffer to go stale |
 | 7 at-rest ciphertext | **runs**, and may never be skipped or `fixme`'d — a run where it does not execute is a red build | — |
@@ -150,9 +151,10 @@ mystery), the `If-Match` shapes in `routes/notes.routes.int.test.ts` (`*`, comma
 
 **Harness files, beyond §3's list.** `e2e/env.ts` (the resolution order: `process.env` → repo-root `.env.test` →
 throwaway defaults, and the `serverEnv()` the `webServer` gets — including `LOGIN_RATE_LIMIT_MAX`, without which a
-suite that signs in 11 times locks itself out at the default 10/60 s) and `e2e/fixtures.ts` (account bootstrap,
-folder/row helpers, the rename/move/delete dialog flows). `e2e/reset.ts` is the integration suite's `resetDb()` for
-this database, and it no-ops when the schema is not applied, so it can run before the first migration.
+suite that signs in 11 times locks itself out at the plan §10 window of 10 per 15 minutes) and `e2e/fixtures.ts`
+(account bootstrap, folder/row helpers, the rename/move/delete dialog flows). `e2e/reset.ts` is the integration
+suite's `resetDb()` for this database, and it no-ops when the schema is not applied, so it can run before the first
+migration.
 
 ## 8. Out of scope
 

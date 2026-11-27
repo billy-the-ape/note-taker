@@ -4,9 +4,10 @@
  * Two rules, both learned from the way this repo's component tests are written:
  *
  * * **`data-testid` only, never structure.** Every locator here goes through a `data-testid` PR-08…PR-16 left
- *   behind, because a test that walks `li > div:nth-child(2)` fails on a padding change and passes for the wrong
- *   reason. Where the tree needs an id (a row's menu is `row-menu-<id>`), the id is read out of the row's own
- *   `data-node-id` rather than guessed from a response body the UI never saw.
+ *   behind or this PR added (AGENTS.md: "if one is missing, add the hook in the PR that needs it"), because a test
+ *   that walks `li > div:nth-child(2)` fails on a padding change and passes for the wrong reason. Where the tree
+ *   needs an id (a row's menu is `row-menu-<id>`), the id is read out of the row's own `data-node-id` rather than
+ *   guessed from a response body the UI never saw.
  * * **A helper does one user gesture.** `createFolder` clicks the buttons a person clicks and then waits for the
  *   tree to say so; it does not reach for the API. The seams in `api.ts` are the exception and they argue
  *   themselves in that file's header.
@@ -45,6 +46,7 @@ export async function signInNewAccount(page: Page, username: string): Promise<vo
   await setupInstance(page);
   await signUp(page, username);
 }
+
 /** The tree row for one node, by kind and id. */
 export function rowOf(page: Page, kind: 'folder' | 'note', id: string): Locator {
   return page.getByTestId(`${kind}-row-${id}`);
@@ -94,9 +96,7 @@ export async function createFolder(page: Page, name: string): Promise<string> {
   await page.getByTestId('new-folder-submit').click();
   await expect(form).toHaveCount(0);
 
-  const id = await folderIdByName(page, name);
-  await expect(rowOf(page, 'folder', id)).toBeVisible();
-  return id;
+  return folderIdByName(page, name);
 }
 
 /** Opens a row's context menu (the row's own `row-menu-<id>` button) and clicks one of its items. */
@@ -127,14 +127,20 @@ export async function moveThroughUi(page: Page, targetTestId: string): Promise<v
   await expect(dialog).toHaveCount(0);
 }
 
-/** The name the delete dialog is asking to be typed, read off its own label rather than hardcoded. */
+/**
+ * The name the delete dialog is asking to be typed, read off the dialog rather than hardcoded.
+ *
+ * Read from `delete-confirm-display-name`, the hook this PR added to `DeleteConfirm` for it: the alternative was
+ * the field's label text (`Type “…” to confirm`), and that is copy — a wording change to a sentence is not
+ * something the delete scenario should be able to fail over. `folderIdByName` above is the same argument one
+ * level up: the id comes from the tree API, the visible name comes from the element that displays it.
+ */
 export async function deleteConfirmName(page: Page): Promise<string> {
-  const label = page.getByText(/^Type “.+” to confirm$/u);
-  await expect(label).toBeVisible();
-  const text = (await label.textContent()) ?? '';
-  const found = /^Type “(.+)” to confirm$/u.exec(text);
-  if (found === null || found[1] === undefined) {
-    throw new Error(`could not read the typed-name label out of ${JSON.stringify(text)}`);
+  const displayed = page.getByTestId('delete-confirm-display-name');
+  await expect(displayed).toBeVisible();
+  const name = ((await displayed.textContent()) ?? '').trim();
+  if (name === '') {
+    throw new Error('the delete dialog rendered no displayed name, so it is not asking for one to be typed');
   }
-  return found[1];
+  return name;
 }

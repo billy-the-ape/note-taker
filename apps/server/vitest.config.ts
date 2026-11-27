@@ -35,9 +35,15 @@ export default defineConfig({
        *
        * Written as glob keys because that is how §14 states the row: encryption and the error taxonomy are each
        * measured over themselves, rather than one aggregate number that a well-tested directory could carry for
-       * an untested one. Values are §14's 80/80/75/80 — and the glob keys are read, not ignored: raising one to
-       * an unreachable value fails the job with `does not meet "src/crypto/**" threshold (99.5%)`, which is the
-       * only way to tell a threshold apart from a decorative object literal.
+       * an untested one. The values are §14's 80/80/75/80 **ratcheted to 85 across the board by PR-19**
+       * (docs/plans/mvp/MVP-19.md §6, the post-PR-19 column), and the glob keys are read, not ignored: raising
+       * one to an unreachable value fails the job with `does not meet "src/crypto/**" threshold (99.5%)`, which
+       * is the only way to tell a threshold apart from a decorative object literal. Raising them is this PR's job
+       * and no other's — a threshold is only worth having if the number went up somewhere — and the scope that
+       * cannot meet the new floor gets tests in the PR that raises it rather than a lower number: for
+       * `src/crypto/**` that was `keys.test.ts`, whose uncovered branches were the keyring configurations a
+       * booted server is allowed to arrive with (a previous map holding a version nothing references, a current
+       * version missing from it, a file-sourced key whose bytes are the wrong length).
        *
        * `src/db/rows.ts` joins them as a single file, and it is the exception that proves the split rule rather
        * than a loophole in it: it lives in `src/db/**`, which §14 gives to the integration job, but every branch
@@ -45,12 +51,13 @@ export default defineConfig({
        * that the real driver in that job never produces. Measured there it scored 12.85% of its branches and
        * took the scope's aggregate to 67.97% against a 75% floor (PR-09's first green-tests run), which is a
        * statement about the shapes a suite can summon, not about whether the file is tested. Here its own suite
-       * can summon all of them, so it is measured at §14's same 80/80/75/80 over itself.
+       * can summon all of them, so it is measured at the same numbers as the two scopes above — 85, since
+       * PR-19 moved all three at once.
        */
       thresholds: {
-        'src/crypto/**': { lines: 80, functions: 80, branches: 75, statements: 80 },
-        'src/domain/**': { lines: 80, functions: 80, branches: 75, statements: 80 },
-        'src/db/rows.ts': { lines: 80, functions: 80, branches: 75, statements: 80 },
+        'src/crypto/**': { lines: 85, functions: 85, branches: 85, statements: 85 },
+        'src/domain/**': { lines: 85, functions: 85, branches: 85, statements: 85 },
+        'src/db/rows.ts': { lines: 85, functions: 85, branches: 85, statements: 85 },
       },
     },
   },

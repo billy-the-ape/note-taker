@@ -19,9 +19,10 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
 | `pnpm format`       | Biome rewrites the same.                                                                                                               |
 | `pnpm typecheck`    | `tsc --noEmit` in every package; resolves `@note-taker/contracts` from its `dist`, so it only passes once `build:packages` has run. |
 | `pnpm test`         | Vitest unit suites (`src/**/*.test.{ts,tsx}`, `*.int.test.ts` excluded).                                                                |
-| `pnpm coverage`     | The same with v8 coverage — this is what the `unit` CI job (PR-03) runs, so keep its thresholds in the Vitest configs, not in CI flags. PR-06 armed its `apps/server/src/{crypto,domain}` glob thresholds at plan §14's 80/80/75/80. |
+| `pnpm coverage`     | The same with v8 coverage — this is what the `unit` CI job (PR-03) runs, so keep its thresholds in the Vitest configs, not in CI flags. Its scopes are at plan §14's **post-PR-19 column**: `packages/contracts` 95/95/95/95, `apps/server/src/{crypto,domain}` (and `src/db/rows.ts`, measured with them) 85/85/85/85, `apps/web/src/lib` 85/85/85/85 and overall `apps/web/src` 65/65/65/65. PR-06 armed the first at 80/80/75/80 and PR-19 raised all of them; a scope that cannot meet its floor gets tests, never a lower number. |
 | `pnpm test:integration` | The `*.int.test.ts` suite (`apps/server/vitest.integration.config.ts`, PR-04) — the only suite that touches a database, so `make db-up` first. `src/test/setup.ts` applies the committed migration, then `resetDb()` truncates between tests, and the files run one at a time. It boots the app under test, which imports `@note-taker/contracts` from its `dist`, so `pnpm build:packages` (PR-05) has to have run. |
-| `pnpm coverage:integration` | The same with `--coverage`. This is what the `integration` CI job (PR-04) runs, and the `apps/server/src/{db,services,routes}` thresholds (plan §14's 80/80/75/80 — `db` armed by PR-04, `services`/`routes` by PR-09) live in that config too, never in a CI flag. |
+| `pnpm coverage:integration` | The same with `--coverage`. This is what the `integration` CI job (PR-04) runs, and the `apps/server/src/{db,services,routes}` thresholds (plan §14's 80/80/75/80 — `db` armed by PR-04, `services`/`routes` by PR-09, **all raised to 85/85/85/85 by PR-19**) live in that config too, never in a CI flag. |
+| `pnpm test:e2e` | The Playwright suite and the MVP acceptance proof (PR-19 — `apps/web/playwright.config.ts`, `apps/web/e2e/*.spec.ts`): `pnpm build` first, then `NODE_ENV=test node apps/server/dist/index.js` is started as the `webServer`, so the browser is driven against the **compiled** app on the **one port** PR-18 ships (the SPA is served by PR-12's `static-spa`, the migration runs before `listen()`), against a throwaway Postgres. It needs a database and a browser: `make db-up` plus `pnpm --filter @note-taker/web exec playwright install chromium`. Local settings come from `process.env` → the gitignored repo-root `.env.test` (`DATABASE_URL`, `NOTE_ENCRYPTION_KEY`) → the throwaway defaults in `e2e/env.ts`; the CI `e2e` job supplies the same two values as job env, because the key is a non-secret test constant, not a secret. See the rules below before adding a spec. |
 | `pnpm db:generate` / `pnpm db:migrate` | drizzle-kit (PR-04), run in `apps/server`: generate the SQL into the committed `apps/server/migrations/`, or apply it. Both need a running Postgres; neither needs a `.env`. There is **no `db:push`**, by design (plan §5): the migration history is what ships. |
 | `pnpm db:seed` | The demo tree, idempotently (PR-09 — `apps/server/src/scripts/seed-demo.ts`, run with `NODE_ENV=development tsx`): the owner, the nested folders and the notes, **sealed with the keyring of the process that runs it** rather than a test key, and readable by the app afterwards. Needs a running Postgres; refuses `NODE_ENV=production` before it builds a keyring or opens a pool. It never truncates and never reseeds — a run reports `created`/`kept` per folder and note, so a second run on edited content is a no-op — and the password it prints is stored only as its argon2 hash. `src/scripts/seed-demo.int.test.ts` proves both halves. |
 | `pnpm generate:key` | Prints a fresh 32-byte note-encryption key as base64 on stdout, for `NOTE_ENCRYPTION_KEY` (PR-06, dev/CI only — root `scripts/generate-keys.ts`, run through the server workspace's `tsx`). A production host generates its key with the `docker run --rm node:22-slim node -e '…randomBytes(32)…'` one-liner instead, which PR-18's runbook documents. |
@@ -65,8 +66,22 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   matches nothing, and **never bumps `notes.version`** — rotation is not a content edit. In integration tests it
   is driven as a `tsx` subprocess with `NOTE_ENCRYPTION_KEY_VERSION=2` and the old key in `_PREVIOUS`, because
   editing `.env` and restarting the app are operator steps a script cannot do to its own container.
-- **Scripts that do not exist yet stay that way**: `test:e2e` (PR-19). Adding one before the files it runs is
-  a plan violation (`check:env` arrived with PR-18, and `db:seed` with PR-09).
+- **The e2e suite drives the compiled app, and says what it cannot drive** (PR-19): specs select only through
+  `data-testid`s (the rule from the testing strategy — every element a UI test needs has a hook; if one is
+  missing, **add the hook in the PR that needs it**, never a structural selector), the `webServer` is the compiled
+  entry with `NODE_ENV=test` (not `tsx`, not Vite dev), `workers: 1` because the suite owns one database and
+  `e2e/reset.ts` truncates it per file the way `resetDb()` does for the integration suite, and `e2e/db.ts` — the
+  scenario-7 reader, on `postgres` (postgres.js) at **PR-04's pinned version** as a devDependency of `apps/web`,
+  because pnpm does not expose one workspace's dependencies to another and the assertion must not drift onto a
+  second driver — is read-only down to `SET TRANSACTION READ ONLY`, so nothing that reads a row can write one.
+  A scenario that has no element to happen to is `test.fixme` with the missing file named in its title, never a
+  passing test that asserts nothing and never a deletion: today those are the editor scenarios (`routes/app/note/$noteId.tsx`,
+  PR-13) and the new-note dialog's own fields (`useNewNoteDialog()` is merged but mounted by nobody). Deleting a
+  `fixme` is how PR-13 finishes its own acceptance; scenario 7 — "DB rows are ciphertext", the DB leg of the MVP
+  proof — may never be skipped or `fixme`'d, and a run where it does not execute is a red build.
+- **Scripts that do not exist yet stay that way**: nothing is outstanding — `check:env` arrived with PR-18 and
+  `test:e2e` with PR-19, each in the PR that created the files it runs. Adding a script before those exist is a
+  plan violation, and so is adding one that cannot go green.
 - **Folder mutations are serialized per user, and ids in bodies are checked before they are written** (PR-09):
   every `create`/`rename`/`move`/`delete` in `services/folder.service.ts` runs in one transaction that starts with
   `takeFolderMoveLock(userId)` — `pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — and

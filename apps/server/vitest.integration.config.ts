@@ -31,7 +31,10 @@ export default defineConfig({
     // (the `unit` job) has no threshold over them. PR-04 armed `src/db/**` alone — the only scope its tests
     // reached — and PR-09 adds the services and routes those repositories serve, which is what §8 of its brief
     // asks for at the same 80/80/75/80. A scope with nothing in it is a guaranteed red, and thresholds only ever
-    // ratchet upward; §8 also says this row reaches 85 only after PR-19, so nothing here is raised past §14.
+    // ratchet upward; PR-09 §8 also says this row reaches 85 only after PR-19 — and PR-19 is here, so the row is
+    // **85/85/85/85** from this PR on (docs/plans/mvp/MVP-19.md §6, the post-PR-19 column). The ratchet is applied
+    // to the config that produces the number, never to a CI flag, which is what makes a local
+    // `pnpm coverage:integration` go red exactly when the `integration` job does.
     //
     // `src/scripts/**` stays out of *this* report: the seed and the rotation script are exercised as subprocesses
     // (their own processes, where this collector cannot see them), so a 0% row there would read as "untested"
@@ -53,10 +56,10 @@ export default defineConfig({
       include: ['src/db/**/*.ts', 'src/services/**/*.ts', 'src/routes/**/*.ts'],
       exclude: ['src/**/*.int.test.ts', 'src/**/*.test.ts', 'src/db/rows.ts'],
       thresholds: {
-        lines: 80,
-        functions: 80,
-        branches: 75,
-        statements: 80,
+        lines: 85,
+        functions: 85,
+        branches: 85,
+        statements: 85,
       },
     },
   },

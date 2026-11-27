@@ -181,6 +181,26 @@ describe('key versions', () => {
     expect(keyForVersion(keyring2, 1)).toBe(KEY_1);
     expect(keyForVersion(keyring2, 2)).toBe(KEY_2);
   });
+
+  it('lists every decrypt-only version when the answer is a rotation still in progress', () => {
+    // The other half of that sentence, which is the half an operator reads *during* a rotation: with `_PREVIOUS`
+    // populated the message has to enumerate what this process can still read (so "add version 3 back" is
+    // answerable from the log line), and "none" — the correct word for `keyringWithout1` — would be a lie.
+    const withThird = new Map<number, Uint8Array>([
+      [1, KEY_1],
+      [2, key(50)],
+    ]);
+    const midRotation: Keyring = { current: { version: 3, key: key(51) }, previous: withThird };
+    expect(() => keyForVersion(midRotation, 4)).toThrow(/can decrypt versions 1, 2\./su);
+    // Sorted numerically, not by insertion order: an operator who put `{"2": …, "1": …}` in the variable should
+    // still read `1, 2`, because `2, 1` looks like a version that was removed.
+    const insertedBackwards = new Map<number, Uint8Array>([
+      [2, key(50)],
+      [1, KEY_1],
+    ]);
+    const reversed: Keyring = { current: { version: 9, key: key(52) }, previous: insertedBackwards };
+    expect(() => keyForVersion(reversed, 8)).toThrow(/can decrypt versions 1, 2\./su);
+  });
 });
 
 describe('the plaintext statistics the columns store', () => {

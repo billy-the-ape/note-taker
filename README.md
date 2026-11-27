@@ -78,7 +78,13 @@ docker compose --env-file .env -f docker/compose.dev.yml <up|down|ps|logs>
 The database is real from PR-04 on: `make db-up`, then `pnpm db:migrate` applies the committed migrations in
 `apps/server/migrations/`, and `pnpm dev` (or `node apps/server/dist/index.js`) runs the same migration runner
 at boot before it starts listening, so a fresh volume is servable without a second command. `pnpm test:integration`
-is the only test suite that needs a database; `pnpm test` never touches one. `pnpm db:seed` (demo data) arrives
+is the only unit-style suite that needs a database; `pnpm test` never touches one. `pnpm test:e2e` (PR-19) needs
+both a database and a browser (`make db-up`, then `pnpm --filter @note-taker/web exec playwright install chromium`):
+it builds both apps and drives the **compiled** one in Chromium on the single port a deployment uses, and it is the
+suite that proves the README's own "2 way encrypted?" requirement end-to-end — including reading a note's row back
+and asserting the body is ciphertext while the name is not. It reads its local settings from a gitignored
+`.env.test` at the repo root (`DATABASE_URL`, `NOTE_ENCRYPTION_KEY`; the same throwaway values CI exports), and
+`docs/plans/mvp/MVP-19.md` is its brief. `pnpm db:seed` (demo data) arrives
 with PR-09, and there is no `make` target pretending otherwise. `docs/DATA-MODEL.md` documents the schema, the
 indexes and the invariants the server relies on.
 

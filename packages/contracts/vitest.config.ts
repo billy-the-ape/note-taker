@@ -12,9 +12,10 @@ import { defineConfig } from 'vitest/config';
  * actually used — by both apps, which import `@note-taker/contracts` through `exports` with no alias
  * to `src` (MVP-05 §4), and by the acceptance check that resolves the compiled entry point itself.
  *
- * The thresholds are the `packages/contracts` row of plan §14 (90 lines / 90 functions / 85 branches
- * / 90 statements, ratcheting to 95 across the board after PR-19). Pure module, no excuse — and this
- * is a `unit`-job scope because contracts need no database.
+ * The thresholds are the `packages/contracts` row of plan §14, ratcheted by PR-19 to **95 across the board**
+ * (docs/plans/mvp/MVP-19.md §6 — the post-PR-19 column; it was 90/90/85/90). Pure module, no excuse: this
+ * package sits at 100% on all four, so the ratchet is a promise about the next file added to it rather than a
+ * number the current ones are lucky to clear. This is a `unit`-job scope because contracts need no database.
  */
 export default defineConfig({
   test: {
@@ -27,10 +28,10 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: ['src/**/*.test.ts'],
       thresholds: {
-        lines: 90,
-        functions: 90,
-        branches: 85,
-        statements: 90,
+        lines: 95,
+        functions: 95,
+        branches: 95,
+        statements: 95,
       },
     },
   },

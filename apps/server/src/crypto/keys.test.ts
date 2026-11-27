@@ -238,6 +238,11 @@ describe('NOTE_ENCRYPTION_KEY_PREVIOUS', () => {
     // separate refusal below, because the current key is never in this map on purpose.)
     [`{"x":${JSON.stringify(KEY_1_B64)}}`, 'keys are key versions'],
     ['{"1":"not base64!!"}', 'must be base64'],
+    // A JSON *number* is what a shell that ate the quotes produces (`{"1": 5}`), and an array is what a config
+    // editor does to a long string; both used to fall through to the decoder, which reported the value as
+    // "undefined"-ish text rather than saying the entry is not a string at all.
+    ['{"1":5}', 'must be a base64 string'],
+    ['{"1":[1,2,3]}', 'must be a base64 string'],
     [`{"1":${JSON.stringify(Buffer.alloc(16, 4).toString('base64'))}}`, 'must decode to exactly 32 bytes'],
   ])('reports %s rather than ignoring it', (previous, phrase) => {
     expect(problemsOf(() => withPrevious(previous))).toContain(phrase);

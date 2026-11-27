@@ -21,12 +21,14 @@ import {
   contentUpdateStatement,
   createNote,
   deleteNote,
+  likeContainsPattern,
   listAllNotes,
   listNotes,
   noteByFolderAndName,
   noteById,
   patchNote,
   recentNotes,
+  searchNotesByMetadata,
   writeNoteContent,
 } from './notes.repo.js';
 
@@ -375,5 +377,82 @@ describe('notes.repo', () => {
     );
     expect(Number(remaining[0]?.total)).toBe(0);
     expect(await listNotes(db, { userId: owner.id, folderId: folder.id })).toStrictEqual([]);
+  });
+
+  it('searches metadata with `%` and `_` literal in **both** halves of the predicate (PR-11)', async () => {
+    const db = testDb();
+    const { owner } = await pair();
+    const underscore = await createFolder(db, { userId: owner.id, name: 'a_b' });
+    const xletter = await createFolder(db, { userId: owner.id, name: 'axb' });
+
+    await makeNote(db, owner.id, { name: '100% cotton' });
+    await makeNote(db, owner.id, { name: 'a_b note' });
+    await makeNote(db, owner.id, { name: 'axb note' });
+    await makeNote(db, owner.id, { name: 'plain' });
+    // Two rows whose **names** cannot match, so what follows can only be answered by the folder half — a second
+    // `LIKE … ESCAPE` living inside the `exists` subquery, escaped separately and able to break separately.
+    await makeNote(db, owner.id, { name: 'inside-underscore', folderId: underscore.id });
+    await makeNote(db, owner.id, { name: 'inside-xletter', folderId: xletter.id });
+
+    const searchBy = async (q: string): Promise<string[]> => {
+      const rows = await searchNotesByMetadata(db, {
+        userId: owner.id,
+        pattern: likeContainsPattern(q),
+        // The scan bound the service passes; the corpus is six rows, so this number decides nothing here.
+        limit: 500,
+      });
+      return rows.map((row) => row.name).sort();
+    };
+
+    // The control: the statement is matching *something*, so an empty or short answer below means "literal".
+    expect(await searchBy('note')).toStrictEqual(['a_b note', 'axb note']);
+
+    // Unescaped, `100%` would become `%%%` (the whole corpus) and `a_b` would reach `axb note`; an ESCAPE clause
+    // that Postgres reads as empty turns both queries into searches for a literal backslash, which is nothing.
+    expect(await searchBy('100%')).toStrictEqual(['100% cotton']);
+    expect(await searchBy('%')).toStrictEqual(['100% cotton']);
+    expect(await searchBy('a_b')).toStrictEqual(['a_b note', 'inside-underscore']);
+    expect(await searchBy('_')).toStrictEqual(['a_b note', 'inside-underscore']);
+  });
+
+  it('returns name matches before folder matches, so its row bound cannot cut a name hit (PR-11)', async () => {
+    const db = testDb();
+    const { owner } = await pair();
+    const work = await createFolder(db, { userId: owner.id, name: 'work' });
+    for (const letter of ['a', 'b', 'c', 'd']) {
+      await makeNote(db, owner.id, { name: `inside-${letter}`, folderId: work.id });
+    }
+    await makeNote(db, owner.id, { name: 'work plan' });
+    // The one row whose **name** matches is also the oldest row in the corpus, so a `limit` ordered by recency
+    // alone would keep the four folder matches and drop it (PR-11 review, inline `r4722272755`).
+    await catalogRows(
+      sql`update notes
+             set content_updated_at = '2020-01-01T00:00:00Z'::timestamptz
+           where user_id = ${owner.id} and name = 'work plan'`,
+    );
+
+    const searchBy = async (limit: number) => {
+      const rows = await searchNotesByMetadata(db, {
+        userId: owner.id,
+        pattern: likeContainsPattern('work'),
+        limit,
+      });
+      return rows.map((row) => `${row.name}:${String(row.nameMatched)}`);
+    };
+
+    // The bound is a bound on *matching rows*, and the tier ordering is what makes it harmless: the cut falls on
+    // rows the endpoint would have ranked below the ones it kept, never on the name hit. The folder rows' internal
+    // order is deliberately not asserted — they were written in one millisecond or several, and only the tier is
+    // the subject here.
+    expect(await searchBy(1)).toStrictEqual(['work plan:true']);
+
+    const topThree = await searchBy(3);
+    expect(topThree[0]).toBe('work plan:true');
+    expect(topThree).toHaveLength(3);
+    expect(topThree.slice(1).every((row) => row.endsWith(':false'))).toBe(true);
+
+    const everything = await searchBy(5);
+    expect(everything.filter((row) => row.endsWith(':true'))).toStrictEqual(['work plan:true']);
+    expect(everything).toHaveLength(5);
   });
 });

@@ -40,8 +40,13 @@ Conventional-commit title; PR body starts `Task: PR-11`; CI green; never lower a
 
 ## 4. Required behavior
 
-- **Name / folder-path match in SQL:** `ILIKE` on `lower(name)` **with `%` and `_` escaped** so they are literal. This
-  branch guarantees coverage of the whole corpus, but it is **accent-sensitive** (see the Unicode rule below).
+- **Name / folder-path match in SQL:** `ILIKE` on `lower(name)` **with `%` and `_` escaped** so they are literal
+  (`\` is escaped too, being the escape character). The folder half matches a **segment** of the breadcrumb — one
+  folder name — rather than the `/`-joined path: `/` is a forbidden name character (`docs/NAME-RULES.md`), so a query
+  containing it should match nothing instead of every note under some folder. This branch tests the whole corpus,
+  though it returns at most **500 matching rows** — and `ORDER BY name_matched DESC, content_updated_at DESC` is what
+  keeps that bound from dropping a name hit in favour of 500 newer folder matches (PR-11 review); the ordering is
+  part of the contract, not an optimization. It is also **accent-sensitive** (see the Unicode rule below).
 - **Name / path / body match in-process:** load up to **500** most recently updated notes for the user, decrypt, and match
   the name, the folder path and the body case-insensitively (substring/word). This pass is what makes results
   accent-aware, and it is also where a name hit is distinguished from a body hit for scoring.
@@ -62,7 +67,10 @@ Conventional-commit title; PR body starts `Task: PR-11`; CI green; never lower a
 
 **Create:** `apps/server/src/services/search.service.ts`, `apps/server/src/routes/search.routes.ts`,
 `apps/server/src/{services,routes}/search.int.test.ts` (+ a 1 000-note fixture helper in `src/test/fixtures.ts`).
-**Modify:** `apps/server/src/app.ts` (add-only route registration), `docs/API.md`.
+**Modify:** `apps/server/src/app.ts` (add-only route registration), `docs/API.md`. (Two statements were unavoidable
+in `db/repositories/notes.repo.ts` — `searchNotesByMetadata` and `listRecentNotesForSearch`, both joining
+`folders.repo.ts`'s new `folderPathCte` — because "scoped to `auth.userId` inside the repository" and "the folder
+path is SQL's breadcrumb walk" are both rules about the statement, not about a caller.)
 
 ## 6. Acceptance criteria (integration)
 

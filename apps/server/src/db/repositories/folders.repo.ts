@@ -27,12 +27,15 @@
  * * {@link folderSubtreeHeight} — the **downward** walk: how much does a move carry. The upward walk alone
  *   would pass a whole deep subtree re-parented under a shallow root and drop its tail below the guard.
  * * {@link listFolderTree} — `GET /api/tree` as one recursive CTE that also walks the breadcrumb path.
+ * * {@link folderPathCte} — PR-11's search: that same breadcrumb walk as a **fragment**, so a statement that
+ *   starts in another table (`notes.repo.ts`'s two search statements) can join the path instead of re-deriving
+ *   it in JavaScript, where it would be a second implementation of "what is this note's folder path".
  *
  * Every recursive statement here carries the same bound, {@link TREE_WALK_GUARD}: a runaway belt against
  * corrupted `parent_id` data and never a silent truncation, because the service refuses any write that would
  * put a folder below depth 99 (§5.1–§5.2).
  */
-import { and, asc, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, isNull, type SQL, sql } from 'drizzle-orm';
 
 import type { Db, DbOrTx } from '../client.js';
 import { newId } from '../ids.js';
@@ -346,6 +349,44 @@ export async function listFolderTree(db: Db, input: { readonly userId: string })
     depth: Number(row.depth),
     path: rawTextArray(row.path),
   }));
+}
+
+/**
+ * The breadcrumb walk of {@link listFolderTree}, extracted as a composable fragment (PR-11, search).
+ *
+ * Its result is two columns, `id` and `path` — the folder's own name and every ancestor's in a `text[]`, root
+ * first, which is the same list {@link listFolderTree} hands the tree endpoint. `depth` exists inside the walk as
+ * the guard's counter and is not selected out of it: a caller that wants a folder's depth has the statement that
+ * reports it ({@link folderDepth}).
+ *
+ * It is a fragment rather than a statement of its own for one reason: search's queries start from `notes`, and the
+ * question one of them asks — "is this note in a folder called `work`?" — has to be answered **in the statement**,
+ * because the answer decides which rows come back. Re-deriving the path in JavaScript would put that predicate
+ * outside SQL, and leave two definitions of "this note's folder path" a rename could disagree about.
+ *
+ * **Both terms are scoped by `user_id`, and the recursive term is the half that needs saying.** The anchor can
+ * only start from the caller's root folders, but `folders.parent_id` carries no `user_id` constraint (schema.ts:
+ * the FKs deliberately do not), so a row belonging to someone else could name one of our folders as its parent.
+ * Filtering the recursive term means such a row never enters `path`, which is what lets a caller display
+ * `array_to_string(path, '/')` without a second look at who owns each element.
+ *
+ * Bounded by {@link TREE_WALK_GUARD} like every other walk in this file: the CTE stops at 100 levels, and
+ * `folder.service.ts` has refused to create anything deeper, so the bound only ever fires on corrupt data.
+ */
+export function folderPathCte(userId: string): SQL {
+  return sql`
+    with recursive folder_paths as (
+        select f.id, array [f.name]::text[] as path, 0 as depth
+          from folders f
+         where f.user_id = ${userId}
+           and f.parent_id is null
+        union all
+        select child.id, folder_paths.path || child.name, folder_paths.depth + 1
+          from folders child
+          join folder_paths on child.parent_id = folder_paths.id
+         where folder_paths.depth < ${TREE_WALK_GUARD}
+           and child.user_id = ${userId}
+      )`;
 }
 
 /**

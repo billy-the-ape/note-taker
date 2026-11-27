@@ -127,3 +127,37 @@ split|write|preview modes, sanitize via rehype-sanitize, byte counter + 900 KiB 
   undo integrity, mode persistence
 - screenshot/GIF: toolbar + live preview in split mode
 ```
+
+---
+
+## 9. What PR-13 actually shipped, where it differed from this brief
+
+Implemented on `feat/pr-13-editor`. Four decisions moved during implementation; each is a plan change, so it is
+recorded here rather than only in code comments.
+
+1. **No CodeMirror: the buffer is a `<textarea>`.** §5/§4 named CodeMirror as the editor and this brief's own risk
+   section said "if the spike fails, ship a `<textarea>`". The spike was not a bundle-size question but a contract
+   question: PR-14's autosave owns the buffer and its flush triggers (`blur`, `visibilitychange`, `pagehide`,
+   `beforeunload`, `Ctrl/Cmd+S`), PR-14's spec suite asserts the buffer with plain DOM values, and PR-19 wrote its
+   e2e assertions as `page.getByTestId('editor').fill(...)`/`toHaveValue(...)` — all of which are textarea
+   semantics. A textarea with no third-party editor library keeps every one of those true and adds nothing to
+   install; `MarkdownEditor.tsx` is ~180 lines and `lib/markdown.ts` is pure. If a later PR wants syntax colouring
+   or a per-token decoration, this is the file it will replace and the transforms will not move.
+2. **`note-title` is a heading, not a field.** §5 called it "an editable title field" while §4/PR-12 give rename to
+   the tree, and AGENTS' one-renderer rule names two inputs writing one row as the bug. The acceptance criterion —
+   "`note-title` shows the renamed note in the tree **without a reload**" — is satisfied by reading the name from
+   `['tree', userId]` (invalidated by rename), which is what the heading does.
+3. **PR-12's note summary moved here, with its test ids.** `routes/app/index.tsx`'s own header predicted this
+   ("when PR-13 adds `routes/app/note.$noteId.tsx`, this page keeps the recent list and loses the summary").
+   `openNote` is a navigation now, `openedNote` is derived from the location, and `app-note-summary` /
+   `app-note-location` / `app-note-facts` / `app-note-close` render on the note page, so `folders.spec.ts` and
+   `notes.spec.ts` keep their meaning. `app-note-location` deliberately stays the id PR-12 pinned rather than
+   growing a second breadcrumb under §5's `note-location`; PR-17 wants `breadcrumbFor()`, which is exported.
+4. **Three e2e assertions became `toHaveValue`.** `toContainText` reads text nodes and a textarea's text is its
+   `value`; PR-19 wrote them before the control existed. `preview`'s `<strong>` count is asserted **before** the
+   toolbar click, because a bare `click()` inside a textarea puts the caret at a coordinate rather than on a
+   selection, and "the button reached the buffer" is honestly a changed value.
+
+Not done, deliberately: `byte-counter`/`editor` have no e2e case of their own yet (the unit tests cover the
+thresholds and the DOM test covers the line; §6's 900 KiB fixture stays out of the browser), and the note editor
+has no keyboard-only "focus the buffer" affordance beyond the click/Enter path PR-12 shipped.

@@ -105,6 +105,15 @@ export interface TreeServer {
    * the second half and passes while proving the first.
    */
   hold(method: string, path: string): { readonly release: (reply: Reply) => void };
+  /**
+   * The plaintext behind `GET /api/notes/:id` for one row (PR-13's editor route reads it; the tree never
+   * sees it, §9.2 #12).
+   *
+   * The body lives *outside* the note row for the same reason it lives in a different column on the server:
+   * a fake whose tree rows carried `content` would let a test assert that the sidebar had decrypted
+   * something.
+   */
+  setNoteContent(id: string, content: string): void;
   /** The ids the model has handed out, so a test can assert on what a create made without reading its stub. */
   created(): readonly string[];
 }
@@ -141,9 +150,29 @@ function requestId(): string {
  * `initial` defaults to an empty tree — the empty state is a state worth testing, and an empty starting point
  * makes each test's fixtures the only thing a reader has to hold in their head.
  */
-export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer {
+/**
+ * Two words, eleven bytes — deliberately the same shape as `noteNode`'s default `wordCount: 2` and
+ * `contentBytes: 12`, so a test that reads a fixture's metadata and then asks for its body is not
+ * surprised by a different note. Above all it is not `''`: an empty body is a state worth testing, and
+ * a default that is empty cannot tell you the difference between "the fake had nothing" and "the note is
+ * blank".
+ */
+export const DEFAULT_NOTE_CONTENT = 'lorem ipsum';
+
+/**
+ * The fake: `stub` answers every tree route over an in-memory model of PR-09's rules.
+ *
+ * `initial` defaults to an empty tree — the empty state is a state worth testing, and an empty starting point
+ * makes each test's fixtures the only thing a reader has to hold in their head.
+ */
+export function makeTreeServer(
+  initial: Partial<TreeResponse> & { readonly contents?: Record<string, string> } = {},
+): TreeServer {
   let folders: FolderNode[] = [...(initial.folders ?? [])];
   let notes: NoteNode[] = [...(initial.notes ?? [])];
+  // One note's plaintext, keyed by id, absent until somebody says what it is. A missing entry is not "empty
+  // note": the row still exists, so `GET /api/notes/:id` answers it with {@link DEFAULT_NOTE_CONTENT}.
+  const bodies = new Map<string, string>(Object.entries(initial.contents ?? {}));
   const queued: Queued[] = [];
   const created: string[] = [];
   // Ids this fake hands out start at 50 so they cannot collide with a test's own fixtures, which count from 1.
@@ -235,6 +264,13 @@ export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer 
     // Ids are only known at runtime, so the two `:id` routes are matched by prefix instead of by table key.
     const folderId = idOf(request.path, '/api/folders');
     const noteId = idOf(request.path, '/api/notes');
+
+    // PR-13's editor read: the row, plus the body the tree is not allowed to carry.
+    if (request.method === 'GET' && noteId !== undefined) {
+      const note = notes.find((candidate) => candidate.id === noteId);
+      if (note === undefined) return notFound('note');
+      return { status: 200, body: { ...note, content: bodies.get(noteId) ?? DEFAULT_NOTE_CONTENT } };
+    }
 
     if (request.method === 'PATCH' && folderId !== undefined) {
       const folder = folders.find((candidate) => candidate.id === folderId);
@@ -338,6 +374,9 @@ export function makeTreeServer(initial: Partial<TreeResponse> = {}): TreeServer 
         }),
       });
       return { release };
+    },
+    setNoteContent: (id, content) => {
+      bodies.set(id, content);
     },
     created: () => created,
   };

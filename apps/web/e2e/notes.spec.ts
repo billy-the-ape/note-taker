@@ -2,7 +2,8 @@
  * Scenarios 2 and 7 — the naming rule a person sees, and the ciphertext nobody sees
  * (docs/plans/mvp/MVP-19.md §5.2, §5.7).
  *
- * **Why two of this file's tests are `test.fixme` and what that is claiming.** PR-19 is the MVP acceptance proof,
+ * **Why one of this file's tests is `test.fixme` and what that is claiming** (it was two until PR-13 landed the editor
+ * route and deleted its own `fixme`, the heading/toolbar/preview case below). PR-19 is the MVP acceptance proof,
  * and two halves of it are not drivable in the tree this PR was built on:
  *
  * * `routes/app/note/$noteId.tsx` is PR-13's file. Without it nothing mounts a textarea, the toolbar transforms,
@@ -93,35 +94,45 @@ test.describe('the naming rule, in the tree', () => {
     },
   );
 
-  test.fixme(
-    'a heading and a toolbar bold render <strong>, and the text is still there after a reload ' +
-      '[blocked: PR-13 has not landed routes/app/note/$noteId.tsx, so no page mounts `editor`/`editor-toolbar`/`preview`]',
-    async ({ page }) => {
-      await signInNewAccount(page, ACCOUNT.noteNaming);
-      await page.goto('/app');
+  test('a heading and a toolbar bold render <strong>, and the text is still there after a reload', async ({
+    page,
+  }) => {
+    await signInNewAccount(page, ACCOUNT.noteNaming);
+    await page.goto('/app');
 
-      // Waiting for the editor pane. The hooks are already named in PR-19 §2 (`editor`, `editor-toolbar`,
-      // `preview`, `mode-split|write|preview`), and `save-status` is merged (PR-14) — only the page that hosts
-      // them is missing.
-      const note = await createNote(page, { name: 'heading', content: 'plain words\n' });
-      await page.goto(`/app/note/${note.id}`);
+    const note = await createNote(page, { name: 'heading', content: 'plain words\n' });
+    await page.goto(`/app/note/${note.id}`);
 
-      const editor = page.getByTestId('editor');
-      await editor.fill('# A heading\nand **bold** words\n');
+    const editor = page.getByTestId('editor');
+    await editor.fill('# A heading\nand **bold** words\n');
 
-      // The toolbar transform, not a typed asterisk: bold is applied to the selection by the button.
-      await editor.click();
-      await page.getByTestId('editor-toolbar').getByTestId('toolbar-bold').click();
-      await expect(editor).toContainText('**bold**');
+    // The render comes first, and the order is the point: `<strong>` exactly twice — one from the ATX
+    // heading, one from the typed `**bold**` — is a claim about *this* buffer, so it is measured before the
+    // toolbar gets a chance to move it. `mode-preview` then hides the source without unmounting it
+    // (`lib/editorMode.ts`), which is why the count is read from `preview` and not from a new page.
+    await page.getByTestId('mode-preview').click();
+    await expect(page.getByTestId('preview').locator('strong')).toHaveCount(2);
 
-      await page.getByTestId('mode-preview').click();
-      await expect(page.getByTestId('preview').locator('strong')).toHaveCount(2);
+    // The toolbar, second: `toolbar-bold` has to reach the buffer. It is asserted as a value that *changed*
+    // rather than as a particular string, because a bare `click()` puts the caret wherever the element's
+    // centre happens to fall in a textarea — the transform's exact output for that is `lib/markdown.ts`'s
+    // unit table's business, and this is the browser-level proof that the button is wired to the buffer.
+    const before = await editor.inputValue();
+    await editor.click();
+    await page.getByTestId('editor-toolbar').getByTestId('toolbar-bold').click();
+    await expect(editor).not.toHaveValue(before);
 
-      await page.reload();
-      await expect(page.getByTestId('editor')).toContainText('A heading');
-      await expect(page.getByTestId('editor')).toContainText('**bold**');
-    },
-  );
+    // `toHaveValue`, three times, and not `toContainText`: a textarea's text is its `value`, not a text
+    // node, so "the text is still there" has one honest form for a control (the same reason
+    // `autosave.spec.ts` reads the editor with `toHaveValue` everywhere). The reload is the interesting
+    // one of the three — it can land before the 800 ms debounce has written, in which case what puts
+    // 'A heading' back on screen is PR-14's `localStorage` mirror, and either way the person's text is
+    // there, which is the promise §5 makes about the buffer and not about the network.
+    await expect(editor).toHaveValue(/\*\*bold\*\*/u);
+    await page.reload();
+    await expect(editor).toHaveValue(/A heading/u);
+    await expect(editor).toHaveValue(/\*\*bold\*\*/u);
+  });
 });
 
 test.describe('the row itself, at rest', () => {

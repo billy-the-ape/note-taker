@@ -17,6 +17,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && pnpm -r typecheck",
     "test": "pnpm -r test",
     "test:integration": "pnpm -r test:integration",
+    "test:e2e": "pnpm build && pnpm --filter @note-taker/web test:e2e",
     "coverage:integration": "pnpm -r coverage:integration",
     "db:generate": "pnpm -r db:generate",
     "db:migrate": "pnpm -r db:migrate",

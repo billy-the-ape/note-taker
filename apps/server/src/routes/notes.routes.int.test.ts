@@ -36,18 +36,39 @@ import {
 import { sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { beforeEach, describe, expect, it } from 'vitest';
-
 import { withApp } from '../test/helpers/app.js';
 import { type Jar, jarHeaders } from '../test/helpers/cookies.js';
 import { catalogRows, resetDb, testDb } from '../test/helpers/db.js';
 import { captureLogs } from '../test/helpers/log-capture.js';
 import { bootstrapOwner, createMember, envelopeOf, signedOutCsrfHeaders } from '../test/helpers/session.js';
+import { ifMatchAdmits } from './notes.routes.js';
 
 const db = testDb();
 
 beforeEach(async () => {
   await resetDb();
 });
+
+/**
+ * Writes a body the way the editor does: the version it read, and that version as `If-Match` too.
+ *
+ * Module-level rather than inside one `describe`, because two of them drive the same request shape — PR-10's
+ * version rules and PR-19's `If-Match`-header-shapes block below.
+ */
+function put(
+  app: FastifyInstance,
+  jar: Jar,
+  input: { readonly id: string; readonly content: string; readonly baseVersion: number },
+  etag?: string,
+) {
+  const headers = { ...jarHeaders(jar), ...(etag === undefined ? {} : { 'if-match': etag }) };
+  return app.inject({
+    method: 'PUT',
+    url: ROUTES.noteContent(input.id),
+    headers,
+    payload: { content: input.content, baseVersion: input.baseVersion },
+  });
+}
 
 /** Reads one header as the string a client would compare, so `string | string[]` cannot hide a missing header. */
 function headerOf(response: { headers: Record<string, unknown> }, name: string): string | undefined {
@@ -314,22 +335,6 @@ describe('PUT /api/notes/:id/content (§9.2 #18)', () => {
             from notes where id = ${id}`,
     );
     return (rows[0] ?? {}) as Record<string, number>;
-  }
-
-  /** Writes a body the way the editor does: the version it read, and that version as `If-Match` too. */
-  function put(
-    app: FastifyInstance,
-    jar: Jar,
-    input: { readonly id: string; readonly content: string; readonly baseVersion: number },
-    etag?: string,
-  ) {
-    const headers = { ...jarHeaders(jar), ...(etag === undefined ? {} : { 'if-match': etag }) };
-    return app.inject({
-      method: 'PUT',
-      url: ROUTES.noteContent(input.id),
-      headers,
-      payload: { content: input.content, baseVersion: input.baseVersion },
-    });
   }
 
   it('writes a new version, answers with it, and moves the ETag the read side had issued', async () => {
@@ -907,5 +912,83 @@ describe('PATCH and DELETE /api/notes/:id (§9.2 #19, #20)', () => {
       },
       { db },
     );
+  });
+});
+
+/**
+ * The `If-Match` shapes §5 promises, which are the half of PR-10 a client can get wrong in a way that looks
+ * like success: this API has no `412` member, so a header that names no state at all is answered by the same
+ * `VERSION_CONFLICT` the database would have produced, and never by the write.
+ *
+ * `ifMatchAdmits()` is asserted directly as well as through the wire because the two are different questions:
+ * the wire says what a browser gets, and the pure function owns the rules the wire cannot reach — a repeated
+ * header arriving as `string[]`, and the `MAX_NOTE_VERSION` ceiling the header and the body half of one request
+ * share (a tag naming `2147483648` names nothing, so it cannot quietly agree with a body asking for the same
+ * unreachable number).
+ */
+describe('If-Match on PUT /api/notes/:id/content (PR-10 §5)', () => {
+  /** A note at version 1, in a folder of its own, owned by a fresh owner. */
+  async function noteAtV1(app: FastifyInstance): Promise<{ jar: Jar; id: string }> {
+    const owner = await bootstrapOwner(app);
+    const created = await app.inject({
+      method: 'POST',
+      url: ROUTES.notes,
+      headers: jarHeaders(owner),
+      payload: { name: 'header-shapes', content: 'v1 body' },
+    });
+    return { jar: owner, id: noteWithContentSchema.parse(created.json()).id };
+  }
+
+  it('takes `*` and a list that names the base version, and refuses every shape that names none', async () => {
+    await withApp(
+      async (app: FastifyInstance) => {
+        const { jar, id } = await noteAtV1(app);
+
+        // `*` — "apply this to whatever is there" (RFC 9110), which is what a client that read the note through a
+        // proxy it does not trust uses. Existence is not the header's business: a foreign id 404s either way.
+        const wildcard = await put(app, jar, { id, content: 'v2 body', baseVersion: 1 }, '*');
+        expect(wildcard.statusCode, wildcard.body).toBe(200);
+        expect(headerOf(wildcard, 'etag')).toBe('W/"v2"');
+
+        // A list is the set of states the client is willing to overwrite, so `some`, not `every`: `W/"v1"` is
+        // stale here and `"v2"` is exactly right, and the request is legal.
+        const list = await put(app, jar, { id, content: 'v3 body', baseVersion: 2 }, 'W/"v1", "v2"');
+        expect(list.statusCode, list.body).toBe(200);
+
+        // Shapes that name no version: a digest (the shape `ETag` would have with a real validator), a version
+        // past the `integer` column, version 0 which no note has ever had, and a header that is not a tag. None
+        // of them writes; all of them get the answer with a recovery.
+        for (const header of ['"deadbeef"', 'W/"v2147483648"', 'W/"v0"', 'not-a-tag']) {
+          const refused = await put(
+            app,
+            jar,
+            { id, content: 'written by a header that names nothing', baseVersion: 3 },
+            header,
+          );
+          expect(refused.statusCode, `${header} → ${refused.body}`).toBe(409);
+          expect(refused.json()).toMatchObject({ error: { code: 'VERSION_CONFLICT' } });
+        }
+
+        // The row is what the last accepted write left there — "refused" is not "wrote and then reported".
+        const read = await app.inject({ method: 'GET', url: ROUTES.note(id), headers: jarHeaders(jar) });
+        expect(noteWithContentSchema.parse(read.json()).content).toBe('v3 body');
+      },
+      { db },
+    );
+  });
+
+  it('reads the header shapes the wire cannot produce, against the same ceiling as the body', () => {
+    // A repeated header arrives as an array, and each entry is its own candidate rather than somebody else's
+    // comma-separated problem.
+    expect(ifMatchAdmits(['W/"v1"', '"v2"'], 2)).toBe(true);
+    expect(ifMatchAdmits(['"v1"', '"v3"'], 2)).toBe(false);
+    // Absent is not a precondition, and `*` is whitespace-tolerant because HTTP says so.
+    expect(ifMatchAdmits(undefined, 7)).toBe(true);
+    expect(ifMatchAdmits('  *  ', 7)).toBe(true);
+    expect(ifMatchAdmits('', 7)).toBe(false);
+    // The ceiling `noteVersionSchema` puts on `baseVersion` is the ceiling on what a tag can name, so the two
+    // halves of one request cannot disagree about what the domain is.
+    expect(ifMatchAdmits('W/"v2147483648"', 2147483648)).toBe(false);
+    expect(ifMatchAdmits('W/"v2147483647"', 2147483647)).toBe(true);
   });
 });

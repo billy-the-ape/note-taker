@@ -1054,3 +1054,77 @@ describe('the CSRF cookie is re-issued wherever an identity changes (§5, §7)',
     );
   });
 });
+
+/**
+ * The **byte** cap the auth bodies add on top of `passwordSchema`'s **character** cap (PR-07 §5, plan §10).
+ *
+ * The two caps are different measurements and only a multi-byte password tells them apart: 300 `é` is legal
+ * against `.max(512)` characters and over the route's 512-byte limit. The routes add it because the argon2
+ * binding hashes its input before it hashes anything, so an over-long secret is work the server is asked to do
+ * for a request that can never be accepted — and because the refusal has to arrive as the same `400 VALIDATION`
+ * with `details[].path` the other rules produce, not as a `500` from inside the hash.
+ *
+ * `POST /api/auth/setup` and `POST /api/auth/password` are the two doors an operator meets first (the owner's
+ * own bootstrap, and the password change), and both add the cap at their own field name.
+ */
+describe('the UTF-8 byte cap on a password a client may legitimately send', () => {
+  /** 300 characters, 600 bytes UTF-8: under the contract's character cap, over the route's byte cap. */
+  const WIDE_PASSWORD = 'é'.repeat(300);
+
+  it('refuses it on setup, without repeating the secret', async () => {
+    await withApp(
+      async (app) => {
+        const refused = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.setup,
+          payload: { username: 'ada.lovelace', password: WIDE_PASSWORD },
+        });
+
+        expect(refused.statusCode, refused.body).toBe(400);
+        expect(envelopeOf(refused)).toMatchObject({
+          code: 'VALIDATION',
+          details: [{ path: 'password' }],
+        });
+        // A validation envelope that echoed the rejected field would put a 600-byte near-secret into every log
+        // and every support ticket. The message names the rule; the value stays out.
+        expect(JSON.stringify(refused.json())).not.toContain(WIDE_PASSWORD.slice(0, 24));
+
+        // …and the instance is not half-bootstrapped by a request the body schema refused: `/setup` is open
+        // exactly as it was, so the operator can follow it up with a password that fits.
+        const status = await app.inject({ method: 'GET', url: ROUTES.auth.status });
+        expect(status.json()).toMatchObject({ needsSetup: true });
+      },
+      { db: testDb() },
+    );
+  });
+
+  it('refuses it as a new password, before the current one is verified', async () => {
+    await withApp(
+      async (app) => {
+        const setup = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.setup,
+          payload: { username: 'ada.lovelace', password: PASSWORD },
+        });
+        expect(setup.statusCode).toBe(200);
+        const acting = jarAfter(setup);
+
+        const refused = await app.inject({
+          method: 'POST',
+          url: ROUTES.auth.password,
+          headers: jarHeaders(acting),
+          payload: { currentPassword: 'wrong-but-never-checked', newPassword: WIDE_PASSWORD },
+        });
+
+        // `400 VALIDATION` rather than `401`: the body was rejected while it was parsed, so the current secret
+        // was never verified and no hash was spent — the same argument the username rule on this endpoint makes.
+        expect(refused.statusCode, refused.body).toBe(400);
+        expect(envelopeOf(refused)).toMatchObject({
+          code: 'VALIDATION',
+          details: [{ path: 'newPassword' }],
+        });
+      },
+      { db: testDb() },
+    );
+  });
+});

@@ -3,6 +3,12 @@
   // config files below can join the program without disturbing an outDir. `moduleResolution` is
   // `bundler` because Vite, not Node, resolves these specifiers (no `.js` suffixes on our own
   // `.tsx` imports).
+  //
+  // `e2e` and `playwright.config.ts` are here for the same reason they are not in `src`: the Playwright
+  // suite is compiled by Playwright's own loader, so without this line its specs would never be
+  // typechecked by anything (docs/plans/mvp/MVP-19.md §7 — a scenario that cannot compile is not a
+  // scenario). Nothing in `e2e` is emitted, so no `outDir` moves.
+  //
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "module": "ESNext",
@@ -12,5 +18,5 @@
     "types": ["vite/client", "node"],
     "noEmit": true
   },
-  "include": ["src", "vite.config.ts", "vitest.config.ts"]
+  "include": ["src", "e2e", "playwright.config.ts", "vite.config.ts", "vitest.config.ts"]
 }

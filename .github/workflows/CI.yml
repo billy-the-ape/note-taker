@@ -305,3 +305,60 @@ jobs:
       # build, the pruned install, and the contract package that has to resolve inside it.
       - name: docker build
         run: docker build --file docker/Dockerfile --tag note-taker-app:ci .
+
+  # PR-19's job — the MVP acceptance proof (docs/plans/mvp/MVP-19.md §4). It is the only job that drives the
+  # *compiled* artifact in a real browser: `pnpm test:e2e` builds both apps and Playwright's `webServer` boots
+  # `node apps/server/dist/index.js` with `NODE_ENV=test`, so the hashed bundles, PR-12's single-port SPA
+  # fallback, the helmet CSP and the migration that runs before `listen()` are all part of what is tested.
+  #
+  # The `postgres:16` service is the same image and the same throwaway credentials the `integration` job uses,
+  # and `DATABASE_URL` is exported for the whole job for the same reason (a set DSN wins verbatim in
+  # `databaseUrl()`, and a CI checkout has no `.env`): the specs' own reader, `apps/web/e2e/db.ts`, has to be
+  # pointed at the database the `webServer` was given.
+  #
+  # `NOTE_ENCRYPTION_KEY` is a **job-env constant, not a secret** — it is the same throwaway value committed in
+  # `apps/web/e2e/env.ts`, exported here so CI and a laptop encrypt with the same key and a red run means the
+  # same thing in both. Scenario 7 asserts `notes.key_version` against `NOTE_ENCRYPTION_KEY_VERSION` (default 1).
+  #
+  # `retries: 1` lives in `apps/web/playwright.config.ts`, not here, and the suite is expected to need it never:
+  # MVP-19 §7 asks for three consecutive clean runs, which is the difference between a flaky suite and a slow
+  # runner. Browser install is `--with-deps` because a GitHub runner has the sudo for it; locally
+  # `pnpm --filter @note-taker/web exec playwright install chromium` is enough.
+  e2e:
+    # Runs after the gates it proves: a tree whose lint, units or migrations are red cannot produce an
+    # informative browser run, and this job is the slowest thing in the workflow.
+    needs: [quality, unit, integration, build]
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        # `postgres:16`, not `-alpine`, for the reason spelled out on the `integration` job's service: the Debian
+        # image is glibc like the dev container, so the e2e database reads and sorts like a real one.
+        image: postgres:16
+        env:
+          POSTGRES_USER: notetaker
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: notetaker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://notetaker:test@localhost:5432/notetaker_test
+      NOTE_ENCRYPTION_KEY: bm90ZS10YWtlciBlMmUgdGhyb3dhd2F5IGtleSAwMTI=
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # After the install and before the run: the browser is a dependency of `apps/web` (`@playwright/test`), and
+      # pnpm does not expose one workspace's dependencies to another, so the CLI that installs it has to be that
+      # workspace's. `chromium` only — the suite asserts behavior, not rendering engines.
+      - name: Install the Chromium Playwright drives
+        run: pnpm --filter @note-taker/web exec playwright install --with-deps chromium
+      # One step, and the `pnpm build` MVP-19 §4 asks this job for is inside it: the root script is
+      # `pnpm build && <web playwright test>`, because a suite that drives `dist` has no honest way to run
+      # against a stale `dist`. `build:packages` comes along inside `pnpm build`, as it does everywhere else.
+      - run: pnpm test:e2e

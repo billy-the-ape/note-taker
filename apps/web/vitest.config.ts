@@ -33,27 +33,29 @@ export default defineConfig({
       reporter: ['text', 'html', 'lcov'],
       include: ['src/**/*.{ts,tsx}'],
       /**
-       * The two rows plan §14 assigns to this app.
+       * The two rows plan §14 assigns to this app, both at the **post-PR-19 column** (docs/plans/mvp/MVP-19.md
+       * §6): `src/lib/**` 85/85/85/85 and overall `src/**` 65/65/65/65.
        *
-       * `src/lib/**` (80/80/75/80) is PR-05's and stays where it was — a threshold is never lowered, and
-       * it is a glob key rather than a global threshold so the new screen cannot average it down (and, as
-       * the server config says of its own glob keys, a key here is read and not decorative: raise it to
-       * `99.5` and the job fails with `does not meet "src/lib/**" threshold (99.5%)`).
+       * `src/lib/**` is PR-05's, armed at 80/80/75/80, and it is a glob key rather than a global threshold so the
+       * new screen cannot average it down (and, as the server config says of its own glob keys, a key here is read
+       * and not decorative: raise it to `99.5` and the job fails with
+       * `does not meet "src/lib/**" threshold (99.5%)`).
        *
-       * `src/**` is the overall **`apps/web/src`** row: **55 lines / 55 functions / 50 branches / 55
-       * statements** (docs/plans/mvp/MVP-08.md §7), ratcheting to 65 after PR-19. Both PR-08 (its owner,
-       * and the one that armed it first) and PR-16 — which armed the same row independently while PR-08
-       * was still open — wrote a key for it, so the raw merge carried **two** keys for one scope
-       * (`'**'` and `'src/**'`); this is the single row the plan has. It stays a glob threshold so it
-       * lives here rather than in CI flags (plan §14), and it stays at 55: measured on the merged tree the
-       * suite clears it by a wide margin (~87 lines / 78 functions / 89 branches / 90 statements), and
-       * §14's rule is that the PR with the tests to spare raises the bar — not a merge commit, which
-       * would be raising a number it did not earn and cannot defend if a platform reports coverage
-       * differently.
+       * `src/**` is the overall **`apps/web/src`** row: PR-08 armed it at 55/55/50/55 (docs/plans/mvp/MVP-08.md
+       * §7) precisely so the six UI PRs could raise it, and PR-19 raises it to 65 on the strength of what they
+       * shipped. Both PR-08 (its owner, and the one that armed it first) and PR-16 — which armed the same row
+       * independently while PR-08 was still open — wrote a key for it, so the raw merge carried **two** keys for
+       * one scope (`'**'` and `'src/**'`); this is the single row the plan has. It stays a glob threshold so it
+       * lives here rather than in CI flags (plan §14), and §14's rule is that the PR with the tests to spare
+       * raises the bar — which is the one thing PR-19 is *not* able to do for this scope from a bare clone: the
+       * Playwright suite is excluded from Vitest's glob, so these two numbers are the unit suite's, measured on
+       * the merged PR-08…PR-18 tree, and the ratchet to 65 is only honest because that tree is what `main` is
+       * now. If a later PR finds 65 is more than its own components can carry, the fix is more component tests
+       * in that PR, never a lower number here.
        */
       thresholds: {
-        'src/lib/**': { lines: 80, functions: 80, branches: 75, statements: 80 },
-        'src/**': { lines: 55, functions: 55, branches: 50, statements: 55 },
+        'src/lib/**': { lines: 85, functions: 85, branches: 85, statements: 85 },
+        'src/**': { lines: 65, functions: 65, branches: 65, statements: 65 },
       },
       // `src/test/**` is the same argument the server config makes: the fakes the suite runs on (a
       // session-accurate fake API, a `matchMedia` that can be driven, PR-14's editor stand-in) are the

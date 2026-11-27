@@ -561,6 +561,10 @@ describe('delete: the cascade is behind the name, typed', () => {
     // The label asks for the name the tree shows — `.md` included — because that is the string a person is
     // looking at, and the matcher is exact: not "contains", not trimmed.
     expect(textOf(screen.getByTestId('delete-confirm'))).toContain('Type “draft.md” to confirm');
+    // …and the name is its own element too. PR-19's e2e delete scenario reads the name to type out of
+    // `delete-confirm-display-name` rather than parsing the sentence above, so the hook is pinned here, where a
+    // copy change is a one-line finding, and not in a browser run whose delete scenario happened to fail.
+    expect(textOf(screen.getByTestId('delete-confirm-display-name'))).toBe('draft.md');
     expect(submit().disabled).toBe(true);
 
     await user.type(input(), 'draft');

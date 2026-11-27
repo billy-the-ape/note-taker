@@ -45,8 +45,10 @@ same PR.
 ## 4. Files to create
 
 `apps/web/src/routes/app/settings.tsx`, `apps/web/src/features/settings/*` (queries/mutations/hooks), theme application
-(`class="dark"` on `<html>`, applied from the settings value with `system` resolving through
-`matchMedia('(prefers-color-scheme: dark)')`), and the wiring that feeds `GET/PATCH /api/settings` into `useAutosave()`.
+(`class="dark"` **or** `class="light"` on `<html>` — one of the two, applied from the settings value with `system`
+resolving through `matchMedia('(prefers-color-scheme: dark)')`; `light` is written rather than inferred from the absence
+of `dark`, because `styles/globals.css` only stands its media query down for `:not(.light)`), and the wiring that feeds
+`GET/PATCH /api/settings` into `useAutosave()`.
 
 `data-testid`s for PR-19: `settings-autosave-toggle`, `settings-theme-select`, `settings-theme-light`,
 `settings-theme-dark`, `settings-theme-system`, `change-password-form`, `sign-out-everywhere`.
@@ -56,8 +58,10 @@ same PR.
 - Autosave toggle → optimistic `PATCH`, invalidates `['settings']`, and the **already-open editor reacts immediately**
   (pill text changes, no debounce writes while off, `Ctrl/Cmd+S` and the explicit Save button still work, navigating away
   with a dirty buffer prompts "Save / Discard / Stay").
-- Theme select (system/light/dark) → persisted via `PATCH /api/settings`, applied as `class="dark"` on `<html>`, survives
-  reload, and `system` follows the OS.
+- Theme select (system/light/dark) → persisted via `PATCH /api/settings`, applied as `class="dark"` or `class="light"` on
+  `<html>` (the explicit `light` is what makes an account's choice beat a dark OS: the stylesheet's media query only
+  stands down for `:not(.light)`), survives reload, and `system` follows the OS. The classes are the screen's own
+  property: they are removed again when it unmounts, so signing out does not leave the account's theme on `/login`.
 - Change-password form: validates the current password (server error rendered inline), and after success
   **the current session survives** — no forced re-login — while every other session of that user is deleted, so another
   tab fails on its next request.
@@ -99,3 +103,102 @@ system), change-password form (session rotation semantics), sign-out-everywhere 
 - vitest run: autosave toggle effective in the open editor (pill + no debounce writes), change-password keeps the current
   session and kills others, logout-all redirect, theme persistence + system resolution
 ```
+
+## 9. What landed (record, written by the PR that did the work)
+
+Only **PR-07** of the three dependencies named in the header is in this tree: **PR-09's settings endpoints are not
+registered** (`app.ts` mounts health, auth and users only — the `settings` *table* is PR-04's, with the defaults PR-09
+documents), **PR-14 has not merged**, and PR-08 — whose `components/ui/*` and session context §2 assumes — is not
+merged either. One acceptance mechanism therefore had to be chosen rather than assumed. All of it is recorded here
+because the next PR reads this file, not the commit messages.
+
+| §6 criterion | Where it is asserted |
+| --- | --- |
+| Autosave off takes effect immediately in the **open** editor; back on resumes debouncing | `features/settings/autosave-roundtrip.test.tsx` (the flag reaches the editor through one `QueryClient`, with the `PATCH` still in flight; zero debounce writes while off; `Ctrl/Cmd+S` and the Save button still write) |
+| Wrong current password ⇒ inline error, nothing changes | `features/settings/change-password.test.tsx` (the server's `401` text is rendered under the form; password, sessions, route and cache all unchanged) |
+| The acting session survives; every other session answers `401` | same file, third test (`GET /api/auth/session` still returns a user on the **rotated** cookie; the second tab's next guarded request is a `401`) |
+| Sign out everywhere ⇒ `logout-all`, `/login`, other tabs dead | `features/settings/sign-out-everywhere.test.tsx` |
+| Theme persists across reload and respects `system` (stored value **and** applied class) | `features/settings/theme.test.ts` + `features/settings/theme-sync.test.tsx` |
+| A user with no settings row still gets defaults | `theme-sync.test.tsx` (last test) and `settings-page.test.tsx`, both against a fake whose first read creates the server's defaults |
+| `apps/web/src` ≥ 55/55/50/55 | armed in `apps/web/vitest.config.ts` (at 89.6% lines when this landed) |
+
+- **PR-09's endpoints are not registered**, so the two settings calls are exercised against `src/test/fake-api.ts`,
+  whose semantics are taken from `docs/API.md` #22 and `db/schema.ts` (`autosave` default `true`, `theme` default
+  `'system'`, `settings_theme_check`) rather than invented here. The credential calls are the opposite case: they *are*
+  served, and PR-07's own `apps/server/src/routes/auth.routes.int.test.ts` ("kills the old password, keeps this session
+  alive, and deletes every other one") proves the same semantics server-side — which is what makes pinning the rotation
+  criterion from the client half safe. PR-09 has since landed, and `apps/server/src/routes/settings.routes.int.test.ts`
+  is the server-side half the fake is meant to track — keep the two in step, exactly as `fake-api.ts` says.
+- **PR-08 was absent when this was written**, so the screen is self-contained Tailwind rather than `components/ui/*`,
+  and `ApiClientProvider` is `lib/api-client-context.tsx` — PR-16's own. PR-08 has since merged and did **not** add a
+  provider (its components call the `lib/api` singleton directly), so this file stays; whether a later PR re-exports it
+  is open. The **overall `apps/web/src` coverage row** was armed here for the same reason, and PR-08 armed the same row
+  independently: merging the two kept **PR-08's `'src/**'` row** and dropped PR-16's duplicate `'**'` key (plan §14
+  says so, and `apps/web/vitest.config.ts` says why).
+- **PR-14 was absent.** The flag's consumer was `apps/web/src/test/editor-harness.tsx`, a ~50-line stand-in that
+  implements exactly PR-14 §6's `settings.autosave === false` rule and is documented as a harness rather than a
+  component. `useAutosaveEnabled()` is the injection surface PR-14 briefs, and PR-14 has since merged:
+  `features/notes/useAutosave.ts` reads `settingsOptions()` / `autosaveFlag()` from the merged `features/settings/settings.api.ts`.
+  The harness survived the merge on purpose — PR-16's assertions are about the *flag contract*, not the engine — but the
+  follow-up is for PR-14's engine to cover those same rows rather than leave two implementations of one rule.
+- **"Navigating away with a dirty buffer prompts Save / Discard / Stay" (§5) is not implemented here.** That prompt is
+  a router blocker, and `routes/app/route.tsx` — PR-12's, which has since merged — is where the `useBlocker` kit hangs
+  off, while the note route that needs it is PR-13's. A settings PR inventing its own blocker would be the second,
+  weaker copy MVP-08 §4 rules out. The harness
+  leaves the blocker out and says why, so the prompt lands once — with PR-13 — rather than twice.
+- **Review round 1 fixed two UI defects this PR shipped** (see the PR discussion, not a §6 criterion):
+  - The first draft defined `--color-paper-dark`/`--color-ink-dark` and used them on `<body>` only, so under
+    `class="dark"` the `<select>` and both password `<input>`s kept `bg-paper` (`#f8fafc`) and inherited the light
+    body text — about 1.1:1. `styles/globals.css` now **redefines the three semantic tokens on `html.dark`**, because
+    v4 compiles `bg-paper` to `var(--color-paper)` and `/20` modifiers to `color-mix(… var(--color-ink) …)`: one flip
+    repaints every utility that names them, including inside form controls. PR-08's token set should keep that shape
+    (names that mean paper/ink, values that depend on the theme) rather than pairing each token with a `-dark` twin
+    nothing reads.
+  - The error screen is gated on `isError && !hasData`. React Query v5 raises `isError` for a failed **background
+    refetch** while keeping `data`, and this screen refetches after every patch, so `isError` alone meant "a `PATCH`
+    failed *and* the refetch behind it failed" wiped four working controls, hid the patch error, and discarded
+    half-typed passwords. A failed refresh with a row on screen is a note (`settings-refresh-error`) with its own
+    retry; only a screen with nothing to show gets replaced.
+- **Review round 2 fixed three behavior defects** (the first two were invisible to the tests that shipped; both now have
+  assertions that fail without the fix):
+  - **A wrong current password signed the user out.** `lib/api.ts` fired its app-wide `onUnauthorized` hook for *every*
+    `401`, and `POST /api/auth/password` answers `401` for a typo in the current-password box. `features/auth/session.tsx`
+    installs the handler, so production bounced the person to `/login` and never showed the inline message — while the
+    session they were signed in with stayed valid. The first fix was a route exemption (`isCredentialOnly401` in
+    `lib/api.ts`, asserted in `lib/api.test.ts`); **round 3 found that exemption too broad** and it no longer exists —
+    see the next entry. The header comment here used to say "whoever wires that hook has to exclude this route", which
+    was already the wrong shape for the problem.
+  - **A stored `light` lost to a dark OS.** `applyThemeClass` only ever added or removed `dark`, but
+    `styles/globals.css`'s media-query block stands down only for `:not([data-theme="light"]):not(.light)`, so with
+    account = light, OS = dark and no per-browser knob the page painted dark. `light` is now written as a class
+    (`LIGHT_CLASS`), and `theme-sync.test.tsx` asserts it beside `dark()` — `dark() === false` alone was the blind spot.
+  - **The account's theme survived sign-out.** `SettingsEffects` is mounted under `/app` only, and a normal sign-out is a
+    client-side navigation, so `html.dark` stayed on the document and painted `/login` dark until a hard reload.
+    `useThemeSync` now removes both classes in its cleanup, and the criterion is "leaves no theme class behind when the
+    screen unmounts".
+  - **Why the tests missed it:** `renderSettings` rendered against a tab whose client had no `onUnauthorized` at all, so
+    the wrong-password case could not fail. `FakeServer.tab()` now accepts the hook, `renderSettings` always installs a
+    recording one, and `expiryEvents()` is asserted empty for the password route and non-empty by a control test using
+    the *same* hook on another route.
+  - One residual docs disagreement from round 1: plan §13's PR-05 passage still assigned the overall `apps/web/src` row
+    to PR-16; §14's authority bullet is the one that says PR-08 owns it, and that passage now agrees.
+- **Review round 3 caught the over-correction in round 2's first fix.** Exempting `POST /api/auth/password` from the
+  expiry hook swallowed the expiry that route can also answer: it sits behind `guard.requireAuth`
+  (`apps/server/src/routes/auth.routes.ts`), whose `401 UNAUTHORIZED` for a missing or expired cookie is the *same* code
+  as `auth.service.ts`'s 'the current password is not right', and the service has a third `401` ('this session is no
+  longer signed in') for a row deleted between the guard and the write. A settings tab left open past the TTL therefore
+  showed a red form on a dead page instead of going to `/login`. `lib/api.ts` now neither guesses in nor guesses out on
+  that route: `sessionGoneError` asks `GET /api/auth/session` (#8, `{user:null}` rather than `401`, so no loop and no
+  prose matching) and the hook fires only when that says gone — with an unanswered probe (network failure, `5xx`)
+  deliberately *not* evidence, because PR-08's rule is that a dead API is explained by the page standing there. The
+  predicate is now `isCredentialBodyRoute` (the route is where the ambiguity lives; the answer is not
+  self-describing), the login-family routes stay out of the list because they have no session to be about, and
+  `docs/API.md` #9 states the three causes. Asserted three ways: `lib/api.test.ts` (wrong password + a live session
+  stays silent, and the probe is exactly one `GET`; a `401` on that route with `{user:null}` fires once; an
+  unanswered probe fires nothing) and `features/settings/change-password.test.tsx` (the same submit before and after
+  another tab signs out everywhere, which the fake already modeled at its `requireAuth` branch — what it lacked was a
+  test reaching that branch, and that is what round 2's `expiryEvents()` could not see).
+- **The settings reads validate their body.** `GET /api/settings` needs no `?includeDeleted` (the contract has no
+  `SettingsIncludeDeleted`, §9.2 #22), and `SettingsUpdatedAt = z.iso.datetime()` rejects the millisecond-less strings
+  a `::text` cast produces — which is a trap on another route, not a reason to skip parsing here. `lib/api.ts` offers
+  an unvalidated `text()` escape hatch; `settings.api.ts` deliberately does not take it.

@@ -17,9 +17,11 @@
  * The three ways a theme gets stated, in the order they beat each other:
  *
  *   1. `@media (prefers-color-scheme: dark)` — the default, for a page with no stated preference.
- *   2. `html[data-theme='dark'|'light']` — what `components/layout/ThemeToggle.tsx` writes for the
- *      session: the interim knob until PR-16 moves the choice into settings.
- *   3. `html.dark` / `html.light` — the class PR-16 owns for the persisted setting.
+ *   2. `html.dark` / `html.light` — the class PR-16 owns for the persisted account setting, written by
+ *      `features/settings/theme.ts` from `GET`/`PATCH /api/settings`. Only an authed page has one.
+ *   3. `html[data-theme='dark'|'light']` — what `components/layout/ThemeToggle.tsx` writes for *this*
+ *      browser, and therefore the strongest: an override that the account default could silently beat
+ *      is not an override (see the guard on the dark rule below).
  *
  * `@theme` holds the light values and they are *not* repeated below: the dark rules override the same
  * custom properties, and a utility reading `var(--color-paper)` cannot tell the difference.
@@ -40,6 +42,24 @@
   --color-danger-soft: #fbeaea;
   --color-ok: #14804a;
 }
+
+/*
+ * PR-16: Tailwind v4's `dark:` variant follows `prefers-color-scheme` by default and would ignore the
+ * class `features/settings/theme.ts` writes, so the variant is redefined as the class-based one. That
+ * keeps a future `dark:bg-…` honest — it will follow the stated theme rather than the operating
+ * system, which is the exact case the header above says a bare `dark:` cannot express.
+ *
+ * The class is not what paints the page, though, and the first draft of this file got that wrong: it
+ * added `--color-paper-dark` & co. and used them on `<body>` alone, which shipped a near-white
+ * (`#f8fafc`) `<select>` and password inputs with light-grey (`#e2e8f0`) text under Dark — about
+ * 1.1:1, i.e. invisible. v4 compiles `bg-paper` to `background-color: var(--color-paper)` and an
+ * opacity modifier such as `border-ink/20` to `color-mix(… var(--color-ink) 20% …)` (checked in the
+ * build output, not assumed), so re-pointing the semantic tokens on the element that carries the
+ * class repaints **every** utility that names them, including inside form controls, where preflight
+ * inherits `color` from `<body>`. Dark values therefore *replace* the light ones below rather than
+ * sitting next to them under names nothing reads.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
 
 /*
  * The dark values, twice: once under the media query and once for an explicit choice. Copying the
@@ -70,9 +90,20 @@
   }
 
   /* An explicit choice wins over the media query in either direction; `light` needs no rules of its
-     own because it is simply excluded above, which is why the selector there is a `:not()`. */
+     own because it is simply excluded above, which is why the selector there is a `:not()`.
+
+     The `:not([data-theme="light"])` on the class branch is the merge rule between the two mechanisms
+     that can now both state a theme: PR-08's per-browser knob (`data-theme`, written by
+     `components/layout/ThemeToggle.tsx`) and PR-16's stored account setting (`class`, written by
+     `features/settings/theme.ts`). It says the choice made in *this* browser outranks the account
+     default, which is what an override is for and is the reading PR-08's own header argues ("a fact
+     about this screen, not about the user, and the two disagree"). Left unguarded, `class="dark"`
+     would keep painting dark after someone used the shell's theme menu to say light — a silent
+     tie-break that no test chose, in a file where the two selectors sit three lines apart.
+     `features/settings/theme-sync.test.tsx` covers the class half; a selector cannot be asserted in
+     jsdom, so this comment is the test. */
   :root[data-theme="dark"],
-  :root.dark {
+  :root.dark:not([data-theme="light"]) {
     color-scheme: dark;
     --color-paper: #10151d;
     --color-paper-2: #1a212c;

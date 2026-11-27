@@ -32,6 +32,7 @@ import { createContext, useContext, useMemo, useState } from 'react';
 import { AppShell, type TreeState } from '../../components/layout/AppShell';
 import { failureMessage } from '../../features/auth/auth.api';
 import { guardNavigation } from '../../features/auth/session';
+import { SettingsEffects } from '../../features/settings/settings-effects';
 import { useUserTree } from '../../features/tree/tree.queries';
 
 export const Route = createFileRoute('/app')({
@@ -108,6 +109,12 @@ function AppLayout() {
 
   return (
     <AppContext.Provider value={value}>
+      {/* PR-16's app-wide effect: the stored theme, applied to `<html>` on every authed load. It lives
+          here rather than in `routes/__root.tsx` because the root owns no furniture and because the
+          value it reads is a signed-in user's row — a signed-out visitor has no settings row to
+          follow, and `prefers-color-scheme` is the right answer for them (see
+          `features/settings/settings-effects.tsx`). */}
+      <SettingsEffects />
       <AppShell tree={tree} onOpenNote={setOpenedNote} openedNoteId={openedNote?.id ?? null}>
         <Outlet />
       </AppShell>

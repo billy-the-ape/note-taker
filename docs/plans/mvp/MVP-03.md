@@ -83,7 +83,9 @@ Rules encoded here:
   CI. `pnpm coverage` measures only the pure scopes (no DB): `packages/contracts` 90/90/85/90,
   `apps/server/src/{crypto,domain}` 80/80/75/80, `apps/web/src/lib` 80/80/75/80, `apps/web/src` 55/55/50/55
   (each row armed by the PR that first has tests in that scope — PR-05 arms the `contracts` and `web/src/lib` rows,
-  PR-08 arms `web/src` overall). The `{services,db,routes}` row (80/80/75/80) is **not** measurable here: it is enforced
+  PR-08 arms `web/src` overall; PR-16 armed that same row in parallel and the merge kept one — plan §14). The
+  `{services,db,routes}` row
+  (80/80/75/80) is **not** measurable here: it is enforced
   by the `integration` job's `pnpm coverage:integration`, added in PR-04.
 - Thresholds only ratchet upward.
 

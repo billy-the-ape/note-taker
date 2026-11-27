@@ -27,12 +27,7 @@
  * `settings.routes.int.test.ts` is the server-side half), and PR-07 registered `ROUTES.auth.password`
  * and `ROUTES.auth.logoutAll`.
  */
-import {
-  type PatchSettingsRequest,
-  ROUTES,
-  type Settings,
-  settingsSchema,
-} from '@note-taker/contracts';
+import { type PatchSettingsRequest, ROUTES, type Settings, settingsSchema } from '@note-taker/contracts';
 import { queryOptions } from '@tanstack/react-query';
 
 import { type ApiClient, api } from '../../lib/api';

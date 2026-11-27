@@ -314,6 +314,33 @@ describe('GET /api/search — ordering and bounds (§6)', () => {
     // the window still answers, because the metadata branch needs no key and no window.
     expect(namesOf((await search(owner.id, 'old-soup')).results)).toEqual(['old-soup']);
   });
+
+  it('keeps an older name hit ahead of 500 newer folder matches — the row bound is tier-ordered', async () => {
+    const owner = await createOwner(db);
+    const work = await createFolder(db, { userId: owner.id, name: 'work' });
+    await seedNotes(db, {
+      userId: owner.id,
+      keyring,
+      notes: [
+        // 600 notes inside a folder named `work`, every one of them newer than the single row whose **name**
+        // matches, and every one of them a tier-1 (folder) hit. 600 is more than the metadata statement's row
+        // bound, so a `limit` ordered by recency alone fills the window with folder matches and the name hit
+        // never reaches scoring (PR-11 review, inline `r4722272755`).
+        ...fillerNotes(600, 'inside', { folderId: work.id, baseTime: at(0) }),
+        // Older than all of them by five years, and outside the candidate window besides, so the SQL statement is
+        // the only thing in this request that can see it at all.
+        { name: 'work plan', body: 'nothing to do with the query', contentUpdatedAt: at(365) },
+      ],
+    });
+
+    const results = (await search(owner.id, 'work')).results;
+    expect(namesOf(results)[0]).toBe('work plan');
+    expect(results[0]?.score).toBe(SEARCH_SCORE_NAME);
+    // The rest of the response is what it always was: the newest matches of the lower tier, and a full page.
+    expect(results).toHaveLength(SEARCH_RESULT_MAX);
+    expect(results.slice(1).every((result) => result.score === SEARCH_SCORE_CONTENT)).toBe(true);
+    expect(namesOf(results.slice(1, 4))).toEqual(['inside-0', 'inside-1', 'inside-2']);
+  });
 });
 
 describe('GET /api/search — snippets come from plaintext (§6)', () => {

@@ -20,9 +20,15 @@
  * * **`name hit > body hit > recency`** (§4). A name hit is {@link SEARCH_SCORE_NAME}; a hit on the body or on a
  *   folder name is {@link SEARCH_SCORE_CONTENT}; and equal scores fall to `content_updated_at DESC`, then `id`,
  *   which is the order the candidate statement already arrives in.
- * * A **corpus-wide guarantee and a per-request bound** are different promises and this file makes both: the
- *   metadata pass never stops at 500 rows, while the decryption pass always does. `limit` cannot raise the second
- *   — the contract caps it at {@link SEARCH_RESULT_MAX} whatever the caller asked for.
+ * * A **corpus-wide search and a per-request bound** are different promises, and this file makes both — in the
+ *   right order. The metadata pass tests every note the caller owns and returns at most
+ *   {@link SEARCH_CANDIDATE_SCAN} *matching rows*, tier-first (`name_matched DESC`, then newest first), so the cut
+ *   can only ever fall on rows the endpoint would have ranked below the ones it kept: with
+ *   {@link SEARCH_RESULT_MAX} slots and that ordering, the response is the same 25 rows whatever the row bound
+ *   allowed. Remove the tier from that `order by` and 500 folder matches push an older name match out before
+ *   scoring ever sees it, which is why the clause is load-bearing and tested (`search.service.int.test.ts`). The
+ *   decryption pass, by contrast, always stops at 500 *notes*, and `limit` cannot raise it — the contract caps the
+ *   response at {@link SEARCH_RESULT_MAX} whatever the caller asked for.
  * * **A note this process cannot read is skipped, not invented.** `openNoteContent()` throws rather than return
  *   blank-or-garbage text (PR-06's rule), so a corrupt row would otherwise fail a whole search over one
  *   unreadable note. It is dropped from both passes and its id is logged. An *out-of-window* corrupt body cannot
@@ -372,17 +378,20 @@ export function createSearchService(options: SearchServiceOptions): SearchServic
       for (const row of metadataRows) {
         // A row the in-process pass already saw keeps its own verdict: it decrypted the body, so it knows whether
         // a snippet is available. And a row it could not read stays dropped from *both* passes, so the skipped set
-        // is checked here too rather than being a fact about one statement.
+        // is checked here rather than being a fact about one statement.
         if (hits.has(row.id) || skipped.has(row.id)) continue;
         hits.set(row.id, {
           id: row.id,
           name: row.name,
           folderPath: row.folderPath,
-          // `name hit > body hit`: SQL matched either the name or a folder name, and the same folded test the
-          // in-process pass uses says which. Falling through to the content tier when neither test matches is
-          // deliberate — the statement did match it, so it is a hit that merely does not name its field, and
-          // dropping it would lose a result to a case-folding difference between Postgres and JavaScript.
-          score: foldKey(row.name).includes(needle) ? SEARCH_SCORE_NAME : SEARCH_SCORE_CONTENT,
+          // `name hit > body hit`. SQL reports which of its two predicates matched (`nameMatched`) and the fold
+          // gets the last word, because the two languages are not asking the same question: a note named `café`
+          // queried as `café` is a name hit in both, and where they disagree the statement matched a *folder*
+          // while the fold may have found the name. Falling through to the content tier when neither test matches
+          // is deliberate — the statement did match the row, so it is a hit that merely does not name its field,
+          // and dropping it would lose a result to a case-folding difference between Postgres and JavaScript.
+          score:
+            row.nameMatched || foldKey(row.name).includes(needle) ? SEARCH_SCORE_NAME : SEARCH_SCORE_CONTENT,
           contentUpdatedAt: row.contentUpdatedAt,
         });
       }

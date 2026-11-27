@@ -526,7 +526,7 @@ PR-05 pins the field names in the envelope schema and `docs/API.md`; PR-09, PR-1
 | 18 | `PUT /api/notes/:id/content` | yes | `{content, baseVersion}` | `{…NoteNode, content, version:version+1}` | `If-Match` optional; `baseVersion` mismatch ⇒ `VERSION_CONFLICT` + current server `content` + `version` (the client compares them with its buffer before calling it a conflict — §11.4); unknown/other-user id ⇒ `404` (the write also filters `user_id`, so the service re-reads to tell the two apart — A.2) |
 | 19 | `PATCH /api/notes/:id` | yes | `{name?, folderId\|null}` | `200 NoteNode` | rename / move (`folderId: null` = move to root); `notes.name` stays extension-free |
 | 20 | `DELETE /api/notes/:id` | yes | — | `204` | |
-| 21 | `GET /api/search?q=&limit=` | yes | `q` (trimmed, non-blank) + `limit` (1–25, default 25) | `{results:[{noteId,name,folderPath,snippet,score}]}` | two passes over the caller's rows: name/folder-**segment** match in SQL over the whole corpus (escaped `ILIKE`, accent-sensitive) + name/path/body match after decrypting the ≤500 most recently updated notes (accent-folded); `score` is a tier (name 2 > body/path 1) with `content_updated_at DESC` then `id` breaking ties; `snippet` ≤120 **code points** of plaintext, `""` for a name-only match; a body that fails to authenticate is skipped and logged (**PR-11**) |
+| 21 | `GET /api/search?q=&limit=` | yes | `q` (trimmed, non-blank) + `limit` (1–25, default 25) | `{results:[{noteId,name,folderPath,snippet,score}]}` | two passes over the caller's rows: name/folder-**segment** match in SQL, testing every note the caller owns (escaped `ILIKE`, accent-sensitive; ≤500 matching rows return, `name_matched DESC` before recency so the bound cannot drop a name hit) + name/path/body match after decrypting the ≤500 most recently updated notes (accent-folded); `score` is a tier (name 2 > body/path 1) with `content_updated_at DESC` then `id` breaking ties; `snippet` ≤120 **code points** of plaintext, `""` for a name-only match; a body that fails to authenticate is skipped and logged (**PR-11**) |
 | 22 | `GET /api/settings` / `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | `autosave`, `theme`; lands in **PR-09** (not PR-16) because PR-14 needs the flag — see both PRs. The row is created with the user by **PR-07** (§8 invariant) and get-or-created by `settings.service.get()`, so neither endpoint can 404 or silently update zero rows |
 
 Payload cap: 1 MiB note body (Fastify `bodyLimit`, → `PAYLOAD_TOO_LARGE`); UI warns at 900 KiB.
@@ -1408,7 +1408,10 @@ decrypt it)
   `folders.repo.ts`'s `folderPathCte`).
 - **Behavior:** name/folder match via SQL (`ILIKE` on `lower(name)`, and on each folder-name **segment** of the
   breadcrumb rather than the `/`-joined path, because `/` is a forbidden name character) with escaped `%`/`_`/`\`,
-  over the whole corpus; body match: load up to 500 most recently updated notes for the user, decrypt, and match
+  testing every note the caller owns; its `limit` bounds the **matching rows** it returns, and `ORDER BY
+  name_matched DESC, content_updated_at DESC` is what makes that bound harmless (a recency-only ordering lets 500
+  folder matches push an older name hit out before scoring; both halves are tested); body match: load up to 500 most
+  recently updated notes for the user, decrypt, and match
   name, folder path and body with NFD accent-folded keys, scoring (`name hit > body hit > recency`), and return
   ≤ 25 results with an ~120-**code-point** snippet generated from plaintext (empty for a name-only match). Both
   statements are scoped by `user_id`; a note whose envelope fails to authenticate is skipped from both passes and

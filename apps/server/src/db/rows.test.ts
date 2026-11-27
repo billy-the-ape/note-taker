@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { expectOne, firstOrNone, rawRows, rawTextArray, rawTimestamp } from './rows.js';
+import { expectOne, firstOrNone, rawBoolean, rawRows, rawTextArray, rawTimestamp } from './rows.js';
 
 /**
  * The pure half of reading a **raw** statement (PR-09).
@@ -107,5 +107,39 @@ describe('rawTextArray', () => {
     expect(rawTextArray(null)).toStrictEqual([]);
     expect(rawTextArray(undefined)).toStrictEqual([]);
     expect(rawTextArray(42)).toStrictEqual([]);
+  });
+});
+
+describe('rawBoolean', () => {
+  it('reads the parsed value a type-aware driver gives back', () => {
+    expect(rawBoolean(true)).toBe(true);
+    expect(rawBoolean(false)).toBe(false);
+  });
+
+  it('reads the text and numeric spellings a driver that parses nothing leaves behind', () => {
+    // `select (name ilike …) as name_matched` is `bool`; a driver without the type lookup writes Postgres's own
+    // text form, and a `case … then 1 else 0 end` variant arrives numeric. All of them mean the same tier.
+    expect([
+      rawBoolean('t'),
+      rawBoolean('true'),
+      rawBoolean('1'),
+      rawBoolean(1),
+      rawBoolean(1n),
+    ]).toStrictEqual([true, true, true, true, true]);
+    expect([
+      rawBoolean('f'),
+      rawBoolean('false'),
+      rawBoolean('0'),
+      rawBoolean(0),
+      rawBoolean(0n),
+    ]).toStrictEqual([false, false, false, false, false]);
+  });
+
+  it('refuses to invent a tier, because a false flag is the failure that keeps answering', () => {
+    // The reason this is not `Boolean(value)`: `Boolean('false')` and `Boolean(0)` are opposite answers to the
+    // same wire value, and a search that silently stopped ranking by name would still return 200.
+    for (const value of [null, undefined, 'yes', 'no', 2, '', {}, []]) {
+      expect(() => rawBoolean(value)).toThrow(/expected a boolean from a raw statement/);
+    }
   });
 });

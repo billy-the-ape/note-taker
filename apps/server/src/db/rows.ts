@@ -175,3 +175,20 @@ function parsePostgresArrayLiteral(text: string): string[] | undefined {
   }
   return out;
 }
+
+/**
+ * A boolean out of a raw statement: the parsed value, plus the text spellings a driver that does not parse
+ * column types would hand over instead.
+ *
+ * Same reasoning as {@link rawTimestamp}: a raw `db.execute(sql`…`)` carries no column metadata, so a computed
+ * predicate — `lower(name) ilike …` from the search statement — arrives parsed only because this particular
+ * driver looks the column type up. Reading `row.some_flag` as a `boolean` regardless would turn a driver change
+ * into a **false** flag, which is the worst failure a boolean has: the search keeps answering and quietly stops
+ * ranking by tier. Anything unrecognized throws and names what arrived.
+ */
+export function rawBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (value === 't' || value === 'true' || value === '1' || value === 1 || value === 1n) return true;
+  if (value === 'f' || value === 'false' || value === '0' || value === 0 || value === 0n) return false;
+  throw new Error(`expected a boolean from a raw statement, got ${typeof value}: ${String(value)}`);
+}

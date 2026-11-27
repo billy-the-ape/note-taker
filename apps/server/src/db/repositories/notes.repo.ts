@@ -24,7 +24,7 @@ import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 
 import type { Db, DbOrTx } from '../client.js';
 import { newId } from '../ids.js';
-import { expectOne, firstOrNone, rawRows, rawTimestamp } from '../rows.js';
+import { expectOne, firstOrNone, rawBoolean, rawRows, rawTimestamp } from '../rows.js';
 import { type Note, notes } from '../schema.js';
 import { folderPathCte } from './folders.repo.js';
 
@@ -319,28 +319,37 @@ export async function listNotesForTree(db: Db, input: { readonly userId: string 
 }
 
 /**
- * One row of a search result set: the note, its folder's breadcrumb path, and — for the candidate window only —
- * the opaque envelope triple (PR-11, docs/plans/mvp/MVP-11.md §4).
+ * One row of a search result set: the note, its folder's breadcrumb path, and which **tier** the statement put it
+ * in (PR-11, docs/plans/mvp/MVP-11.md §4).
  *
  * `folderPath` is the contract's `folderPath`: the folder's own name and every ancestor's, `/`-joined, root
  * first, and **empty for a note at the root**. It arrives as `array_to_string` rather than as a `text[]`
  * because that is the one shape the contract has a field for, and the joining happens in the same statement
  * that decided the row matched, so the string a client is shown and the string the server matched on cannot
  * be two different answers.
+ *
+ * `nameMatched` is the statement's own answer to "did the **name** match?", and it is a column rather than a
+ * fact the caller re-derives because the statement's `limit` needs an ordering, and an ordering needs the tier
+ * before the rows can be cut ({@link searchNotesByMetadata}).
  */
-export interface NoteSearchRow {
+export interface NoteSearchRow extends NoteSearchRowFields {
+  readonly nameMatched: boolean;
+}
+
+/** A candidate for the in-process pass: the row, its path, and the envelope `crypto/envelope.ts` opens. */
+export interface NoteSearchCandidate extends NoteSearchRowFields {
+  readonly contentCipher: Uint8Array;
+  readonly contentIv: Uint8Array;
+  readonly keyVersion: number;
+}
+
+/** The five columns both search statements share; each statement adds the half only it can offer. */
+interface NoteSearchRowFields {
   readonly id: string;
   readonly name: string;
   readonly folderId: string | null;
   readonly folderPath: string;
   readonly contentUpdatedAt: Date;
-}
-
-/** A candidate for the in-process pass: the row, its path, and the envelope `crypto/envelope.ts` opens. */
-export interface NoteSearchCandidate extends NoteSearchRow {
-  readonly contentCipher: Uint8Array;
-  readonly contentIv: Uint8Array;
-  readonly keyVersion: number;
 }
 
 /**
@@ -361,8 +370,8 @@ const SEARCH_COLUMNS = sql`
       coalesce(array_to_string(folder_paths.path, '/'), '') as folder_path,
       floor(extract(epoch from n.content_updated_at) * 1000)::bigint as content_updated_at`;
 
-/** The five columns both search statements share, minus the envelope. */
-function searchRowBase(row: Record<string, unknown>): NoteSearchRow {
+/** The five columns both search statements share, minus the tier flag and minus the envelope. */
+function searchRowBase(row: Record<string, unknown>): NoteSearchRowFields {
   return {
     id: String(row.id),
     name: String(row.name),
@@ -416,15 +425,28 @@ export function likeContainsPattern(term: string): string {
 }
 
 /**
- * Every note whose **name**, or whose folder's **name**, matches the pattern — the branch that guarantees search
- * sees the whole corpus (PR-11 §4).
+ * Every note whose **name**, or whose folder's **name**, matches the pattern — the branch that searches the whole
+ * corpus without a key (PR-11 §4).
  *
- * Three properties the in-process pass cannot give and this one can:
+ * Four properties the in-process pass cannot give and this one can:
  *
- * * it does not stop at the 500 most recent notes;
+ * * its `WHERE` has no window: every note the caller owns is tested, not the newest 500;
  * * it needs no key, so it answers while some note bodies in the install are unreadable;
+ * * it reports which tier each row is in (`name_matched`), and **orders by that tier first**, which is what makes
+ *   its row bound harmless — see the bound below;
  * * it is indexed-adjacent work at MVP size (the folder walk is per user and tiny; the note scan is the same
  *   sequential read `GET /api/tree` already pays).
+ *
+ * **The row bound, and why ordering by tier makes it harmless.** `limit` cuts the *matching rows*, so a query
+ * matching more than `limit` of them gets the newest `limit`, not all of them. That is only a promise about the
+ * response because of the `order by`: every name match (the tier the endpoint ranks above every folder match)
+ * precedes every folder-name match, and each tier is newest-first. Since the endpoint returns at most
+ * {@link SEARCH_RESULT_MAX} rows and its whole ordering is `tier DESC, content_updated_at DESC, id`, the first
+ * `SEARCH_RESULT_MAX` of this statement's output **is** the response whenever there are that many name matches,
+ * and otherwise it carries every name match plus the newest `limit - n` folder matches — more than the ≤ 25 slots
+ * can hold either way. Without the tier in the `ORDER BY`, 500 folder matches could fill the window and push an
+ * older name match out before scoring ever saw it (PR-11 review, inline `r4722272755`); `notes.repo.int.test.ts`
+ * and `search.service.int.test.ts` pin both halves of that.
  *
  * **It is accent-sensitive, and that asymmetry is documented rather than hidden.** `unaccent` is not installed —
  * PR-04's migration enables `pgcrypto` alone — and NFD accent folding is not expressible as a `LIKE` pattern, so
@@ -442,24 +464,32 @@ export async function searchNotesByMetadata(
   db: Db,
   input: { readonly userId: string; readonly pattern: string; readonly limit: number },
 ): Promise<NoteSearchRow[]> {
+  // The name predicate, spelled once and used three times: as the tier column, as the first `WHERE` disjunct, and
+  // as the tie-free tier half of the `ORDER BY` (the alias would be legal here too, but naming the predicate once
+  // keeps the column and the ordering from drifting apart).
+  const nameMatches = sql`lower(n.name) ilike ${input.pattern} ${LIKE_ESCAPE}`;
   const result = await db.execute(
     sql`${folderPathCte(input.userId)}
-    select ${SEARCH_COLUMNS}
+    select ${SEARCH_COLUMNS},
+           ${nameMatches} as name_matched
       from notes n
       left join folder_paths on folder_paths.id = n.folder_id
      where n.user_id = ${input.userId}
        and (
-            lower(n.name) ilike ${input.pattern} ${LIKE_ESCAPE}
+            ${nameMatches}
          or exists (
               select 1
                 from unnest(folder_paths.path) as matched_segment(segment_name)
                where lower(matched_segment.segment_name) ilike ${input.pattern} ${LIKE_ESCAPE}
             )
          )
-     order by n.content_updated_at desc, n.id
+     order by ${nameMatches} desc, n.content_updated_at desc, n.id
      limit ${input.limit}`,
   );
-  return rawRows<Record<string, unknown>>(result).map(searchRowBase);
+  return rawRows<Record<string, unknown>>(result).map((row) => ({
+    ...searchRowBase(row),
+    nameMatched: rawBoolean(row.name_matched),
+  }));
 }
 
 /**

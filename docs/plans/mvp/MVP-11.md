@@ -43,8 +43,10 @@ Conventional-commit title; PR body starts `Task: PR-11`; CI green; never lower a
 - **Name / folder-path match in SQL:** `ILIKE` on `lower(name)` **with `%` and `_` escaped** so they are literal
   (`\` is escaped too, being the escape character). The folder half matches a **segment** of the breadcrumb — one
   folder name — rather than the `/`-joined path: `/` is a forbidden name character (`docs/NAME-RULES.md`), so a query
-  containing it should match nothing instead of every note under some folder. This branch guarantees coverage of the
-  whole corpus, but it is **accent-sensitive** (see the Unicode rule below).
+  containing it should match nothing instead of every note under some folder. This branch tests the whole corpus,
+  though it returns at most **500 matching rows** — and `ORDER BY name_matched DESC, content_updated_at DESC` is what
+  keeps that bound from dropping a name hit in favour of 500 newer folder matches (PR-11 review); the ordering is
+  part of the contract, not an optimization. It is also **accent-sensitive** (see the Unicode rule below).
 - **Name / path / body match in-process:** load up to **500** most recently updated notes for the user, decrypt, and match
   the name, the folder path and the body case-insensitively (substring/word). This pass is what makes results
   accent-aware, and it is also where a name hit is distinguished from a body hit for scoring.

@@ -378,8 +378,8 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   fact about the visit rather than about the note. Until PR-13's route exists the navigation is
   `navigate({ href: noteEditorHref(id) })`, because `to` is typed against a generated tree with no `/app/*` in it;
   `NOTE_EDITOR_PATH` is exported for the one-line swap when that file lands.
-- **Search is two passes, and one documented asymmetry** (PR-11): `GET /api/search` answers metadata hits from SQL
-  over the *whole* corpus — `notes.repo.ts`'s `searchNotesByMetadata`, `ILIKE` on `lower(name)` and on every
+- **Search is two passes, and one documented asymmetry** (PR-11): `GET /api/search` answers metadata hits from SQL,
+  which tests the *whole* corpus — `notes.repo.ts`'s `searchNotesByMetadata`, `ILIKE` on `lower(name)` and on every
   folder-name **segment** of the breadcrumb (not the joined path: `/` is a forbidden name character, so `a/b` should
   match nothing rather than every note under `a`), with `%`, `_` and `\` escaped by `likeContainsPattern()` so a
   search for `100%` means the discount — and body hits from `listRecentNotesForSearch`, which hands
@@ -388,7 +388,13 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   structurally impossible rather than filtered out, and the breadcrumb both of them join is
   `folders.repo.ts`'s `folderPathCte` — one walk, one definition of "this note's path", shared with `listFolderTree`.
   The window is the **scan bound**, not a page: `limit` cannot raise it (the contract caps results at 25, and the
-  service re-bounds for a caller that reached it past the schema). NFD accent folding (`foldKey`) runs **only in the
+  service re-bounds for a caller that reached it past the schema). The metadata statement has its own **row bound**
+  too — at most 500 *matching* rows come back — and the only reason that can be said out loud is that the statement
+  `order by name_matched DESC` **before** `content_updated_at DESC`: every name hit precedes every folder hit, so the
+  cut lands on rows the endpoint would have ranked below the ones it kept, and the ≤25 it returns are the same 25
+  whatever the bound allowed. Remove that tier term from the `ORDER BY` and 500 folder matches push an older name hit
+  out before scoring ever sees it, which `notes.repo.int.test.ts` (statement level) and `search.service.int.test.ts`
+  (a folder of 600 notes beside one old `work plan`) exist to catch. NFD accent folding (`foldKey`) runs **only in the
   in-process pass**, so `cafe` finds an in-window `café` and misses an out-of-window one; `docs/API.md` #21 states
   the rule, `search.service.int.test.ts` pins both halves (including the miss, so the gap cannot be "fixed" by a
   quiet `unaccent` — that is backlog PR-29's folded column). `score` is a **tier** (`name 2 > body-or-path 1`), with

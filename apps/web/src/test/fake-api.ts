@@ -44,7 +44,7 @@ import {
   type Settings,
 } from '@note-taker/contracts';
 
-import { type ApiClient, createApiClient } from '../lib/api.js';
+import { type ApiClient, type ApiError, createApiClient } from '../lib/api.js';
 
 /** A session row, reduced to what the client can observe: its token. */
 interface FakeSessionRow {
@@ -70,9 +70,19 @@ export interface FakeTab {
   token(): string | undefined;
 }
 
+export interface FakeTabOptions {
+  /**
+   * Wires the tab's client the way the composition root wires the singleton (PR-08's
+   * `features/auth/session.tsx`), so a test can prove that a `401` does or does not fire the app-wide
+   * expiry hook. Absent by default: a bare tab is a tab with nobody listening, which is exactly why a
+   * test that needs this half of production has to ask for it.
+   */
+  readonly onUnauthorized?: (error: ApiError) => void;
+}
+
 export interface FakeServer {
   /** A new browser tab: a fresh cookie jar plus a client bound to it. */
-  tab(name?: string): FakeTab;
+  tab(name?: string, options?: FakeTabOptions): FakeTab;
   /** Signs a tab in by handing it a session cookie, i.e. what `POST /api/auth/login` would have done. */
   signInTab(tab: FakeTab): void;
   /** The settings row as the "database" holds it — `undefined` until get-or-create has run. */
@@ -315,7 +325,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     return errorResponse(404, 'NOT_FOUND', `the fake does not implement ${method} ${path}`);
   }
 
-  function makeTab(name: string): FakeTab {
+  function makeTab(name: string, options: FakeTabOptions = {}): FakeTab {
     const jar = new Map<string, string>();
 
     const fetchImpl = async (input: string, init: RequestInit): Promise<Response> => {
@@ -341,6 +351,9 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
         // The CSRF cookie is PR-07's business and `lib/api.test.ts` covers the header and the
         // one-shot replay already; these tests are about sessions.
         readCsrfToken: () => 'fake-csrf-token',
+        // Only present when a test asked for it, so the harness can hold a tab to the same contract
+        // the composition root holds the singleton to (`lib/api.ts`'s 401 hook).
+        ...(options.onUnauthorized === undefined ? {} : { onUnauthorized: options.onUnauthorized }),
       }),
       token: () => tokenFor(jar),
     };
@@ -349,8 +362,8 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
   }
 
   return {
-    tab(name = 'tab') {
-      return makeTab(name);
+    tab(name = 'tab', options?: FakeTabOptions) {
+      return makeTab(name, options);
     },
     signInTab(tab) {
       const row: FakeSessionRow = {

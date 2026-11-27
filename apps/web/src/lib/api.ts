@@ -21,7 +21,9 @@
  * 4. **The 401 hook.** Session expiry is a single app-wide decision (route to the sign-in screen), so
  *    it is a callback the composition root sets rather than something each caller re-implements.
  *    `setUnauthorizedHandler` is how PR-08's session provider sets it: the client is created here,
- *    once, and the handler can only be chosen by whoever owns routing, which happens later.
+ *    once, and the handler can only be chosen by whoever owns routing, which happens later. One route
+ *    is exempt from the hook — `isCredentialOnly401` — because its `401` denies the password in the
+ *    body while the session that sent it stays valid.
  *
  * Nothing here touches `document` at import time: the cookie reader is injected, which is also what
  * lets the suite below run in the plain Node environment Vitest uses.
@@ -173,6 +175,29 @@ function errorMessageFor(status: number): { readonly code: ApiErrorCode; readonl
   return { code, message: API_ERROR_MESSAGES[code] };
 }
 
+/**
+ * The routes whose `401` is an answer about **the credentials in the request body**, not about the
+ * session that sent them (docs/API.md #9).
+ *
+ * `POST /api/auth/password` is the case that proves the distinction is not academic: it answers `401`
+ * for a wrong `currentPassword` at the same instant the same request proves the acting session is
+ * alive — PR-07 rotates that session and *keeps* it, and its integration test asserts the cookie still
+ * works. Fire the app-wide expiry hook for this one path and a typo in the current-password box sends
+ * the person to `/login` and hides the "the current password is not right" line the form exists to
+ * show, while the server session they just proved they hold is untouched.
+ *
+ * A table here rather than a per-call flag, mirroring `isCsrfExempt` in `@note-taker/contracts`: the
+ * answer belongs to the route, so no caller can forget to opt out and no new caller of the same route
+ * has to know the rule exists.
+ */
+const CREDENTIAL_ONLY_401_ROUTES: readonly string[] = [ROUTES.auth.password];
+
+export function isCredentialOnly401(path: string): boolean {
+  const queryStart = path.indexOf('?');
+  const pathname = queryStart === -1 ? path : path.slice(0, queryStart);
+  return CREDENTIAL_ONLY_401_ROUTES.includes(pathname);
+}
+
 function isJsonContent(contentType: string | null): boolean {
   return contentType?.toLowerCase().includes('application/json') ?? false;
 }
@@ -320,7 +345,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       return send(path, callOptions, 1);
     }
 
-    if (error.status === 401) options.onUnauthorized?.(error);
+    // The one carve-out: a `401` from `POST /api/auth/password` is about the password in the body,
+    // not the session that sent it (`isCredentialOnly401` above), and the caller is a form that has
+    // the right message to show. Every other `401` is the app-wide "the session is gone" event.
+    if (error.status === 401 && !isCredentialOnly401(path)) options.onUnauthorized?.(error);
     throw error;
   }
 

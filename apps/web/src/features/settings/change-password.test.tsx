@@ -76,9 +76,12 @@ describe('/app/settings — change password', () => {
     expect(location.assign).not.toHaveBeenCalled();
     expect(view.getByTestId('settings-page')).toBeDefined();
     expect(queryClient.getQueryData(queryKeys.settings)).toBeDefined();
-    // And the acting session is still a session: the `401` was about the password, not about it. This
-    // is the assertion that fails if `lib/api.ts`'s `onUnauthorized` hook is ever wired without
-    // excluding `ROUTES.auth.password` (see `credential-mutations.ts`).
+    // And the acting session is still a session: the `401` was about the password, not about it. The
+    // transport is the one place that decides, and this tab's client is wired with the same 401 hook
+    // `features/auth/session.tsx` installs in production — so an empty list here means the hook was
+    // *offered* this error and declined it (`lib/api.ts`'s `isCredentialOnly401`), which is the whole
+    // difference between "the current password is not right" and a trip to `/login`.
+    expect(rendered.expiryEvents()).toEqual([]);
     const session = await tab.client.json(ROUTES.auth.session, { schema: sessionResponseSchema });
     expect(session.user?.username).toBe('ada.lovelace');
     // The other tab is untouched, which is what "every *other* session is deleted" means on a failure.
@@ -88,6 +91,24 @@ describe('/app/settings — change password', () => {
     expect(otherSession.user?.username).toBe('ada.lovelace');
 
     location.restore();
+  });
+
+  /**
+   * The control the wrong-password case above needs: with a client wired like production, a `401`
+   * from a route that is *not* `POST /api/auth/password` has to reach the app-wide hook, or
+   * `expiryEvents()` would read `0` for a tab that simply has nobody listening.
+   */
+  it('hands a 401 from any other route to the expiry hook', async () => {
+    const server = createFakeServer();
+    server.failNextSettingsRead({ status: 401, message: 'your session has expired' });
+    const rendered = renderSettings({ server });
+
+    await waitFor(() => {
+      expect(rendered.expiryEvents()).toEqual(['401 UNAUTHORIZED']);
+    });
+    // And the screen said so rather than bouncing anyone: `/login` is PR-08's route, and this harness
+    // records the instruction instead of performing it.
+    expect(rendered.view.getByTestId('settings-error')).toBeDefined();
   });
 
   it('refuses a weak new password locally, without spending a request', async () => {
@@ -154,8 +175,10 @@ describe('/app/settings — change password', () => {
     expect(otherSession.user).toBeNull();
     expect(server.liveTokens()).toEqual([tab.token()]);
 
-    // 4. The screen did not treat a successful password change as a sign-out: no navigation, and the
-    //    cached row is where it was. This device is still signed in to the same account.
+    // 4. The screen did not treat a successful password change as a sign-out: no navigation, the
+    //    cached row is where it was, and the app-wide expiry hook was never offered this tab's
+    //    business. This device is still signed in to the same account.
+    expect(rendered.expiryEvents()).toEqual([]);
     expect(location.assign).not.toHaveBeenCalled();
     expect(queryClient.getQueryData(queryKeys.settings)).toBeDefined();
     expect(view.getByTestId('settings-page')).toBeDefined();

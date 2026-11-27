@@ -1128,8 +1128,8 @@ merge with the placeholder still in place — see "Jobs added later" below)
   one status refetch, exactly one replay, second 403 surfaces the error) and the 401 hook. Those tests are what arm the
   `apps/web/src/lib` row of §14's threshold table, so PR-05 adds that row's thresholds to
   `apps/web/vitest.config.ts` and drops PR-01's `passWithNoTests: true` (the overall `apps/web/src` row still waits for
-  components — §14 assigns it to PR-16, the PR that lands the first screen with components a Postgres-free web suite can
-  render, and not to PR-08).
+  components — §14 assigns it to **PR-08**, the PR that lands the shell and the first components, and it was armed there;
+  PR-16, which arrived later, armed the same row independently before the merge kept one).
 - **Coverage:** ≥ 90% lines and ≥ 85% branches in `packages/contracts` (the `packages/contracts` row of the §14
   threshold table: 90/90/85/90 here, ratcheting to 95 across the board after PR-19; pure module, no excuse, and it is a
   `unit`-job scope because contracts needs no DB).
@@ -1279,9 +1279,8 @@ merge with the placeholder still in place — see "Jobs added later" below)
   Tailwind theme tokens (light/dark via `prefers-color-scheme` default), global error/not-found boundaries. It also
   **keeps the rest of the web coverage gate**: the overall `apps/web/src` row of §14's threshold table is **this PR's**,
   and it was armed here (`'src/**'` at 55/55/50/55). PR-16 armed the same row independently while this PR was open, and
-  merging PR-16 kept one row — this PR's key and numbers — so nobody adds a second `apps/web/src` row and no PR lowers
-  one. The
-  `apps/web/src/lib` row was armed by PR-05, and PR-01's `passWithNoTests: true` was dropped there — from PR-05 on, an
+  merging PR-16 kept one row — this PR's key and numbers — so nobody adds a second `apps/web/src` row and no PR lowers one.
+  The `apps/web/src/lib` row was armed by PR-05, and PR-01's `passWithNoTests: true` was dropped there — from PR-05 on, an
   empty web suite is a failure, not a pass.
 - **Acceptance (playwright-able, against routes this PR owns):** unauth visit → `/login`; `needsSetup` → `/setup`;
   wrong password shows the server message; success lands on **`/welcome`**; refresh keeps the session; the sign-out

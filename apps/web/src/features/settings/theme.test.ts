@@ -4,6 +4,7 @@ import {
   applyThemeClass,
   DARK_CLASS,
   DARK_SCHEME_QUERY,
+  LIGHT_CLASS,
   type MatchMediaLike,
   type MediaQueryListLike,
   prefersDarkScheme,
@@ -100,12 +101,25 @@ describe('applyThemeClass', () => {
     };
   }
 
-  it('writes exactly the dark class, and removes it for light', () => {
+  it('writes exactly one theme class, and the *other* one for the opposite resolution', () => {
     const root = fakeRoot();
     applyThemeClass(root, 'dark');
     expect(root.has(DARK_CLASS)).toBe(true);
+    expect(root.has(LIGHT_CLASS)).toBe(false);
 
     applyThemeClass(root, 'light');
+    expect(root.has(DARK_CLASS)).toBe(false);
+    expect(root.has(LIGHT_CLASS)).toBe(true);
+  });
+
+  it('writes light rather than merely removing dark, because the stylesheet needs the opt-out', () => {
+    // `styles/globals.css` paints dark under `prefers-color-scheme: dark` unless the root carries
+    // `data-theme="light"` (PR-08's per-browser knob) or `.light` (this file's account value). A
+    // stored `light` that only removed `dark` therefore lost to a dark operating system, which is
+    // what these two lines are worth: an empty class list is not light, it is "ask the OS".
+    const root = fakeRoot();
+    applyThemeClass(root, 'light');
+    expect(root.has(LIGHT_CLASS)).toBe(true);
     expect(root.has(DARK_CLASS)).toBe(false);
   });
 

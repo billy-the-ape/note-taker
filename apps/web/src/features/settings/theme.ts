@@ -1,6 +1,6 @@
 /**
  * Theme application (docs/plans/mvp/MVP-16.md §4 and §5): the stored `system | light | dark` value
- * becomes `class="dark"` on `<html>`, and `system` resolves through
+ * becomes `class="dark"` or `class="light"` on `<html>`, and `system` resolves through
  * `matchMedia('(prefers-color-scheme: dark)')`.
  *
  * Three deliberate shapes:
@@ -15,7 +15,9 @@
  *   flip needs no write.
  * * **The class is the contract.** `styles/globals.css` declares Tailwind's `dark` variant as
  *   class-based (`@custom-variant`), so `.dark` on the root element is what the whole stylesheet
- *   reads. This file writes exactly one class and nothing else about `<html>`.
+ *   reads — and its `prefers-color-scheme` block needs `.light` to stand down. So this file writes
+ *   exactly one of the two theme classes, never anything else about `<html>`, and takes both away
+ *   again when the screen that owns the account setting unmounts.
  */
 
 import type { SettingsTheme } from '@note-taker/contracts';
@@ -25,6 +27,12 @@ import { useSettingsTheme } from './use-settings.js';
 
 /** The class Tailwind's `dark:` variant keys off (see the `@custom-variant` in `globals.css`). */
 export const DARK_CLASS = 'dark';
+/**
+ * The class the stylesheet opts *out* of `prefers-color-scheme` with
+ * (`:root:not([data-theme="light"]):not(.light)` in `globals.css`), so a stored `light` has to be
+ * written, not merely inferred from the absence of `dark`.
+ */
+export const LIGHT_CLASS = 'light';
 /** The query PR-08's `prefers-color-scheme` default used, kept as the single source for `system`. */
 export const DARK_SCHEME_QUERY = '(prefers-color-scheme: dark)';
 
@@ -57,14 +65,18 @@ export function resolveTheme(theme: SettingsTheme, prefersDark: boolean): Resolv
 /**
  * Makes `root` match `resolved`, and only ever that: adding `dark` and removing the other classes a
  * page might own would fight with whatever else writes `<html class>`.
+ *
+ * Both directions *write* a class. The absence of `dark` is not "light" to the stylesheet — the
+ * `prefers-color-scheme` block in `styles/globals.css` stands down only for
+ * `:not([data-theme="light"]):not(.light)` — so a stored `light` that merely removed `dark` left a
+ * dark operating system winning an argument the person had already settled in the settings screen.
  */
 export function applyThemeClass(root: ClassTarget | undefined, resolved: ResolvedTheme): void {
   if (root === undefined) return;
-  if (resolved === 'dark') {
-    root.classList.add(DARK_CLASS);
-    return;
-  }
-  root.classList.remove(DARK_CLASS);
+  const adds = resolved === 'dark' ? DARK_CLASS : LIGHT_CLASS;
+  const drops = resolved === 'dark' ? LIGHT_CLASS : DARK_CLASS;
+  root.classList.add(adds);
+  root.classList.remove(drops);
 }
 
 /** The implementation the hook uses: the browser's own, or nothing outside a browser. */
@@ -161,6 +173,19 @@ export function useThemeSync(options: ThemeSyncOptions = {}): ResolvedTheme {
   useEffect(() => {
     applyThemeClass(root, resolved);
   }, [root, resolved]);
+
+  // Only ever the unmount of the screen that owns the account setting. `/login` has no settings row
+  // to read, so an account's `dark` must not survive the sign-out that navigated there: the login
+  // page belongs to the operating system and to this browser's `data-theme` knob, and a leftover
+  // `.dark` rule silences both until a hard reload.
+  useEffect(
+    () => () => {
+      if (root === undefined) return;
+      root.classList.remove(DARK_CLASS);
+      root.classList.remove(LIGHT_CLASS);
+    },
+    [root],
+  );
 
   return resolved;
 }

@@ -45,8 +45,10 @@ same PR.
 ## 4. Files to create
 
 `apps/web/src/routes/app/settings.tsx`, `apps/web/src/features/settings/*` (queries/mutations/hooks), theme application
-(`class="dark"` on `<html>`, applied from the settings value with `system` resolving through
-`matchMedia('(prefers-color-scheme: dark)')`), and the wiring that feeds `GET/PATCH /api/settings` into `useAutosave()`.
+(`class="dark"` **or** `class="light"` on `<html>` — one of the two, applied from the settings value with `system`
+resolving through `matchMedia('(prefers-color-scheme: dark)')`; `light` is written rather than inferred from the absence
+of `dark`, because `styles/globals.css` only stands its media query down for `:not(.light)`), and the wiring that feeds
+`GET/PATCH /api/settings` into `useAutosave()`.
 
 `data-testid`s for PR-19: `settings-autosave-toggle`, `settings-theme-select`, `settings-theme-light`,
 `settings-theme-dark`, `settings-theme-system`, `change-password-form`, `sign-out-everywhere`.
@@ -56,8 +58,10 @@ same PR.
 - Autosave toggle → optimistic `PATCH`, invalidates `['settings']`, and the **already-open editor reacts immediately**
   (pill text changes, no debounce writes while off, `Ctrl/Cmd+S` and the explicit Save button still work, navigating away
   with a dirty buffer prompts "Save / Discard / Stay").
-- Theme select (system/light/dark) → persisted via `PATCH /api/settings`, applied as `class="dark"` on `<html>`, survives
-  reload, and `system` follows the OS.
+- Theme select (system/light/dark) → persisted via `PATCH /api/settings`, applied as `class="dark"` or `class="light"` on
+  `<html>` (the explicit `light` is what makes an account's choice beat a dark OS: the stylesheet's media query only
+  stands down for `:not(.light)`), survives reload, and `system` follows the OS. The classes are the screen's own
+  property: they are removed again when it unmounts, so signing out does not leave the account's theme on `/login`.
 - Change-password form: validates the current password (server error rendered inline), and after success
   **the current session survives** — no forced re-login — while every other session of that user is deleted, so another
   tab fails on its next request.
@@ -155,6 +159,29 @@ because the next PR reads this file, not the commit messages.
     failed *and* the refetch behind it failed" wiped four working controls, hid the patch error, and discarded
     half-typed passwords. A failed refresh with a row on screen is a note (`settings-refresh-error`) with its own
     retry; only a screen with nothing to show gets replaced.
+- **Review round 2 fixed three behavior defects** (the first two were invisible to the tests that shipped; both now have
+  assertions that fail without the fix):
+  - **A wrong current password signed the user out.** `lib/api.ts` fired its app-wide `onUnauthorized` hook for *every*
+    `401`, and `POST /api/auth/password` answers `401` for a typo in the current-password box. `features/auth/session.tsx`
+    installs the handler, so production bounced the person to `/login` and never showed the inline message — while the
+    server session the same request had just proved alive stayed valid. The exemption is now `isCredentialOnly401` in
+    `lib/api.ts` (a route table, like `isCsrfExempt`, so no caller can forget it), asserted in `lib/api.test.ts`;
+    `docs/API.md` #9 says the same in prose. The header comment here used to say "whoever wires that hook has to exclude
+    this route" — it no longer has to, because the transport does.
+  - **A stored `light` lost to a dark OS.** `applyThemeClass` only ever added or removed `dark`, but
+    `styles/globals.css`'s media-query block stands down only for `:not([data-theme="light"]):not(.light)`, so with
+    account = light, OS = dark and no per-browser knob the page painted dark. `light` is now written as a class
+    (`LIGHT_CLASS`), and `theme-sync.test.tsx` asserts it beside `dark()` — `dark() === false` alone was the blind spot.
+  - **The account's theme survived sign-out.** `SettingsEffects` is mounted under `/app` only, and a normal sign-out is a
+    client-side navigation, so `html.dark` stayed on the document and painted `/login` dark until a hard reload.
+    `useThemeSync` now removes both classes in its cleanup, and the criterion is "leaves no theme class behind when the
+    screen unmounts".
+  - **Why the tests missed it:** `renderSettings` rendered against a tab whose client had no `onUnauthorized` at all, so
+    the wrong-password case could not fail. `FakeServer.tab()` now accepts the hook, `renderSettings` always installs a
+    recording one, and `expiryEvents()` is asserted empty for the password route and non-empty by a control test using
+    the *same* hook on another route.
+  - One residual docs disagreement from round 1: plan §13's PR-05 passage still assigned the overall `apps/web/src` row
+    to PR-16; §14's authority bullet is the one that says PR-08 owns it, and that passage now agrees.
 - **The settings reads validate their body.** `GET /api/settings` needs no `?includeDeleted` (the contract has no
   `SettingsIncludeDeleted`, §9.2 #22), and `SettingsUpdatedAt = z.iso.datetime()` rejects the millisecond-less strings
   a `::text` cast produces — which is a trap on another route, not a reason to skip parsing here. `lib/api.ts` offers

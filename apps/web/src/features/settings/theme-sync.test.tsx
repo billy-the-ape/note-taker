@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createFakeServer } from '../../test/fake-api.js';
 import { installMatchMedia } from '../../test/match-media.js';
 import { renderSettings } from '../../test/render-settings.js';
-import { DARK_CLASS } from './theme.js';
+import { DARK_CLASS, LIGHT_CLASS } from './theme.js';
 
 function selectedTheme(container: HTMLElement): string {
   const select = container.querySelector('[data-testid="settings-theme-select"]');
@@ -27,6 +27,14 @@ function selectedTheme(container: HTMLElement): string {
 
 function dark(): boolean {
   return document.documentElement.classList.contains(DARK_CLASS);
+}
+
+/**
+ * Not the negation of `dark()`, and that difference is the bug this pins: to the stylesheet an empty
+ * class list means "ask the operating system", so only an explicit `.light` is a stored light.
+ */
+function light(): boolean {
+  return document.documentElement.classList.contains(LIGHT_CLASS);
 }
 
 function patchCalls(server: ReturnType<typeof createFakeServer>): number {
@@ -165,6 +173,50 @@ describe('/app/settings — theme', () => {
       expect(selectedTheme(view.container)).toBe('light');
     });
     expect(dark()).toBe(false);
+    // The half `dark() === false` cannot see: `styles/globals.css` paints dark under
+    // `prefers-color-scheme: dark` *unless* the root opts out, and the opt-out is the class
+    // `.light`. Removing `dark` is therefore not enough — without it this page is dark in a browser
+    // and light in this test, which is precisely how the bug this line pins was found.
+    expect(light()).toBe(true);
+  });
+
+  it('starts light on a dark operating system, and says so beside the select', async () => {
+    // The cold-load shape of the same rule: the OS is already dark when the settings row lands, so
+    // there is no flip to witness and nothing but the class to decide what the person sees.
+    media = installMatchMedia(true);
+    const server = createFakeServer({
+      settings: { autosave: true, theme: 'light', updatedAt: '2026-01-01T00:00:00.000Z' },
+    });
+    const { view } = renderSettings({ server, prefersDark: true });
+
+    await waitFor(() => {
+      expect(selectedTheme(view.container)).toBe('light');
+    });
+    expect(dark()).toBe(false);
+    expect(light()).toBe(true);
+    // And the copy does not claim to be following anything: that sentence appears for `system` only,
+    // so its absence is the second half of "the stored value won".
+    expect(view.queryByTestId('settings-theme-resolved')).toBeNull();
+  });
+
+  it('leaves no theme class behind when the screen unmounts', async () => {
+    // Sign-out is a client-side navigation to `/login`, so the screen that owns the account setting
+    // unmounts without a document reload. `/login` has no settings row to read, so an account's
+    // `dark` surviving the trip would paint the sign-in page dark — over the operating system and
+    // over this browser's own knob — until a hard reload.
+    media = installMatchMedia(false);
+    const server = createFakeServer({
+      settings: { autosave: true, theme: 'dark', updatedAt: '2026-01-01T00:00:00.000Z' },
+    });
+    const { view } = renderSettings({ server });
+    await waitFor(() => {
+      expect(dark()).toBe(true);
+    });
+
+    view.unmount();
+
+    expect(dark()).toBe(false);
+    expect(light()).toBe(false);
   });
 
   it('follows the operating system for an account with no settings row yet', async () => {

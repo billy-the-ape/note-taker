@@ -20,12 +20,13 @@ import { type ChangePasswordRequest, changePassword, signOutEverywhere } from '.
  * send the person to — the correct client behavior after a password change is to leave them exactly
  * where they are standing, with a message that says what just happened to their other devices.
  *
- * One thing the next PR must know, recorded here because this is the file that would break: the
+ * One thing about this route is easy to get backwards, so it is recorded where the call is made: the
  * `401` this route answers when `currentPassword` is wrong is a **credential** error, not a session
- * error (`docs/API.md` #9). `lib/api.ts` fires `onUnauthorized` for every `401`, so whoever wires
- * that hook (PR-08's composition root, via `ApiClientProvider`) has to exclude
- * `ROUTES.auth.password`, or a mistyped current password would sign the person out of a session that
- * PR-07 has just proved is still alive.
+ * error (`docs/API.md` #9). `lib/api.ts` fires its app-wide `onUnauthorized` hook for every `401`
+ * *except* the routes in `isCredentialOnly401`, and `ROUTES.auth.password` is in that list precisely
+ * so a mistyped current password cannot sign a person out of a session PR-07 has just proved is still
+ * alive. The exemption belongs to the transport, not to this hook — do not "helpfully" catch the
+ * `401` here — and `change-password.test.tsx` fails if it is undone.
  *
  * The absence of `onSuccess` in the hook below is not slack: `change-password.test.tsx` fails the
  * moment anything here clears the cache or navigates, which is the mutation that a "session hygiene"

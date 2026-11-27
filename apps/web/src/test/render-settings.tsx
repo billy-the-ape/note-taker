@@ -18,7 +18,7 @@ import { SettingsPage } from '../features/settings/settings-page.js';
 import { ApiClientProvider } from '../lib/api-client-context.js';
 import { createQueryClient } from '../lib/queryClient.js';
 import { EditorHarness } from './editor-harness.js';
-import { createFakeServer, type FakeServer, type FakeTab } from './fake-api.js';
+import { createFakeServer, type FakeServer, type FakeTab, type FakeTabOptions } from './fake-api.js';
 
 export interface RenderSettingsOptions {
   /** Defaults to a server with one signed-in owner and no settings row yet. */
@@ -31,6 +31,27 @@ export interface RenderSettingsOptions {
   readonly save?: (content: string) => void;
   /** Set when the test is about the theme: the operating system's preference at mount. */
   readonly prefersDark?: boolean;
+  /**
+   * @internal Passed down by {@link reload} so the recorded expiry events survive re-rendering the
+   * same document. Do not set this by hand.
+   */
+  readonly expiry?: ExpiryRecord;
+}
+
+/**
+ * The tab's `onUnauthorized` sink, shaped like production but recording instead of acting.
+ *
+ * In the browser, `lib/api.ts`'s 401 hook is installed by `features/auth/session.tsx`, which clears
+ * the session cache and navigates. Neither is worth re-implementing here — PR-08's own tests cover
+ * what the handler *does* — but the *decision about which `401`s reach it* is exactly what a settings
+ * test has to be able to observe, and a client built without the hook cannot observe it at all:
+ * `change-password.test.tsx` once passed a wrong current password while production would have signed
+ * the person out, because nothing was listening. So a tab created by this harness always has a hook,
+ * and it counts.
+ */
+export interface ExpiryRecord {
+  /** One entry per `401` that reached the app-wide hook, as `<status> <code>`. */
+  readonly events: string[];
 }
 
 export interface RenderSettingsResult {
@@ -38,6 +59,12 @@ export interface RenderSettingsResult {
   readonly server: FakeServer;
   readonly tab: FakeTab;
   readonly queryClient: ReturnType<typeof createQueryClient>;
+  /**
+   * The `401`s this document handed to the app-wide expiry hook — the app-wide "the session is gone"
+   * verdict. `0` after a failed password change is the assertion that a wrong current password is
+   * about the password, not the session (`lib/api.ts`'s `isCredentialOnly401`).
+   */
+  expiryEvents(): readonly string[];
   /** Signs the user in on a second tab, i.e. the same account in another browser tab. */
   otherTab(name?: string): FakeTab;
   /** Throws away this document and renders a new one against the same fake server. */
@@ -46,7 +73,14 @@ export interface RenderSettingsResult {
 
 export function renderSettings(options: RenderSettingsOptions = {}): RenderSettingsResult {
   const server = options.server ?? createFakeServer();
-  const tab = options.tab ?? signInOn(server, 'tab A');
+  const expiry: ExpiryRecord = options.expiry ?? { events: [] };
+  const tab =
+    options.tab ??
+    signInOn(server, 'tab A', {
+      onUnauthorized: (error) => {
+        expiry.events.push(`${error.status} ${error.code}`);
+      },
+    });
 
   const queryClient = createQueryClient();
 
@@ -75,7 +109,7 @@ export function renderSettings(options: RenderSettingsOptions = {}): RenderSetti
     // A new `QueryClient` and a fresh render against the same fake server and the same cookie jar:
     // the settings row has to come back over the wire, because that is all a reload is.
     view.unmount();
-    return renderSettings({ ...options, server, tab });
+    return renderSettings({ ...options, server, tab, expiry });
   }
 
   return {
@@ -83,14 +117,18 @@ export function renderSettings(options: RenderSettingsOptions = {}): RenderSetti
     server,
     tab,
     queryClient,
+    expiryEvents: () => [...expiry.events],
     otherTab: (name = 'tab B') => signInOn(server, name),
     reload,
   };
 }
 
-/** What `POST /api/auth/login` would have done to a fresh tab's cookie jar. */
-export function signInOn(server: FakeServer, name: string): FakeTab {
-  const tab = server.tab(name);
+/**
+ * What `POST /api/auth/login` would have done to a fresh tab's cookie jar. `options` reaches
+ * {@link FakeServer.tab}: pass `onUnauthorized` for the half of production that installs the 401 hook.
+ */
+export function signInOn(server: FakeServer, name: string, options?: FakeTabOptions): FakeTab {
+  const tab = server.tab(name, options);
   server.signInTab(tab);
   return tab;
 }

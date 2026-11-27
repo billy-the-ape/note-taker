@@ -371,6 +371,33 @@ describe('the 401 hook', () => {
     expect(seen).toHaveLength(1);
   });
 
+  it('stays quiet for a 401 that denies the credentials in the body, not the session (docs/API.md #9)', async () => {
+    const seen: ApiError[] = [];
+    const fetch = mockFetch([envelope(401, 'UNAUTHORIZED'), envelope(401, 'UNAUTHORIZED')]);
+    const client = createApiClient({
+      fetch: fetch.fetch,
+      readCsrfToken: () => 'token-1',
+      onUnauthorized: (error) => seen.push(error),
+    });
+
+    // `POST /api/auth/password` answers `401` for a wrong `currentPassword` while the session that
+    // sent it stays alive (PR-07 rotates and keeps it), so this is the change-password form's inline
+    // message, not an expiry. Firing the hook here is what used to bounce a person to `/login` for a
+    // typo — see `isCredentialOnly401`, whose whole job is this line.
+    await expect(
+      client.json(ROUTES.auth.password, {
+        method: 'POST',
+        body: { currentPassword: 'what I thought it was', newPassword: 'a-brand-new-password-1' },
+      }),
+    ).rejects.toMatchObject({ status: 401, code: 'UNAUTHORIZED' });
+    expect(seen).toEqual([]);
+
+    // The exemption is one route wide: the next `401`, from anywhere else, is still the app-wide
+    // "the session is gone" event, and this is the assertion that keeps it that way.
+    await expect(client.request(ROUTES.tree)).rejects.toBeInstanceOf(ApiError);
+    expect(seen).toHaveLength(1);
+  });
+
   it('does not trigger the CSRF replay, because a new cookie would not help an expired session', async () => {
     const fetch = mockFetch([envelope(401, 'UNAUTHORIZED')]);
     const client = createApiClient({ fetch: fetch.fetch, readCsrfToken: () => 'token-1' });

@@ -5,6 +5,7 @@ import helmet from '@fastify/helmet';
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 
 import { createArgon2Hasher } from './auth/passwords.js';
+import { getKeyring, type Keyring } from './crypto/keys.js';
 import type { Db } from './db/client.js';
 import type { Env } from './env.js';
 import type { CookiePolicy } from './http/cookies.js';
@@ -13,10 +14,19 @@ import { createLogger } from './logger.js';
 import { type AuthGuard, createAuthGuard, registerAuthGuard } from './plugins/auth-guard.js';
 import { registerCsrfGuard } from './plugins/csrf.js';
 import { registerErrorHandlers } from './plugins/error-handler.js';
+import { registerStaticSpa } from './plugins/static-spa.js';
 import { authRoutes } from './routes/auth.routes.js';
+import { folderRoutes } from './routes/folders.routes.js';
 import { healthRoutes } from './routes/health.routes.js';
+import { noteRoutes } from './routes/notes.routes.js';
+import { settingsRoutes } from './routes/settings.routes.js';
+import { treeRoutes } from './routes/tree.routes.js';
 import { usersRoutes } from './routes/users.routes.js';
 import { createAuthService } from './services/auth.service.js';
+import { createFolderService } from './services/folder.service.js';
+import { createNoteService } from './services/note.service.js';
+import { createSettingsService } from './services/settings.service.js';
+import { createTreeService } from './services/tree.service.js';
 
 export interface BuildAppOptions {
   readonly env: Env;
@@ -37,10 +47,28 @@ export interface BuildAppOptions {
   /** Reported by `/api/health`. Defaults to the version in `apps/server/package.json`. */
   readonly version?: string;
   /**
+   * The keyring the note routes seal and open content with (PR-09). Defaults to {@link getKeyring} — the one
+   * process-wide ring built from `NOTE_ENCRYPTION_KEY`/`_FILE`/`_PREVIOUS`/`_VERSION`, or, in development and
+   * test with nothing configured, the persisted key under `.dev/`.
+   *
+   * Injectable because a route test that wants a note it *cannot* read (the tampered-ciphertext case of
+   * `notes.routes.int.test.ts`) is far cheaper to write with two rings than with a database write and a
+   * re-decrypt.
+   */
+  readonly keyring?: Keyring;
+  /**
    * The `/api/health` database probe (`probeDb(getDb().db)` in `index.ts`). Absent means the probe reports
    * the static `'ok'` it shipped with in PR-01, which is what every unit test and any pool-less boot uses.
    */
   readonly checkDb?: () => Promise<unknown>;
+  /**
+   * The directory the built SPA is served from (PR-12). Absent means `apps/web/dist`, and **a directory
+   * with no `index.html` in it serves nothing** — which is why the whole test suite, and `pnpm dev` with
+   * no `pnpm build` run, are unaffected by this option existing. Read `plugins/static-spa.ts` before
+   * changing it: the path is a repository/image layout fact, not an operator knob, which is why it is an
+   * option here rather than a variable in `env.ts`.
+   */
+  readonly webDist?: string;
 }
 
 const UNKNOWN_VERSION = '0.0.0-unknown';
@@ -79,8 +107,14 @@ function serverVersion(): string {
  * * `fastify-type-provider-zod` — the auth routes validate with `schema.parse(request.body)` and let the
  *   resulting `ZodError` reach `mapError()`, which already renders it as `400 VALIDATION` with `details`
  *   (PR-05). A type provider earns its keep once routes declare `schema` for their *responses*; none do yet.
- * * `@fastify/static` + SPA fallback (PR-12), which will own the not-found answer for non-`/api` paths and must
- *   be registered before that changes anything here — including the CSP that `index.html` needs.
+ *
+ * PR-12 added `plugins/static-spa.ts` at the end of this function: `@fastify/static` over `apps/web/dist`
+ * with the `/app` fallback, registered after every API route so no `/api` path is ever swallowed. It is a
+ * route like any other, so the helmet headers registered inside {@link registerAuth} — and the error envelope —
+ * apply to the served shell too: `script-src 'self'` covers Vite's hashed bundles, and the CSP's one concession
+ * (inline *styles*, whose reason is written out in {@link helmetOptions}) is what a same-origin stylesheet plus
+ * an editor's measurement pass need. If a later build starts inlining a `<script>`, that is a CSP conversation
+ * to have then, not a directive to widen now.
  */
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const { env } = options;
@@ -104,8 +138,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   if (options.db !== undefined) {
-    await registerAuth(app, env, options.db);
+    // `exactOptionalPropertyTypes` again: an absent `keyring` must reach the default parameter of
+    // {@link registerAuth} as `undefined`, which is what `getKeyring()` below then resolves.
+    await registerAuth(app, env, options.db, options.keyring);
   }
+
+  // Last, so the API is routed first whatever the build directory contains: `static-spa` registers one
+  // route per file rather than a catch-all, but the ordering is what makes "`/api/*` is never swallowed"
+  // true by construction instead of by inspection (docs/plans/mvp/MVP-12.md §6).
+  await registerStaticSpa(app, options.webDist === undefined ? {} : { root: options.webDist });
 
   return app;
 }
@@ -124,7 +165,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
  * process's memory (see `http/rate-limit.ts`), so two instances would mean two lockouts, and a test that builds
  * its own app gets a clean window rather than inheriting one from whatever ran before it in the same process.
  */
-async function registerAuth(app: FastifyInstance, env: Env, db: Db): Promise<void> {
+async function registerAuth(
+  app: FastifyInstance,
+  env: Env,
+  db: Db,
+  keyring: Keyring = getKeyring(),
+): Promise<void> {
   await app.register(cookie);
   await app.register(helmet, helmetOptions());
 
@@ -143,6 +189,44 @@ async function registerAuth(app: FastifyInstance, env: Env, db: Db): Promise<voi
 
   await app.register(authRoutes, { service, guard, cookies });
   await app.register(usersRoutes, { service, guard });
+
+  // PR-09's domain surface, registered from here rather than from `buildApp()` so it shares the two guards
+  // above: a second `registerAuthGuard` would resolve the same session cookie twice per request for no benefit,
+  // and the CSRF guard has to be in place before a browser may issue a folder `PATCH` at all.
+  await registerDomain(app, db, guard, keyring);
+}
+
+/**
+ * The domain half of the API (docs/plans/mvp/MVP-09.md, plus `PUT /api/notes/:id/content` from
+ * docs/plans/mvp/MVP-10.md): `tree.routes.ts` (1) + `folders.routes.ts` (3) + `notes.routes.ts` (5) +
+ * `settings.routes.ts` (2).
+ *
+ * One service object per process, each built over the same injected pool, which is what makes the folder
+ * transaction and the note's envelope share a connection with the rest of the request. Two things are
+ * deliberately *not* constructed here:
+ *
+ * * **The keyring is passed in**, defaulting to {@link getKeyring} at the call site. Only
+ *   `services/note.service.ts` ever holds one, and `GET /api/tree` proves it: the tree is served without a key.
+ * * **No per-request state of any kind.** `createFolderService` closes over the pool and nothing else, so the
+ *   advisory lock in a folder mutation is held by the *transaction*, not by a service instance — which is the
+ *   only way two concurrent requests from one user can be serialised by Postgres rather than by whoever happened
+ *   to build the object.
+ */
+async function registerDomain(
+  app: FastifyInstance,
+  db: Db,
+  guard: AuthGuard,
+  keyring: Keyring,
+): Promise<void> {
+  const folderService = createFolderService({ db });
+  const noteService = createNoteService({ db, keyring });
+  const treeService = createTreeService({ db });
+  const settingsService = createSettingsService({ db });
+
+  await app.register(treeRoutes, { service: treeService, guard });
+  await app.register(folderRoutes, { service: folderService, guard });
+  await app.register(noteRoutes, { service: noteService, guard });
+  await app.register(settingsRoutes, { service: settingsService, guard });
 }
 
 /**

@@ -89,3 +89,11 @@ Two more that only look safe:
 included**, because it is what the UI prefills and displays (§8). `POST /api/notes` with no `name`
 instead stores `new-file-<msepoch>` run through `uniquify`, so two creates in the same millisecond in
 the same folder do not collide (plan §9.2 #16).
+
+That sentence is about *concurrent* creates too, which choosing the name out of a read does not on its
+own achieve: two nameless creates in one folder in one millisecond read the same set of names and pick
+the same suffix, and the loser would otherwise be answered `409 CONFLICT` about a name it never sent —
+with the winner's `id`, which is the recovery for a name somebody *typed* (the collision table above), not
+for one the server invented. So `note.service.ts` treats a unique violation on a **generated** name as its own
+problem: it re-reads the folder, and `uniquify` moves to the next free suffix. A generated name therefore
+never produces a `409`; a typed one still does, always.

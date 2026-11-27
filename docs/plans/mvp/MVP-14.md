@@ -121,6 +121,23 @@ during the retry).
 `useAutosave()` hook, `apps/web/src/components/editor/{SaveStatus,ConflictBanner}.tsx`, the draft-mirror helper,
 `features/notes/note.mutations.ts` write wiring, and the unit tests.
 
+As shipped, with the paths named for the next reader:
+
+- `apps/web/src/lib/autosave.ts` — the machine, plus `classifyWriteFailure` as the one error-to-meaning table.
+- `apps/web/src/lib/draft.ts` — the `note-draft:<id>` mirror (a key of its own, deliberately not a `uiStore` `nt.` key).
+- `apps/web/src/features/notes/useAutosave.ts` — the machine's DOM half: flush triggers, the unload budget and the
+  dirty guard, the draft prompt, and the `404` escape hatch.
+- `apps/web/src/features/notes/note.mutations.ts` — the versioned `PUT`, its `keepalive` twin, the new-note `POST`, and
+  the cache bookkeeping a confirmed write owes.
+- `apps/web/src/features/settings/settings.api.ts` — `GET /api/settings` read + `autosaveFlag`, i.e. the caller PR-09's
+  flag needs; PR-16 builds the screen on the same query key.
+- `apps/web/src/components/editor/{SaveStatus,ConflictBanner,DraftPrompt}.tsx` — the pill (and its copy table), the
+  conflict banner with *Keep mine / Use server / Copy server text*, the `404` banner, and the restore prompt. §6 asks
+  for the restore prompt and the deleted-note notice without naming files for them; they get one file each rather than
+  being folded into a banner whose sentence means something else.
+- `apps/web/src/lib/api.ts` grew one optional `keepalive` field on `ApiCallOptions`, so the unload write is the same
+  client with the same CSRF behaviour rather than a second fetch wrapper.
+
 ## 8. Acceptance criteria (fake-timer unit tests)
 
 - [ ] Typing 5× in 200 ms ⇒ exactly **one** `PUT`; no write for a 2 s idle period.
@@ -152,6 +169,13 @@ during the retry).
 
 Type in two tabs, save in one, observe the conflict UI in the other; reload immediately after typing and confirm the text
 is present.
+
+> **Status (PR-14 merged against `main`).** This check needs a note editor in the browser, and PR-12/PR-13 (the app shell
+> and the editor pane) had not merged when this PR was built, so `main` has no route to type in — nor a stack to run
+> without Docker. The two-tab behaviour itself is asserted at engine altitude in `lib/autosave.test.ts` (the three
+> lost-response cases, the different-payload sibling) and in `features/notes/useAutosave.test.tsx` (reload-after-typing
+> leaves no draft behind, `pagehide` budget). The human two-tab walk is owed by PR-13's editor page and by PR-19's
+> `e2e/autosave.spec.ts`, which is where the plan puts it; it is **not** marked done in this PR's body.
 
 ## 10. Out of scope
 

@@ -17,11 +17,13 @@
     "coverage:integration": "NODE_ENV=test vitest run --config vitest.integration.config.ts --coverage",
     "db:generate": "NODE_ENV=development drizzle-kit generate",
     "db:migrate": "NODE_ENV=development drizzle-kit migrate",
+    "db:seed": "NODE_ENV=development tsx src/scripts/seed-demo.ts",
     "coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.5",
     "@fastify/helmet": "^13.2.0",
+    "@fastify/static": "^10.1.12",
     "@node-rs/argon2": "^2.2.2",
     "@note-taker/contracts": "workspace:*",
     "drizzle-orm": "0.45.4",

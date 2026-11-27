@@ -33,9 +33,10 @@ export interface DomainErrorOptions {
   readonly details?: readonly ErrorDetail[];
   /**
    * Whole seconds the caller should wait before retrying, rendered as the `Retry-After` header
-   * (plan §10's `429 RATE_LIMITED` from PR-07's login window). Optional on the base rather than a field of
-   * `RateLimitedError` alone, because "when may I ask again" is a property of the answer, not of one class:
-   * a later PR that throttles search or writes gets the header by passing the same option.
+   * (plan §10's `429 RATE_LIMITED` from PR-07's login and sign-up windows). Optional on the base rather
+   * than a field of `RateLimitedError` alone, because "when may I ask again" is a property of the answer,
+   * not of one class: a later PR that throttles search or writes gets the header by passing the same
+   * option.
    */
   readonly retryAfterSeconds?: number;
   /** Wrapped failure, for `Error#cause` and the server log only. */
@@ -71,6 +72,25 @@ export abstract class DomainError extends Error {
   /** The status this error answers with, straight from the shared table. */
   get status(): number {
     return API_ERROR_STATUS[this.code];
+  }
+}
+
+/**
+ * `VALIDATION` (400) for a request the server cannot honour even though its body parsed.
+ *
+ * `ZodError` covers "this field is not a string/uuid/too long", and that is most of what `VALIDATION` means.
+ * This is the rest: a rule the *server* has to check against the current state of the database, where a field
+ * error is still the true report. The 100-level folder cap of §9.2 #13/#14 is the case that needed it —
+ * `parentId: "<the deepest folder>"` is a perfectly well-formed uuid, and answering `CONFLICT` would tell the
+ * caller to retry something that will never succeed, while `NOT_FOUND`/`FORBIDDEN` would describe a folder the
+ * request never asked about. `details` carries the field the caller has to change, exactly like a schema
+ * failure, so the SPA renders it with the same form code.
+ */
+export class ValidationError extends DomainError {
+  readonly code = 'VALIDATION' as const;
+
+  constructor(message: string, options: DomainErrorOptions = {}) {
+    super(message, options);
   }
 }
 

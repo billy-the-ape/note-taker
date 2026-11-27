@@ -20,10 +20,22 @@ import { noteNameIssue } from './names.js';
 export const noteIdSchema = z.uuid();
 
 /**
+ * The ceiling of `notes.version`: the column is an `integer` (`int4`), so no note has ever been at a higher
+ * version than this. It is part of the field's domain rather than a sanity check — a `baseVersion` above it is
+ * not a stale read but a value the database cannot compare, and handing one to Postgres raises `22003` (value out
+ * of range for integer), which reaches the client as `500 INTERNAL`: a number no row can hold, reported as the
+ * server's emergency. The same ceiling `crypto/keys.ts` puts on `notes.key_version`, for the same reason.
+ */
+export const MAX_NOTE_VERSION = 2_147_483_647;
+
+/**
  * `notes.version` (plan §8): starts at `1` and increments on every content write. It is what makes
  * writes versioned rather than last-write-wins, so a client sends it back as `baseVersion`.
+ *
+ * Bounded on both sides, therefore: `0` is not a version a note had, and neither is anything past what the
+ * column holds (**PR-10**).
  */
-export const noteVersionSchema = z.number().int().min(1);
+export const noteVersionSchema = z.number().int().min(1).max(MAX_NOTE_VERSION);
 
 /** The 1 MiB note-body cap of §9.2, matching `MAX_NOTE_BYTES` (default) at the transport layer. */
 export const NOTE_CONTENT_MAX_BYTES = 1024 * 1024;

@@ -12,8 +12,9 @@ Postgres to enforce.
 | Migrations     | `apps/server/migrations/` — committed SQL + `meta/_journal.json`              |
 | Client / pool  | `apps/server/src/db/client.ts` (postgres.js + `drizzle-orm/postgres-js`)      |
 | Migration API  | `apps/server/src/db/migrate.ts` (`migrateDatabase()`, run at boot)            |
-| Repositories   | `apps/server/src/db/repositories/{folders,notes}.repo.ts`                     |
-| Proof          | `apps/server/src/db/**/*.int.test.ts` — 54 tests, run only by `pnpm test:integration` |
+| Repositories   | `apps/server/src/db/repositories/{folders,notes,settings,users}.repo.ts`      |
+| Services       | `apps/server/src/services/{tree,folder,note,settings,auth}.service.ts` — the only layer that decides a status code |
+| Proof          | `apps/server/src/**/*.int.test.ts`, run only by `pnpm test:integration` (PR-04 `db/`, PR-07 auth, PR-09 `services/`, `routes/` and `scripts/`) |
 
 Nothing here is enforced by the application alone. If a rule matters, it is a constraint or an index in the
 database, and an integration test that would fail if it were dropped.
@@ -149,8 +150,13 @@ accepted trade and PR-18's backup drill, not a bug this schema can fix.
 | `theme`     | `text NOT NULL DEFAULT 'system'` + `settings_theme_check` (`theme IN ('system','light','dark')`) | |
 | `updated_at`| `timestamptz NOT NULL DEFAULT now()` |                                               |
 
-PR-07 inserts the row with the user; PR-09's `settings.service.get()` get-or-creates so the invariant survives
-a user row created by a fixture or a future import path.
+PR-07 inserts the row with the user; PR-09 makes that survive a user created by any other path. Both
+`settings.service.get()` and `settings.service.patch()` start with `ensureSettingsRow()` — `INSERT … ON CONFLICT
+(user_id) DO NOTHING`, so two first calls race and one of them is *the success case* — and then read or update the
+row. A user whose row was never written therefore has exactly one row after either call, never a `404`, and never
+the zero-row write that a bare `UPDATE` would report as success; `services/settings.service.int.test.ts` and
+`routes/settings.routes.int.test.ts` assert both halves against a row deleted on purpose. `updated_at` is read
+back from the database rather than assumed, so the timestamp a client is told about is the one the row carries.
 
 ### `auth_attempts`
 
@@ -192,12 +198,70 @@ so the root is one more level and collides like anything else. `src/db/schema.in
 definitions and the violation itself, in the root and inside a folder; `folders_unique_sib` is deferred while
 drizzle-kit builds an index, which is also why the migration is ordered the way it is.
 
-Cycle prevention is **not** a database constraint (Postgres has no recursive CHECK) and is **not** a
-read-then-write in PR-04. PR-09 owns it: `move`/`rename` run in a transaction that FIRST takes
-`pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — one lock per user, serializing
-that user's create/move/delete — and then walks ancestors. Locking only the two affected rows is not enough:
-two moves can lock disjoint pairs (X→Y and Z→W), each pass its own ancestor walk, and commit a cycle.
-`isDescendantOrSelf()` in `folders.repo.ts` is the ancestor walk that check will use.
+Both indexes are checked **per statement**, which is what makes a rename-and-move a single statement rather than
+two: `patchNote` and `patchFolder` write the name and the parent column in one `UPDATE`, so the row is judged by
+the `(parent, name)` the request asked for. Renaming first and re-parenting afterwards puts the row in the
+position *half* the request described while the index is deciding — a legal `PATCH {name, parentId}` refused for a
+clash in the folder the row was leaving — and a second statement that fails after the first committed leaves
+exactly that half applied with nothing to tell the client which it was. Proven at statement level in
+`folders.repo.int.test.ts` and `notes.repo.int.test.ts` ("renames and moves in one statement"), and at the wire in
+`routes/notes.routes.int.test.ts`.
+
+Cycle prevention is **not** a database constraint (Postgres has no recursive CHECK), and it is not a
+read-then-write either. PR-09 owns it, as-built: `create`, `move` and `delete` in `services/folder.service.ts`
+each run in one transaction that FIRST takes
+`pg_advisory_xact_lock(hashtext('folder_move'), hashtext(user_id::text))` — `takeFolderMoveLock()` in
+`folders.repo.ts`, one lock **per user**, which serializes every folder mutation of that user and nothing else —
+and only then walks ancestors.
+
+Locking only the two affected rows is not enough: two moves can lock disjoint pairs (`X→Y` and `Z→W`), each pass
+its own ancestor walk, and commit a four-node cycle. `isDescendantOrSelf()` (the upward walk from a proposed
+parent) is the check, and it is only correct because the lock guarantees nobody is re-parenting underneath it
+while it runs. `services/folder.service.int.test.ts` asserts both interleavings — the adjacent pair that a
+row-lock design also survives, and the disjoint pair that it does not.
+
+Two more things the same transaction decides, both because the tree is data and not a cache:
+
+* **The 100-level cap is arithmetic on the database's depths, not on a client's breadcrumb.** A create compares
+  `folderDepth(parent)` against the cap; a move compares `folderDepth(destination) + 1 + folderSubtreeHeight(moving)`,
+  where the height is the longest path *below* the folder being moved. The second term is what makes a move of a
+  deep subtree under a root refuse with `VALIDATION` naming the cap, when a destination-depth check alone would
+  have waved it through. Nothing is truncated, ever.
+* **The cascade is the schema's, and the refusal is the service's.** `deleteFolder()` is one `DELETE` over
+  `(id, user_id)`; the descendant folders and the notes inside them go because `parent_id`/`folder_id` are
+  `ON DELETE CASCADE` (§2) — there is no delete-then-recurse in JavaScript, and therefore no state where a folder
+  is gone and its children are not. What the API adds is the *gate*: without `?cascade=true` the service locks the
+  folder row first (`lockFolderRow()`, `FOR UPDATE`) and **only then** counts direct children
+  (`countChildren()`) and the notes in this folder (`countNotesInFolder()`), refusing a non-empty one with
+  `409 CONFLICT`, because a recursive delete the user did not ask for is data destruction.
+  The row lock is not decoration, and the per-user advisory lock above does not provide it: a note `INSERT` takes
+  `KEY SHARE` on the folder row it points at, and `FOR UPDATE` conflicts with that. Count first and the answer can
+  be "empty" about a folder someone is writing into right now, and the later `DELETE` waits on the very same
+  `KEY SHARE` only after the gate has already opened — then cascading over the row that won the race, so the client
+  is told `204` for a delete that destroyed a note whose `POST` it was told had succeeded a moment earlier. Locking
+  first makes the count read a snapshot that includes the committed insert (→ `409`); an insert that starts
+  afterwards blocks on this lock and dies on its foreign key once the delete commits (→ `404` for the folder).
+  Asserted concurrently in `services/folder.service.int.test.ts`, next to the cycle-race tests that share the file.
+* **One read serves the whole tree.** `listFolderTree()` is a single recursive CTE over the caller's rows that
+  returns folders flat with their `depth` and a root-first `path` breadcrumb (walk metadata: `folderNodeSchema`
+  has no path field, and PR-12 rebuilds the nesting from `parentId`), ordered by `name collate "C", id` so the
+  answer is the same on a `C` and an `en_US.utf8` cluster, and `listNotesForTree()` supplies the notes beside
+  them. The walk's guard is `depth < ${TREE_WALK_GUARD}` (100) — one more than the deepest folder the cap allows,
+  so a legal tree is never truncated — and `tree.service.int.test.ts` renders a 99-deep chain to prove the
+  difference between a guard and a fence. There is no stored depth column: a materialised depth would be a second
+  truth for a move to get wrong.
+* **A raw statement's columns are read, never asserted.** This CTE is the only application code that reads SQL
+  drizzle cannot express, and a raw result carries **no column metadata**: the first CI run answered every
+  `GET /api/tree` with `500`, because the mapping wrote `row.created_at as Date` and the driver — which had no way
+  to know the column was ever a `timestamptz` — handed back text for `.toISOString()` to choke on. The statement
+  therefore asks for one unambiguous JS reading of the two timestamps
+  (`floor(extract(epoch from …) * 1000)::bigint` — `floor`, because `numeric::bigint` rounds and a JavaScript date
+  parse truncates, and the two must agree to the millisecond),
+  and the values pass through `rawTimestamp()` / `rawTextArray()` in `db/rows.ts`, which tolerate the shapes a
+  driver may actually deliver — a `Date`, an integer, the integer as text, ISO or Postgres text; a JS array or the
+  array literal Postgres writes (`{"Top","Mid"}`, escapes and all) — and throw rather than invent `1970-01-01`.
+  `db/rows.test.ts` pins the parser and `folders.repo.int.test.ts` pins the row, so the next raw statement (PR-11's
+  search is the likely candidate) has two things to copy and one mistake not to repeat.
 
 ## 4. The optimistic-locking contract (PR-10's 409)
 
@@ -212,14 +276,28 @@ UPDATE notes
 ```
 
 - Zero rows back means the caller's `baseVersion` is stale, or the note is gone, or it belongs to someone else;
-  the repository returns `undefined` and **PR-10 renders that as `409`**. It is deliberately not an exception:
-  a conflict is a normal answer here, not a bug.
+  the repository returns `undefined` and **PR-10 renders that as a `404` or a `VERSION_CONFLICT`** — never as one
+  or the other on a guess. The statement filtered on `user_id`, so the two cases are the same answer at SQL level;
+  what separates them is one scoped `SELECT` afterwards, and answering `409` for a row the caller does not own
+  would confirm the row exists *and* hand over its decrypted body. That payload is deliberate: `data.content` and
+  `data.version` are the current server state, which PR-14's autosave compares with the exact snapshot it put on
+  the wire, so a write that committed but whose reply went missing is adopted instead of reported as a collision.
+- A second precondition sits above this one, in the transport: `PUT …/content` accepts an optional `If-Match`, and
+  a header naming a version other than the one being written against is answered from that same scoped re-read
+  without any write at all. There is no `412` in this API's nine codes, so a violated precondition is a
+  `VERSION_CONFLICT` (or the `404` the re-read says is true) rather than a status no client has a recovery for.
+- A `baseVersion` outside `[1, int4 max]` never reaches this statement at all. `noteVersionSchema` refuses it with
+  `400 VALIDATION` and `putContent` re-checks it before sealing, because comparing a number the column cannot hold
+  in the `WHERE` is not "zero rows" — it is Postgres `22003`, which the error handler would have to report as a
+  server error on the strength of a value the caller invented.
 - The row comes back whole, so the new `version` is available to return to the client without a second query
   (and no window between the two).
-- `version` is bumped **only** by a content write. `renameNote` and `moveNote` touch `name`/`folder_id` and
-  `updated_at` and leave `version` alone, so renaming or re-filing a note never invalidates an open editor.
+- `version` is bumped **only** by a content write. `patchNote` and `patchFolder` — the one statement behind each
+  `PATCH` — touch `name`/`folder_id`/`parent_id` and `updated_at` and leave `version` alone, so renaming or
+  re-filing a row never invalidates an open editor.
 - Two writers that read the same version: exactly one wins, asserted concurrently in
-  `notes.repo.int.test.ts`. Nothing is merged and nothing is lost silently.
+  `notes.repo.int.test.ts`, and again one layer up (through the HTTP endpoint, with a request cancelled while it
+  waits on the row lock) in `notes.content-race.int.test.ts`. Nothing is merged and nothing is lost silently.
 - The key rotation (PR-06's `apps/server/src/scripts/rotate-note-key.ts`) is the only other writer of these
   columns, and it is deliberately **not** a content write:
 
@@ -246,7 +324,7 @@ tests, which cannot import it because that file imports `expect` from Vitest.
 | SQLSTATE | Means                                                              | Rendered as (PR-07/09/10) |
 | -------- | ------------------------------------------------------------------ | ------------------------- |
 | `23505`  | unique violation — `users_username_lower_uidx`, `users_one_owner_uidx`, `folders_unique_sib`, `notes_unique_sib` | `409 CONFLICT` for all four, as of PR-07: plan §9.1's code list has no `422`, and "that username is taken" and "this install already has an owner" are the same statement to a client — the constraint name that tells them apart goes in the log, not in a new status code |
-| `23503`  | foreign key failed — a `folder_id`/`user_id` that is not there       | `400` (a UI that cannot send this is fine) |
+| `23503`  | foreign key failed — a `folder_id`/`parent_id` that is not there     | `404 NOT_FOUND` (PR-09). Every id that arrives in a **body** is looked up scoped to the caller before anything is written, so this only fires when the parent is deleted between that check and the insert — which is exactly the answer the same request would have given a moment earlier. A `500` here would be a lie about who broke, and a `400` would be a new code for a state a client can only reach by racing itself |
 | `23514`  | CHECK violated — empty name, a role outside `(owner, member)`, a theme outside the three | `400` |
 | `22P02`  | invalid input syntax for a `uuid` (a malformed id in the route)      | `400` |
 | `22001`  | value too long                                                       | `413` for note content, `400` otherwise |
@@ -264,7 +342,7 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | Username unique case-insensitively | `users_username_lower_uidx` on `lower(username)` | `schema.int.test.ts` (definition + `Kayla`/`kayla` → `23505`) |
 | Exactly one owner | `users_one_owner_uidx` (partial unique on `role = 'owner'`) | `schema.int.test.ts` (a second explicit `role='owner'` insert → `23505` from that constraint); the concurrent-`/setup` race is `routes/auth.routes.int.test.ts` (three simultaneous setups → one `200`, two `409`, one owner row) |
 | A role-less insert is never an owner | column `DEFAULT 'member'` | `schema.int.test.ts` (two raw role-less inserts coexist, both `member`) |
-| One name per `(user, folder)`, root included | `folders_unique_sib` / `notes_unique_sib` + `COALESCE` | `folders.repo.int.test.ts`, `notes.repo.int.test.ts` (inside a folder **and** at the root) |
+| One name per `(user, folder)`, root included | `folders_unique_sib` / `notes_unique_sib` + `COALESCE`, and one `UPDATE` per `PATCH` (§3) so the index never judges a half-applied rename-and-move | `folders.repo.int.test.ts`, `notes.repo.int.test.ts` (inside a folder **and** at the root; and a rename+move whose new name is free at the destination but taken at the source, which two statements refused) |
 | Two users may use the same name in the same place | `user_id` is the first index column | `folders.repo.int.test.ts` |
 | Deleting a folder deletes its subtree, notes included | `ON DELETE CASCADE` on `parent_id`/`folder_id` | `folders.repo.int.test.ts` (three levels deep, one note two levels down) |
 | Deleting a user deletes everything they own | `ON DELETE CASCADE` on every `user_id` | `folders.repo.int.test.ts` (other user's rows survive, so the zeros mean something) |
@@ -276,6 +354,16 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
 | One `settings` row per user, in the user's own transaction | `user_id` is the PK, and `insertUserWithSettings()` is the only writer that pairs them | `schema.int.test.ts` (the fixture's two users get one row each); `users.repo.int.test.ts` (a transaction aborted between the two inserts leaves neither row) |
 | A password change changes the password and revokes the other devices together | one transaction in `auth.service.ts` — `setUserPassword`, `deleteSessionsOfUser` and `rotateSessionToken` all run on the caller's `tx` | `services/auth.service.int.test.ts` (a change whose last statement fails leaves the old hash and both sessions exactly as they were, and still refuses with the service's own `401`) |
 | An install has an owner before anyone joins | `users_one_owner_uidx` here + `auth.service.ts`'s two guards | `routes/registration.int.test.ts` (`POST /api/auth/register` answers `403` on an empty database even with `ALLOW_REGISTRATION=true`, and `needsSetup` stays `true`) |
+| A folder move never creates a cycle | per-user `pg_advisory_xact_lock` + the ancestor walk inside it (§3) | `services/folder.service.int.test.ts` — the adjacent pair started as siblings (one commits, one `409`) and the four-node disjoint-pair race that a row-lock design commits a cycle through; afterwards the tree walk terminates and both folders stay reachable |
+| A delete without `?cascade=true` never destroys a note that was created beside it | `lockFolderRow()` — the folder row's `FOR UPDATE`, taken **before** the emptiness counts (§3), which conflicts with the `KEY SHARE` a note insert takes on the parent row | `services/folder.service.int.test.ts` (a note create and a non-cascade delete of the same folder at once: either the folder survives with its note, or the create is refused for a folder that is gone — never a `204` over a note whose `201` was already acknowledged) |
+| A **generated** note name never answers `409` | `note.service.ts` re-picks the name when the insert loses `notes_unique_sib` (`GENERATED_NAME_ATTEMPTS`); a name the client typed still clashes, on purpose | `services/note.service.int.test.ts` (four nameless creates at one pinned clock, started together: four rows, four distinct names, no conflict — where the sequential pair test cannot see the race at all) |
+| The tree is at most 100 levels, and a tree that legal is never truncated | the service's cap on create (`folderDepth`) and on move (`destination depth + 1 + subtree height`); no DB constraint can express it | `services/folder.service.int.test.ts` (the 101st level refuses, naming the cap; a deep subtree under a root refuses too) and `services/tree.service.int.test.ts` (a 99-deep chain renders complete, with a note at the bottom) |
+| A raw statement's columns are read through a helper, never asserted as a type | `db/rows.ts` — `rawRows()`, `rawTimestamp()`, `rawTextArray()` — with the tree CTE asking for `epoch … ::bigint` and the array literal read as written (§3), because a raw result carries no column metadata | `db/rows.test.ts` (each shape a driver may deliver, and a throw rather than an invented `1970-01-01`) + `folders.repo.int.test.ts` (the walked row: depth, breadcrumb, and timestamps equal to the row that was inserted) — this is the assertion PR-09's first CI run was missing, when every `GET /api/tree` answered `500` |
+| An id in a **body** is the caller's or the answer is `404` | `folderById`/`noteById` scoped to `userId` before any insert or update, so the FK never fires (§5's `23503` row) | `routes/cross-user.int.test.ts` — the four-call matrix (note create, folder create, folder move, note move) against another user's folder, all four envelopes byte-identical to a nonexistent id, and both trees byte-identical afterwards |
+| A note body never crosses the tree wire | `treeResponseSchema` has no `content`, and `tree.service.ts` maps every row through `toNoteNode()`, which is the one place the cipher/iv/key-version columns are dropped | `services/tree.service.int.test.ts` + `routes/tree.routes.int.test.ts` (the payload is parsed, then searched for a `content` key) |
+| A stored body that will not authenticate is an error, never an empty note | `crypto/envelope.ts` throws; `mapError` renders `INTERNAL` and logs the note id (§5) | `routes/notes.routes.int.test.ts` (the blob is rewritten directly, then `GET /api/notes/:id` answers 500 with no `content` field), `plugins/error-handler.test.ts` (nothing about key versions on the wire) |
+| One `settings` row survives a user whose row was never written | `ensureSettingsRow()` before every read and patch (§2) | `services/settings.service.int.test.ts`, `routes/settings.routes.int.test.ts` (defaults with `200`, one row left behind, read back by a second `GET`, and a `PATCH` on the zero-row user updates exactly one) |
+| The demo seed is safe to run twice | lookup-by-`(user, parent, name)` then insert, never truncate-and-reseed; `main()` refuses `NODE_ENV=production` before it opens a pool | `scripts/seed-demo.int.test.ts` (second run creates 0 and reports the same counts, an edited body and an added folder are left alone, every seeded body opens with the app keyring) |
 
 ## 7. How the schema is built and checked
 
@@ -307,7 +395,8 @@ From plan §4/§8, and where each is now **proven** rather than asserted:
   the latest migration, and it reports `{ total, applied }`.
 - CI: the `integration` job in `.github/workflows/CI.yml` runs a `postgres:16` service, exports
   `DATABASE_URL`, runs `pnpm test:integration` then `pnpm coverage:integration`, and uploads
-  `coverage-integration/`. The `apps/server/src/db` ≥ 80% lines threshold lives in
+  `coverage-integration/`. The `apps/server/src/{db,services,routes}` ≥ 80% thresholds — `db` armed by PR-04 and
+  widened to the services and routes by PR-09 — live in
   `vitest.integration.config.ts` — never in a CI flag.
 - `make db-up` / `db-down` / `db-reset` are the Postgres lifecycle (dev Postgres 16 in Docker);
   `make bootstrap-env` only creates `.env` from `.env.example`, which ships dev defaults and deliberately **no

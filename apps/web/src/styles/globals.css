@@ -2,39 +2,121 @@
    pair, and design tokens live in CSS — utilities such as `bg-brand` are generated from @theme. */
 @import "tailwindcss";
 
+/*
+ * The whole design system (docs/plans/mvp/MVP-08.md §5). It is deliberately a list of *names* rather
+ * than a palette: `bg-paper`, `bg-surface`, `text-ink`, `text-ink-muted`, `border-line`, `bg-brand`,
+ * `text-danger` and `focus-visible:ring-brand` are the utilities every component in this app is
+ * written against, and switching light to dark is this file changing what those words mean.
+ *
+ * Why variables rather than Tailwind's `dark:` variant: this app has three theme states — light, dark,
+ * and "follow the operating system" — and the third is the default (PR-16 later persists the choice to
+ * `GET`/`PATCH /api/settings`). A `dark:bg-…` utility cannot say "unless the person picked light",
+ * while one variable re-pointed inside a media query can, and it keeps every component free of theme
+ * conditionals of its own.
+ *
+ * The three ways a theme gets stated, in the order they beat each other:
+ *
+ *   1. `@media (prefers-color-scheme: dark)` — the default, for a page with no stated preference.
+ *   2. `html.dark` / `html.light` — the class PR-16 owns for the persisted account setting, written by
+ *      `features/settings/theme.ts` from `GET`/`PATCH /api/settings`. Only an authed page has one.
+ *   3. `html[data-theme='dark'|'light']` — what `components/layout/ThemeToggle.tsx` writes for *this*
+ *      browser, and therefore the strongest: an override that the account default could silently beat
+ *      is not an override (see the guard on the dark rule below).
+ *
+ * `@theme` holds the light values and they are *not* repeated below: the dark rules override the same
+ * custom properties, and a utility reading `var(--color-paper)` cannot tell the difference.
+ */
 @theme {
-  --color-brand: #0f766e;
-  --color-brand-soft: #ccfbf1;
-  --color-paper: #f8fafc;
-  --color-ink: #0f172a;
-  --color-ink-muted: #475569;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial,
+    "Apple Color Emoji", "Segoe UI Emoji";
+
+  --color-paper: #f7f8fa;
+  --color-paper-2: #eceef2;
+  --color-surface: #ffffff;
+  --color-line: #dfe2e8;
+  --color-ink: #171c26;
+  --color-ink-muted: #5d6673;
+  --color-brand: #2f6fed;
+  --color-danger: #c62b2b;
+  --color-danger-soft: #fbeaea;
+  --color-ok: #14804a;
 }
 
-/* PR-16: `/app/settings` stores a theme (`system | light | dark`) and `features/settings/theme.ts`
-   writes the resolved value as `class="dark"` on `<html>`. Tailwind v4's `dark:` variant follows
-   `prefers-color-scheme` by default and would ignore that class entirely, so the variant is
-   redefined here as the class-based one — but the class is not what paints the page.
-
-   v4 compiles `bg-paper` to `background-color: var(--color-paper)`, and an opacity modifier such as
-   `border-ink/20` to `color-mix(... var(--color-ink) 20% ...)`, so redefining the three semantic
-   tokens on `html.dark` (see the base layer) repaints **every** utility that names them, including
-   inside `<select>` and `<input>`, where preflight inherits `color` from `<body>`. That is one flip
-   for the whole screen instead of a `dark:` class on each of the three controls `/app/settings`
-   happens to own today. (Checked in the build output, not assumed: `.bg-paper` really is
-   `background-color:var(--color-paper)`, and `html.dark` is emitted after the theme block, so it
-   outranks `:root`. The one thing that does not follow is Tailwind's `@supports`-less fallback for
-   `border-ink/20`, which is a static `#0f172a33`; every browser this app targets takes the
-   `color-mix` branch above.)
-
-   The first draft of this file instead added `--color-paper-dark` & co. and used them on `<body>`
-   alone, which shipped a near-white (`#f8fafc`) select and password inputs with light-grey
-   (`#e2e8f0`) text under Dark — about 1.1:1, i.e. invisible. Dark values now *replace* the light
-   ones rather than sitting next to them under names nothing reads; PR-08's fuller token set should
-   keep that shape (names that mean paper/ink, values that depend on the theme). */
+/*
+ * PR-16: Tailwind v4's `dark:` variant follows `prefers-color-scheme` by default and would ignore the
+ * class `features/settings/theme.ts` writes, so the variant is redefined as the class-based one. That
+ * keeps a future `dark:bg-…` honest — it will follow the stated theme rather than the operating
+ * system, which is the exact case the header above says a bare `dark:` cannot express.
+ *
+ * The class is not what paints the page, though, and the first draft of this file got that wrong: it
+ * added `--color-paper-dark` & co. and used them on `<body>` alone, which shipped a near-white
+ * (`#f8fafc`) `<select>` and password inputs with light-grey (`#e2e8f0`) text under Dark — about
+ * 1.1:1, i.e. invisible. v4 compiles `bg-paper` to `background-color: var(--color-paper)` and an
+ * opacity modifier such as `border-ink/20` to `color-mix(… var(--color-ink) 20% …)` (checked in the
+ * build output, not assumed), so re-pointing the semantic tokens on the element that carries the
+ * class repaints **every** utility that names them, including inside form controls, where preflight
+ * inherits `color` from `<body>`. Dark values therefore *replace* the light ones below rather than
+ * sitting next to them under names nothing reads.
+ */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/*
+ * The dark values, twice: once under the media query and once for an explicit choice. Copying the
+ * block is the lesser evil — a `--color-*` list is data, and any indirection that lets the two
+ * diverge (a `lighten()` per token, a shared custom property someone has to remember) is more
+ * machinery than the eleven lines it saves.
+ */
 @layer base {
+  /* Which way round the browser should paint form controls, scrollbars and `Canvas` backgrounds. */
+  :root {
+    color-scheme: light;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]):not(.light) {
+      color-scheme: dark;
+      --color-paper: #10151d;
+      --color-paper-2: #1a212c;
+      --color-surface: #151b24;
+      --color-line: #2a3341;
+      --color-ink: #e7eaef;
+      --color-ink-muted: #9aa5b4;
+      --color-brand: #6ea8fe;
+      --color-danger: #ff7b72;
+      --color-danger-soft: #3a1c1d;
+      --color-ok: #4ac58a;
+    }
+  }
+
+  /* An explicit choice wins over the media query in either direction; `light` needs no rules of its
+     own because it is simply excluded above, which is why the selector there is a `:not()`.
+
+     The `:not([data-theme="light"])` on the class branch is the merge rule between the two mechanisms
+     that can now both state a theme: PR-08's per-browser knob (`data-theme`, written by
+     `components/layout/ThemeToggle.tsx`) and PR-16's stored account setting (`class`, written by
+     `features/settings/theme.ts`). It says the choice made in *this* browser outranks the account
+     default, which is what an override is for and is the reading PR-08's own header argues ("a fact
+     about this screen, not about the user, and the two disagree"). Left unguarded, `class="dark"`
+     would keep painting dark after someone used the shell's theme menu to say light — a silent
+     tie-break that no test chose, in a file where the two selectors sit three lines apart.
+     `features/settings/theme-sync.test.tsx` covers the class half; a selector cannot be asserted in
+     jsdom, so this comment is the test. */
+  :root[data-theme="dark"],
+  :root.dark:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-paper: #10151d;
+    --color-paper-2: #1a212c;
+    --color-surface: #151b24;
+    --color-line: #2a3341;
+    --color-ink: #e7eaef;
+    --color-ink-muted: #9aa5b4;
+    --color-brand: #6ea8fe;
+    --color-danger: #ff7b72;
+    --color-danger-soft: #3a1c1d;
+    --color-ok: #4ac58a;
+  }
+
   html {
     -webkit-text-size-adjust: 100%;
   }
@@ -46,19 +128,5 @@
     color: var(--color-ink);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
-  }
-
-  /* `color-scheme` is what makes the *browser* draw form controls, scrollbars and the date picker for
-     the theme the user chose, which a background color on `<body>` does not cover.
-
-     The three tokens are redefined on the element that carries the class, so they beat `:root`'s
-     `@theme` values on specificity and are inherited by everything the utilities paint — `<body>`
-     needs no `.dark` rule of its own, because it already reads `var(--color-paper)` and
-     `var(--color-ink)`, which now resolve to the dark pair. */
-  html.dark {
-    color-scheme: dark;
-    --color-paper: #0b1120;
-    --color-ink: #e2e8f0;
-    --color-ink-muted: #94a3b8;
   }
 }

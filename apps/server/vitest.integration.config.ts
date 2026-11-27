@@ -26,17 +26,32 @@ export default defineConfig({
     // A pool that outlives a file keeps the worker alive; `forks` + the setup file's `afterAll` ends cleanly.
     pool: 'forks',
     testTimeout: 30_000,
-    // ── the `apps/server/src/db` row of plan §14, armed by this PR (≥ 80% lines) ───────────────
+    // ── the `apps/server/src/{db,services,routes}` row of plan §14, widened by PR-09 ────────────
     // Measured here and nowhere else: these files cannot be exercised without a database, so `pnpm coverage`
-    // (the `unit` job) has no threshold over them. Only the scope this PR has tests in is included — a scope
-    // with nothing in it is a guaranteed red — and PR-09 widens it to `services`/`routes` when its tests
-    // arrive. Thresholds live in this file, never in a CI flag.
+    // (the `unit` job) has no threshold over them. PR-04 armed `src/db/**` alone — the only scope its tests
+    // reached — and PR-09 adds the services and routes those repositories serve, which is what §8 of its brief
+    // asks for at the same 80/80/75/80. A scope with nothing in it is a guaranteed red, and thresholds only ever
+    // ratchet upward; §8 also says this row reaches 85 only after PR-19, so nothing here is raised past §14.
+    //
+    // `src/scripts/**` stays out of *this* report: the seed and the rotation script are exercised as subprocesses
+    // (their own processes, where this collector cannot see them), so a 0% row there would read as "untested"
+    // next to a test file that runs them repeatedly.
+    //
+    // `src/db/rows.ts` is out for the same reason in the opposite direction, and it is the one line of this
+    // config that CI has actually paid for: the first PR-09 run measured 12.85% of its branches here (against
+    // 75% for the scope's threshold) and turned the aggregate red at 67.97%. It is not that the file is
+    // untested — `src/db/rows.test.ts` covers it — it is that the branches here are **driver-shape fallbacks**
+    // (`rawTimestamp` reading epoch-millis text, `rawTextArray` reading Postgres's array literal) that only the
+    // *other* driver behaviour would take. This suite drives the real driver, which takes the happy path, so the
+    // defensive half of the file is unreachable by construction; `vitest.config.ts` gates the file where its
+    // shapes can be summoned. Reporting it here would ask the integration suite to cover code that runs only
+    // when the driver changes its mind.
     coverage: {
       provider: 'v8',
       reportsDirectory: 'coverage-integration',
       reporter: ['text', 'html', 'lcov'],
-      include: ['src/db/**/*.ts'],
-      exclude: ['src/**/*.int.test.ts', 'src/**/*.test.ts'],
+      include: ['src/db/**/*.ts', 'src/services/**/*.ts', 'src/routes/**/*.ts'],
+      exclude: ['src/**/*.int.test.ts', 'src/**/*.test.ts', 'src/db/rows.ts'],
       thresholds: {
         lines: 80,
         functions: 80,

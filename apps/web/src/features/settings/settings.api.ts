@@ -1,33 +1,69 @@
 /**
- * The four calls `/app/settings` makes (docs/plans/mvp/MVP-16.md §2, `docs/API.md` #9, #7 and #22).
+ * The settings and credential calls this app makes (`docs/API.md` #22, #9 and #7).
  *
- * Every one of them is a thin wrapper over the shared {@link ApiClient}, and every response is
- * parsed with the same Zod schema the server compiles against, so a contract change breaks a test
- * here rather than a render deep in a component.
+ * Two PRs met in this file, and the merge is worth stating because the two halves answer different
+ * questions:
  *
- * There is deliberately no error handling in this file: `lib/api.ts` already turns every non-2xx
- * into an `ApiError` carrying the envelope, and the caller that can *show* something is the form or
- * the page, not the transport.
+ * * **PR-14** wrote it first, for the autosave engine: `autosave: boolean` is an **injected** input,
+ *   and the caller that injects it needs somewhere honest to get it from. Hence {@link
+ *   settingsOptions} (the cache entry, so PR-14's editor and PR-16's toggle cannot disagree about
+ *   which row is the truth), {@link fetchSettings} (the app-level singleton transport) and {@link
+ *   autosaveFlag} — the default is the load-bearing part, because the only ways to see no row are a
+ *   request in flight and a request that failed, and a note whose autosave quietly turned itself off
+ *   because a settings `GET` was slow is precisely the silent behaviour the README rules out.
+ * * **PR-16** added the rest of the surface the settings screen needs — {@link patchSettings},
+ *   {@link changePassword}, {@link signOutEverywhere} — against an **injected** {@link ApiClient},
+ *   because a component cannot pass constructor options to a module singleton and PR-16's tests drive
+ *   a fake server through `lib/api-client-context.tsx`. `lib/api.ts` (PR-05) exports the singleton, so
+ *   {@link fetchSettings} is now one call to {@link getSettings} rather than a second implementation
+ *   of the same request: one URL, one schema, two entry points for two kinds of caller.
  *
- * Which endpoints exist in this tree is worth stating, because it explains the test layout:
- * `ROUTES.auth.password` and `ROUTES.auth.logoutAll` are served (PR-07), while `ROUTES.settings`
- * is **PR-09's and is not registered yet** — `app.ts` mounts health, auth and users only. So the two
- * settings calls are covered by the fake in `src/test/fake-api.ts`, whose semantics are taken from
- * `docs/API.md` #22 and `db/schema.ts`'s `settings` defaults (PR-04), not invented here; PR-09's own
- * integration suite is the server-side half, and should keep the two in step the way
- * `auth.routes.int.test.ts` does for #9.
+ * Every response is parsed with the same Zod schema the server compiles against, so a contract change
+ * breaks a test here rather than a render deep in a component. There is deliberately no error handling
+ * in this file: `lib/api.ts` already turns every non-2xx into an `ApiError` carrying the envelope, and
+ * the caller that can *show* something is the form or the page, not the transport.
+ *
+ * All four endpoints exist in this tree now: PR-09 registered `GET`/`PATCH /api/settings` (its
+ * `settings.routes.int.test.ts` is the server-side half), and PR-07 registered `ROUTES.auth.password`
+ * and `ROUTES.auth.logoutAll`.
  */
-import { type PatchSettingsRequest, ROUTES, type Settings, settingsSchema } from '@note-taker/contracts';
+import {
+  type PatchSettingsRequest,
+  ROUTES,
+  type Settings,
+  settingsSchema,
+} from '@note-taker/contracts';
+import { queryOptions } from '@tanstack/react-query';
 
-import type { ApiClient } from '../../lib/api.js';
+import { type ApiClient, api } from '../../lib/api';
+import { queryKeys } from '../../lib/queryClient';
+
+/** What this app does with "no answer yet": on. The plan's default, not a coin flip. */
+export const AUTOSAVE_DEFAULT = true;
 
 /**
- * `GET /api/settings` (§9.2 #22). Get-or-create on the server, so this never 404s and never answers
- * an empty body: a fresh account gets the defaults row, which is what lets the page skip the
- * "no settings yet" branch entirely (MVP-16 §6).
+ * `GET /api/settings` (§9.2 #22) with an injected client — the form PR-16's hooks and its tests use.
+ *
+ * Get-or-create on the server, so this never 404s and never answers an empty body: a fresh account
+ * gets the defaults row, which is what lets the settings page skip the "no settings yet" branch
+ * entirely (MVP-16 §6).
  */
 export function getSettings(client: ApiClient): Promise<Settings> {
   return client.json<Settings>(ROUTES.settings, { schema: settingsSchema });
+}
+
+/** `GET /api/settings` on the application singleton — PR-14's entry point, and the one PR-14 tested. */
+export function fetchSettings(): Promise<Settings> {
+  return getSettings(api);
+}
+
+export function settingsOptions() {
+  return queryOptions({ queryKey: queryKeys.settings, queryFn: fetchSettings });
+}
+
+/** The flag out of a row, with the default for `undefined`. Pure, so the rule has a test of its own. */
+export function autosaveFlag(settings: Settings | undefined): boolean {
+  return settings?.autosave ?? AUTOSAVE_DEFAULT;
 }
 
 /**

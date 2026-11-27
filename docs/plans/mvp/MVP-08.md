@@ -31,8 +31,8 @@ context + route guards, and the UI kit everything else reuses. **No `/app` shell
 - `apps/web` (Vite 7 + React 19 + TanStack Router file-based routes + TanStack Query + Tailwind v4), with
   `routes/__root.tsx`, a placeholder `routes/index.tsx`, and `lib/{api.ts,queryClient.ts}` from PR-05.
   `apps/web/vitest.config.ts` carries **both** web coverage rows: `apps/web/src/lib` (armed by PR-05)
-  and the overall `apps/web/src` row, which **PR-16 armed** rather than this PR (§7) — it already
-  exists, so it is yours to keep green, not to add.
+  and the overall `apps/web/src` row, which **this PR armed** (§7). PR-16 armed the same row independently while this PR
+  was open, and merging PR-16 kept one row — this PR's key and numbers — so it is never added twice and never lowered.
 - `@note-taker/contracts` exports `registerSchema`, `loginSchema`, `changePasswordSchema`, `sessionUserSchema`,
   `ROUTES` path constants, and the error envelope types.
 - The server (PR-07) serves: `GET /api/auth/status` (`{needsSetup, registrationOpen}`, issues `note_csrf`),
@@ -90,10 +90,12 @@ this PR's acceptance testable on its own.
 ## 7. Coverage gate you keep (and may raise)
 
 The overall **`apps/web/src`** row — **55 lines / 55 functions / 50 branches / 55 statements**, ratcheting to 65 after
-PR-19 — is **already in `apps/web/vitest.config.ts`**: **PR-16 armed it** (plan §14, `MVP-16.md` §9), because this PR had
-not merged when PR-16 landed the first screen whose components a Postgres-free web suite can render. So:
+PR-19 — is **in `apps/web/vitest.config.ts`** as `'src/**'`, **armed by this PR**. PR-16 was written against a tree
+where this PR had not merged and armed the same row under a second key (`'**'`); merging PR-16 into main resolved that
+to one row, this PR's. So:
 
-- **Do not add a second `apps/web/src` row.** Edit the existing one; never lower it (§3).
+- **Never add a second `apps/web/src` row** (a parallel PR already did once, and the merge had to delete it). Edit the
+  existing one; never lower it (§3).
 - Your auth screens are the first `/login` / `/signup` / `/welcome` tests in that scope, so *raising* the row is what
   §3's "this PR raises one" now means: run `pnpm coverage`, read the number, and set thresholds the new suite clears
   with room to spare.
@@ -113,7 +115,7 @@ not merged when PR-16 landed the first screen whose components a Postgres-free w
       member and lands on `/welcome`. With the flag false: `/signup` is unreachable from the UI and a direct visit
       redirects to `/login`. On a **fresh install** (flag true, `needsSetup: true`): the link is hidden and a direct
       `/signup` visit redirects to `/setup`.
-- [ ] `apps/web/src` overall coverage ≥ 55/55/50/55 — the row **PR-16** armed (§7), not one you add — and
+- [ ] `apps/web/src` overall coverage ≥ 55/55/50/55 — the `'src/**'` row this PR armed (§7), never a second one — and
       `pnpm coverage` green in the `unit` job; higher numbers, with the thresholds raised to match, are the goal.
 
 ## 9. Out of scope
@@ -130,7 +132,7 @@ Task: PR-08
 ## What
 routes setup/login/signup/welcome, features/auth session context + guard plumbing, components/ui v1 (Radix + Tailwind),
 Tailwind light/dark tokens, error + not-found boundaries, overall `apps/web/src` coverage row kept green (the
-55/55/50/55 row PR-16 armed) and raised to whatever this PR's suite clears.
+55/55/50/55 row this PR armed) and raised to whatever this PR's suite clears.
 
 ## Acceptance evidence
 - vitest run: guard redirects, signup visibility matrix (flag × owner-exists × needsSetup), error rendering

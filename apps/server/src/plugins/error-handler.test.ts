@@ -6,6 +6,7 @@ import { errorResponseSchema, isVersionConflictErrorData, renameMoveSchema } fro
 import { describe, expect, it } from 'vitest';
 
 import { buildApp } from '../app.js';
+import { EnvelopeError } from '../crypto/envelope.js';
 import {
   ConflictError,
   ForbiddenError,
@@ -13,6 +14,7 @@ import {
   PayloadTooLargeError,
   RateLimitedError,
   UnauthorizedError,
+  ValidationError,
   VersionConflictError,
 } from '../domain/errors.js';
 import { parseEnv } from '../env.js';
@@ -146,6 +148,62 @@ describe('mapError: the Postgres codes that mean a retry may work', () => {
   });
 });
 
+describe('mapError: the mappings PR-09 added', () => {
+  it('answers a foreign-key violation with 404, because the parent the request named is gone', () => {
+    // The service scopes every body `folderId`/`parentId` first, so this is the race: the folder was deleted
+    // between the check and the insert. A 500 would be a lie about who broke, and a 409 would advise a retry that
+    // can never work (docs/plans/mvp/MVP-09.md §5.4).
+    const mapped = mapError(driverError('23503'));
+    expect(mapped.status).toBe(404);
+    expect(mapped.code).toBe('NOT_FOUND');
+    // The code's own default sentence, not the driver's: what must never reach a client is the text that names the
+    // constraint or the two rows involved.
+    expect(mapped.message).toBe('not found');
+    expect(JSON.stringify(mapped)).not.toContain('23503');
+    // …and it is the same answer a missing row gives, so the race is not an existence oracle.
+    expect(mapped.status).toBe(mapError(new NotFoundError('folder')).status);
+  });
+
+  it('answers an envelope failure with 500 and the note id in the log, never an empty body', () => {
+    const id = '0f6f0c1a-0000-4000-8000-000000000000';
+    const mapped = mapError(
+      new EnvelopeError(
+        'note content failed to authenticate (bad AAD, a truncated tag, or the wrong key version)',
+        {
+          noteId: id,
+        },
+      ),
+    );
+    expect(mapped.status).toBe(500);
+    expect(mapped.code).toBe('INTERNAL');
+    // The generic text: `EnvelopeError`'s own names key versions and fingerprints, and the client cannot act on
+    // either. What it must not get is `content: ""`, which would read as an empty note (MVP-09 §7).
+    expect(mapped.message).toBe('internal error');
+    // The operator's half: which row.
+    expect(mapped.logContext).toEqual({ noteId: id });
+    // An envelope failure about something other than a note has no id to name, and invents none.
+    expect(
+      mapError(new EnvelopeError('the sealed triple is not a parseable envelope')).logContext,
+    ).toBeUndefined();
+  });
+
+  it('keeps the depth-cap refusal a field error that names the cap', () => {
+    // §4 #13: `parentId` was otherwise a well-formed uuid, so the message is the only thing the client can show.
+    const mapped = mapError(
+      new ValidationError(
+        'a folder there would sit at depth 100, and the tree is capped at 100 levels (depths 0-99)',
+        {
+          details: [{ path: 'parentId', message: 'may not nest a folder below depth 99' }],
+        },
+      ),
+    );
+    expect(mapped.status).toBe(400);
+    expect(mapped.code).toBe('VALIDATION');
+    expect(mapped.message).toContain('capped at 100 levels');
+    expect(mapped.details?.[0]?.path).toBe('parentId');
+  });
+});
+
 describe('mapError: everything else', () => {
   it('keeps a 4xx Fastify chose, and replaces its developer-facing text', () => {
     expect(mapError(Object.assign(new Error('Rate limit exceeded'), { statusCode: 429 }))).toEqual({
@@ -214,6 +272,15 @@ describe('registerErrorHandlers through buildApp()', () => {
     });
     app.get('/api/stub/rate-limited-without-a-number', () => {
       throw new RateLimitedError();
+    });
+    // PR-09's two: a parent row that vanished mid-write, and a note body that will not authenticate.
+    app.get('/api/stub/foreign-key', () => {
+      throw driverError('23503');
+    });
+    app.get('/api/stub/envelope', () => {
+      throw new EnvelopeError('note content failed to authenticate (bad AAD, or the wrong key version)', {
+        noteId: '0f6f0c1a-0000-4000-8000-000000000000',
+      });
     });
     app.post('/api/stub/echo', () => ({ received: true }));
     await app.ready();
@@ -292,6 +359,29 @@ describe('registerErrorHandlers through buildApp()', () => {
     expect(rejected.statusCode).toBe(400);
     expect(rejected.json()).toMatchObject({ error: { code: 'VALIDATION' } });
     expect(rejected.body).not.toContain('my secret note');
+
+    await app.close();
+  });
+
+  it('answers a vanished parent with 404 and a failed decryption with 500, in the same envelope', async () => {
+    const app = await makeApp();
+
+    // §5.4's net: the folder a note was being moved into stopped existing. The client is told the thing it named is
+    // not there, and never that a constraint fired.
+    const foreignKey = await app.inject('/api/stub/foreign-key');
+    expect(foreignKey.statusCode).toBe(404);
+    expect(errorResponseSchema.safeParse(foreignKey.json()).success).toBe(true);
+    expect(foreignKey.json()).toMatchObject({ error: { code: 'NOT_FOUND' } });
+    expect(foreignKey.body).not.toContain('23503');
+
+    // §7's other half: the body cannot be served, so nothing is served. An empty `content` would be a note the
+    // user could overwrite and lose the only copy.
+    const envelope = await app.inject('/api/stub/envelope');
+    expect(envelope.statusCode).toBe(500);
+    expect(errorResponseSchema.safeParse(envelope.json()).success).toBe(true);
+    expect(envelope.json()).toMatchObject({ error: { code: 'INTERNAL', message: 'internal error' } });
+    expect(envelope.body).not.toContain('AAD');
+    expect(envelope.body).not.toContain('0f6f0c1a');
 
     await app.close();
   });

@@ -328,17 +328,22 @@ note-taker/
             │                                   one-shot 403 refresh-and-replay per §10; proven in PR-07)
             ├── lib/queryClient.ts             PR-05
             ├── lib/markdown.ts                PR-13 toolbar transforms (pure, unit-tested)
-            ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested)
+            ├── lib/autosave.ts                PR-14 state machine (pure, unit-tested) owns the buffer
+            ├── lib/draft.ts                   PR-14 the `note-draft:<id>` crash mirror (not a `uiStore` key)
             ├── lib/name.ts                    PR-15 thin wrapper over contracts names.ts
             ├── features/auth/{session.tsx, auth.api.ts, useSession.ts}   PR-08
             ├── features/tree/{tree.queries.ts, tree.selectors.ts, tree.mutations.ts}  PR-12
             ├── features/notes/{note.queries.ts, note.mutations.ts}       PR-13/14
+            ├── features/notes/{new-note.ts, open-note.ts}  PR-15 the create path (tree-cache uniqueness,
+            │                                            cache bookkeeping) and the editor-caret handoff
+            ├── features/notes/useAutosave.ts  PR-14 the machine's DOM half (flush triggers, draft prompt)
+            ├── features/settings/settings.api.ts PR-14 `GET /api/settings` read (PR-16 grows the screen)
             └── components/
                 ├── ui/{Button,Input,Field,Dialog,Menu,Toast,Spinner}.tsx  PR-08 (grown by later PRs)
                 ├── layout/{AppShell,Sidebar,TopBar,StatusBar}.tsx         PR-12
                 ├── tree/{FolderTree,FolderRow,NoteRow,TreeContextMenu}.tsx PR-12
                 ├── editor/{EditorPane,MarkdownEditor,EditorToolbar,PreviewPane}.tsx PR-13
-                ├── editor/{SaveStatus,ConflictBanner}.tsx                 PR-14
+                ├── editor/{SaveStatus,ConflictBanner,DraftPrompt}.tsx     PR-14
                 ├── notes/{RenameDialog,MoveDialog,DeleteConfirm}.tsx      PR-12 (shared dialog forms)
                 └── notes/NewNoteDialog.tsx                               PR-15
 ```
@@ -645,7 +650,7 @@ home/LAN/VM network, possibly behind a reverse proxy.
 | `/setup` | only when `needsSetup` | create the first account (README: self-hosted, first-run) |
 | `/login` | redirect away when authed | username + password, error + rate-limit messaging |
 | `/signup` | only when `registrationOpen` **AND** `!needsSetup`; otherwise redirect to `/login` (`/setup` on a fresh install) | self-sign-up form; creates a `member` (route + guard land in PR-08, server guard in PR-07) |
-| `/welcome` | auth | **placeholder home created by PR-08** (signed-in card + sign-out control); deleted by PR-12 when `/app` lands |
+| `/welcome` | — | **does not exist: PR-12 deleted `routes/welcome.tsx`.** PR-08's placeholder home; a bookmark to it is an unknown path and lands on `/app` when signed in |
 | `/app` | auth | AppShell; default view = recent notes + "New note" |
 | `/app/note/$noteId` | auth | editor + preview for one note |
 | `/app/search` | auth | search results (`?q=`) |
@@ -656,16 +661,18 @@ Route guards live in `routes/app/route.tsx` (`beforeLoad` reads the session cont
 TanStack Router's own convention:** in file-based routing a directory's layout route is `route.tsx` inside it
 (`routes/app/route.tsx` wraps `index.tsx`, `note.$noteId.tsx`, `settings.tsx`, `search.tsx`); `__layout.tsx` is the
 Next.js App Router habit and is not what the router's plug-in picks up. Until PR-12
-creates that layout, the authed redirect target is `/welcome` (created in PR-08, replaced in PR-12), which keeps
-PR-08's acceptance testable on its own.
+created that layout, the authed redirect target was `/welcome` (created in PR-08, deleted by PR-12), which kept
+PR-08's acceptance testable on its own. PR-12 repointed every authed landing and redirect at `/app`, and the guard
+matches `/app` as a **prefix** (`isAppPath` in `session.tsx`), so a later PR adds `/app/search` or `/app/settings`
+without teaching the guard anything.
 
 ### 11.2 State
 
 | Kind | Where |
 | --- | --- |
 | Server state (tree, note content, settings, session) | TanStack Query, cache keys `['tree',userId]`, `['note',id]`, `['settings']` |
-| Mutations | TanStack Query mutations with optimistic tree updates + rollback on error |
-| Editor buffer (uncommitted text) | local component state + autosave engine ref; mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
+| Mutations | TanStack Query mutations with optimistic tree updates + rollback on error (a **create** has no id to insert optimistically — `POST /api/notes` mints it, so the row enters the tree on confirmation; PR-15 §9) |
+| Editor buffer (uncommitted text) | **the autosave engine owns it** (PR-14): `lib/autosave.ts` holds the buffer and the editor renders `snapshot().buffer`, because §11.4's conflict comparison needs one owner of the string that went on the wire and a component holding its own `useState` on top of the engine is two. Mirrored to `localStorage['note-draft:<id>']` so a browser crash keeps the last buffer |
 | Transient UI (dialogs, preview mode, sidebar width) | local state + a tiny `ui` store for sidebar/preview mode persisted in `localStorage` |
 
 No global client store (no Redux/Zustand) in the MVP — Query + Router cover it, and less state means fewer bugs.
@@ -735,6 +742,62 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   stale `baseVersion`, plain `CONFLICT` is the generic code for a sibling-name clash (§9.1) — the autosave machine never
   reacts to the latter.
 
+**Seven things only writing the code settles, recorded because PR-16/19 read this section as behaviour (PR-14):**
+
+- **Nothing leaves while a reply is owed.** A request that went out and never came back is an answer the client has
+  not read. So every flush that arrives during a backoff — the debounce, the 10 s cap, `blur`,
+  `visibilitychange → hidden`, a note switch, an unmount, `Ctrl/Cmd+S` — sends **the request that failed**, its bytes
+  and its `baseVersion` unchanged, and never a fresh capture of the buffer: newer text written against the version we
+  left on the wire is answered by a `VERSION_CONFLICT` carrying *our own* earlier write, which the fork would then
+  read as a second writer. Such a flush moves the replay earlier and leaves the spent retry budget spent; keystrokes
+  typed meanwhile go out in the window after it settles, which is the "to `dirty` if the user typed meanwhile" case
+  above rather than a second interpretation of it. The 10 s cap opens no second window beside a scheduled replay, and
+  no 10 s deadline is armed next to a 30 s backoff, because "the backoff is exactly 1 s, 2 s, 4 s, 8 s, 30 s" is a
+  promise this section makes.
+- **A person re-funds the retry schedule; a trigger does not, and neither keeps the old failure.** A flush during a
+  backoff buys nothing, but `Ctrl/Cmd+S` and *Retry* arriving from the spent-budget `error` state are §4's own "manual
+  retry" row, so they clear `attempt` and the message before the replay — without that, the spent `attempt` made the
+  next failure terminal instead of opening a fresh 1 s window, and the pill read `failure` before it read the state
+  (`saveStatusText`'s precedence), so it said "Not saved — …" with `data-state="error"` over a request that was on its
+  way out. A `blur`, a note switch or a `hidden` that lands in the same state sends the owed request and clears the
+  message, because a pill must never describe a failed cycle while a request is in flight, but it does not buy a new
+  schedule: §4 makes the next cycle the user's decision.
+- **An explicit resolution supersedes the owed replay.** *Keep mine*, *Use server* and a re-read of the note each say
+  what the row holds and at which version, which is the only question a replay exists to ask, so each drops it. The
+  unload `keepalive` write is the one place that sends newer text while a reply is owed: only one request can leave an
+  exiting page, and losing the buffer would be the worse loss. On the next load the row and the draft mirror disagree,
+  which is what the restore prompt is for.
+- **The snapshot is the screen's only window.** `snapshot()` is cached and `notify()` is the only thing that clears the
+  cache, and the editor renders `snapshot().buffer` — so a path that updates the buffer without publishing makes a
+  controlled editor swallow the keystroke that woke it, in `conflict` and in the two stopped rows being exactly the
+  states where the text has to stay visible. `onEdit` publishes on every path, and `dirty` means "newer than the row"
+  everywhere: undoing back to the saved text is `clean`, not a pill reading "Unsaved changes" over a write that will
+  never start.
+- **The unload guard is the negation of "the unload carries this", not of the budget alone.** `beforeunload` is armed
+  only when the buffer is dirty *and* nothing is carrying it: clean, or a `keepalive` request already leaving with
+  exactly that text, or `pagehide` still able to start one — those need no prompt. An **ordinary** in-flight `PUT`
+  never counts as carried, because the unload aborts it, and an autosave-off or over-budget buffer is never carried
+  either. A prompt over a save already leaving is noise; a missing prompt over a buffer that cannot leave is data loss.
+- **`visibilitychange → hidden` goes out on the unload transport — but only when nothing is owed — and the budget
+  measures the body.** A closing tab hides *before* `pagehide` (the unload steps are hide → `beforeunload` →
+  `pagehide`), so the ordinary `PUT` a `hidden` handler used to start occupied rule 1, was aborted by the unload, and
+  left `pagehide` with nothing it may start — the `keepalive` path never ran on a normal close. Within the budget
+  `hidden` now sends `fetch(…, {keepalive: true})`, and a mere tab switch is unharmed, because a live page reads a
+  `keepalive` reply normally. **The first bullet outranks that transport:** with a replay owed, `hidden` behaves like
+  every other trigger and sends the owed request, because the ordinary `hidden` is a tab switch whose page survives,
+  and a keepalive write of the newest buffer against the abandoned `baseVersion` is answered by a `VERSION_CONFLICT`
+  carrying *our own* lost write — a conflict fork about the reader's own edit, on a page that is still open and could
+  have retried. `pagehide` alone keeps the right to supersede the owed request (the bullet above). That ~64 KiB cap is
+  a cap on the **request body**, which `lib/api.ts` builds with `JSON.stringify({content, baseVersion})`, and escaping
+  is not
+  free: a `"` or a `\n` costs two bytes and a control character six, so 58 KiB of quotes is a ~116 KiB body that
+  `fetch` rejects before it leaves — *after* the predicate had promised the buffer fitted. `contentWriteBytes` is that
+  measure, and the two-key body it assumes is pinned by `note.mutations.test.ts`.
+- **The draft mirror clears only on a match.** `localStorage` is per-browser and the key is per-note, so a write
+  confirmed in one tab must not delete another tab's unsaved text: `clear(text)` removes the key when it still holds
+  exactly `text` and leaves it alone otherwise. The mirror is not an `nt.` `uiStore` preference and does not go through
+  that store; it is a note body under a key §11.2 names.
+
 ### 11.5 UX details that the README implies and must not be skipped
 
 - **New note dialog**: name input pre-filled with `new-file-<Date.now()>.md`, the `.md` rendered as a fixed suffix
@@ -742,6 +805,20 @@ answers for free. Recorded in `docs/ARCHITECTURE.md` (PR-20) next to the A.2 wri
   to the selected folder/root, "Create" is disabled while the name is invalid or collides (debounced
   uniqueness check against the tree cache, no extra endpoint).
 - Rename dialogs reuse the same component with the current name and the same fixed `.md` suffix for notes.
+
+**Three things PR-15 only settled in code, recorded because PR-12/13/19 read this section as behaviour:**
+
+- **The suffix is a sibling element, not a character.** The input's value is the editable name; `.md` is a node after
+  it. A `keydown` guard for "cannot be deleted" has to enumerate every way a character leaves a field (backspace,
+  delete, cut, drag-out, drop, autofill, IME and screen-reader replacements); the markup rule has no cases. The one
+  route that still gets `.md` into the value is a paste, and `stripMd` removes it from the request body.
+- **The uniqueness check is a debounced read of `['tree', userId]`, never a request.** The tree already lists every
+  sibling, so a "is this free?" endpoint re-learns a list this tab is holding. The consequence is deliberate: a tab
+  that has not fetched the tree has no opinion, so the `409 CONFLICT` (with the winner's id) is a first-class branch
+  of the dialog, not an error page.
+- **Creating hands the caret over through the cache, not the URL.** `['editor-focus']` holds the id this tab just
+  created; PR-13's editor page asks `takesEditorFocus(client, id)` on mount. A `?focus=1` would be bookmarked and
+  re-opened, and a one-shot consume would be eaten by `StrictMode`'s double mount (PR-15 §9).
 - Everything reachable by keyboard: tree arrow-key navigation, `Enter` to open, `F2` rename, `Delete` delete,
   `Ctrl/Cmd+K` (search *page* link in MVP, palette is backlog). Two chord rules keep this collision-free:
   **`Ctrl/Cmd+K` is editor-scoped against shell-scoped** — while the CodeMirror editor has focus, its keymap owns the
@@ -855,8 +932,8 @@ no PR may lower a coverage threshold; every new DB column ships with a generated
   day one, and an empty server suite should be red. The web config also carries **no `coverage.thresholds`**, because a
   threshold over a scope with nothing in it is a guaranteed red: the `apps/web/src/lib` row of §14 is armed by **PR-05**
   (whose mocked-`fetch` tests for `lib/api.ts` are the first web tests) and the overall `apps/web/src` row by
-  **PR-16** (the first components a Postgres-free web suite can render; §14 says why that ended up being PR-16 and
-  not PR-08, whose screens had not landed when the row was armed).
+  **PR-08**, with the first components (§14 records that PR-16 armed the same row independently while PR-08 was
+  still open, and that merging the two kept one row rather than two).
   **`AGENTS.md` is updated here, not deferred:** the file lists **no commands today**, so this PR **adds** the real
   ones it introduces (`pnpm i / dev / build / lint / typecheck / test`) — the file's first-ever command list —
   because §1's same-PR doc rule — inherited from
@@ -1200,9 +1277,10 @@ merge with the placeholder still in place — see "Jobs added later" below)
   owns**, because the `/app` shell and its guard belong to PR-12), `features/auth/*`,
   `components/ui/*` (Button, Input, Field, Dialog, Menu, Toast, Spinner — Radix primitives + Tailwind),
   Tailwind theme tokens (light/dark via `prefers-color-scheme` default), global error/not-found boundaries. It also
-  **keeps the rest of the web coverage gate**: the overall `apps/web/src` row of §14's threshold table was **armed by
-  PR-16**, not by this PR (PR-16 landed the first components a Postgres-free web suite can render before this PR merged),
-  so this PR must not add that row — it keeps it green and raises it to whatever its own auth screens clear. The
+  **keeps the rest of the web coverage gate**: the overall `apps/web/src` row of §14's threshold table is **this PR's**,
+  and it was armed here (`'src/**'` at 55/55/50/55). PR-16 armed the same row independently while this PR was open, and
+  merging PR-16 kept one row — this PR's key and numbers — so nobody adds a second `apps/web/src` row and no PR lowers
+  one. The
   `apps/web/src/lib` row was armed by PR-05, and PR-01's `passWithNoTests: true` was dropped there — from PR-05 on, an
   empty web suite is a failure, not a pass.
 - **Acceptance (playwright-able, against routes this PR owns):** unauth visit → `/login`; `needsSetup` → `/setup`;
@@ -1486,12 +1564,18 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   `NODE_ENV=production` — `docker compose --env-file .env -f docker/compose.yml exec app node -e "console.log(process.env.NODE_ENV)"`
   prints it **with no `NODE_ENV` entry in `.env`**, proving the image/compose set it and the boot guard in §10 is
   actually armed (an unset value would exit non-zero at boot and the container would never reach `healthy`);
-  `docker history` shows no dev deps and no `curl`; image runs as uid ≠ 0; boot fails loudly (non-zero) when
+  the runtime image adds no build or download tool of its own — proven by asking a container of the image to
+  walk `/app` (no tool by name; no `.ts` source of ours, scoped to the payload paths the image ships, since
+  third-party packages ship their own TypeScript; nothing under `/app` owned by the app user), **not** by
+  `docker history`, whose layer
+  *commands* mention `curl` because the base image's ancestors installed it, whether or not the finished image
+  keeps it (this sentence corrected while reviewing PR-16: the original read "`docker history` shows no dev deps
+  and no `curl`", a check that prints LEAK on a correct image); image runs as uid ≠ 0; boot fails loudly (non-zero) when
   `NOTE_ENCRYPTION_KEY` is missing in production — **and** on that same clean VM, with nothing on it but Docker,
   `docker compose --env-file .env -f docker/compose.yml config` exits non-zero naming the variable without creating a
   single container: that is the form §15 step 2b runs, backed by `${NOTE_ENCRYPTION_KEY:?…}` in the app service. The
   dev/CI form is asserted **in the CI `build` job**, where the repo toolchain exists and never from the runbook: `pnpm
-  check:env`, run against two fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
+  check:env`, run against four fixture files through `DOTENV_PATH` (§16's loader hook) rather than the runner's own
   environment — defined as `NODE_ENV=production tsx scripts/check-env.ts`, per PR-01's inline-mode rule — exits non-zero
   listing the same missing
   variables **before Docker is contacted**, then exits 0 once `NOTE_ENCRYPTION_KEY` is filled in. Two details make that
@@ -1499,7 +1583,10 @@ included, since PR-17 is what closes M3; the image itself can be drafted at PR-1
   comes from its script line, §16) and **no `DATABASE_URL` line** — the runbook's file carries the `POSTGRES_*` trio,
   which is exactly what satisfies the preflight's DSN rule even though the *boot* guard demands a composed
   `DATABASE_URL` in the process (§10). A third assertion pins the negative case: a `.env` with neither form exits
-  non-zero naming both options.
+  non-zero naming both options. Two more pin a promise about the *report itself* — added after PR-16's first review
+  found the failure paths printing the key they were reporting on: fixtures whose values are pasted into a malformed
+  line, into a boolean, and onto a line of their own must still fail and still name the rule, while neither the whole
+  value nor its first 20 characters may appear in the log (a prefix grep, because the leak was a truncated one).
   **Operator drills, all executed inside the built image** (this is what proves the runtime layer can actually run them):
   the backup + restore drill from §15, **each numbered step in order** (`pg_dump … | gzip`; `exec -T db createdb -U
   "$POSTGRES_USER" "${POSTGRES_DB}_restore"` — the scratch DB must exist before the pipe can succeed; `gunzip -c
@@ -1717,11 +1804,12 @@ Rules:
 - Flaky policy: `retries: 1` for e2e only; a test that fails on re-run gets an immediate follow-up issue/PR.
 - The two `apps/web` rows are armed when the web scope first has tests to measure: **PR-05** turns on
   `apps/web/src/lib` (mocked-`fetch` tests for `lib/api.ts`) and drops PR-01's `passWithNoTests: true`;
-  the overall `apps/web/src` row was **PR-08**'s, and **PR-16 armed it instead** — PR-08 had not merged when PR-16
-  landed the first screen whose components a Postgres-free web suite can render (`/app/settings`), and a row naming a
-  scope nothing measures is not a gate. **This bullet is the authority on that row:** `MVP-08.md` §7 now tells PR-08 to
-  keep the existing row and raise it, never to add a second one, and the `MVP-01` / `MVP-03` / `MVP-05` / `MVP-12`
-  passages that dated the arming to PR-08 say PR-16. Before PR-05 the web config passes with zero files and declares no
+  the overall `apps/web/src` row is **PR-08**'s and was armed there with the first components. **PR-16 armed the same
+  row independently** — it was written against a tree where PR-08 had not merged, and a row naming a scope nothing
+  measures is not a gate — so merging PR-16 into main resolved to **one** `src/**` row at 55/55/50/55, PR-08's key and
+  PR-08's numbers, with PR-16's duplicate `'**'` key dropped. **This bullet is the authority on that row**: the
+  `MVP-01` / `MVP-03` / `MVP-05` / `MVP-08` / `MVP-12` / `MVP-16` passages say PR-08 owns it and that PR-16 re-armed it
+  in parallel. Before PR-05 the web config passes with zero files and declares no
   thresholds, so `pnpm coverage` cannot fail on an empty scope. Every other row is armed by the first PR that puts a
   test in its scope; the table's `enforced by` column names the **job and config** that measure it, not the arming PR.
 

@@ -181,8 +181,8 @@ default include (`**/*.{test,spec}.*`) would otherwise pull the DB-backed files 
 Postgres-free `unit` job. The **web** config additionally sets `passWithNoTests: true` (PR-01 ships no web tests and
 Vitest otherwise exits 1 — which would break this PR's own acceptance and PR-03's `unit` job); the **server** config
 does not, because `env.test.ts`/`app.test.ts` exist from day one. The web config carries **no `coverage.thresholds`**:
-the `apps/web/src/lib` row is armed by PR-05 and the overall `apps/web/src` row by PR-16 (plan §14 records why that row
-moved from PR-08 to PR-16).
+the `apps/web/src/lib` row is armed by PR-05 and the overall `apps/web/src` row by PR-08 (plan §14 records that PR-16
+armed that same row in parallel and that the merge kept one).
 
 Coverage thresholds you *do* set now (server): `src/{crypto,domain}` 80/80/75/80 — those directories are empty today,
 so set the row only if it cannot fail; if it would, leave the scope unset and let PR-06 arm it. Never set a threshold

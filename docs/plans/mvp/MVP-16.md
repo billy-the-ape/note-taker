@@ -123,18 +123,24 @@ because the next PR reads this file, not the commit messages.
   `'system'`, `settings_theme_check`) rather than invented here. The credential calls are the opposite case: they *are*
   served, and PR-07's own `apps/server/src/routes/auth.routes.int.test.ts` ("kills the old password, keeps this session
   alive, and deletes every other one") proves the same semantics server-side — which is what makes pinning the rotation
-  criterion from the client half safe. Whoever lands PR-09 should keep the fake and its docblock in step, exactly as
-  `fake-api.ts` already says.
-- **PR-08 is absent**, so the screen is self-contained Tailwind rather than `components/ui/*`, `ApiClientProvider` is
-  `lib/api-client-context.tsx` (PR-16's own, to be replaced or re-exported by PR-08), and the **overall `apps/web/src`
-  coverage row — nominally PR-08's — was armed here** (§14 of the plan is updated to say so).
-- **PR-14 is absent.** The flag's consumer is `apps/web/src/test/editor-harness.tsx`, a ~50-line stand-in that
+  criterion from the client half safe. PR-09 has since landed, and `apps/server/src/routes/settings.routes.int.test.ts`
+  is the server-side half the fake is meant to track — keep the two in step, exactly as `fake-api.ts` says.
+- **PR-08 was absent when this was written**, so the screen is self-contained Tailwind rather than `components/ui/*`,
+  and `ApiClientProvider` is `lib/api-client-context.tsx` — PR-16's own. PR-08 has since merged and did **not** add a
+  provider (its components call the `lib/api` singleton directly), so this file stays; whether a later PR re-exports it
+  is open. The **overall `apps/web/src` coverage row** was armed here for the same reason, and PR-08 armed the same row
+  independently: merging the two kept **PR-08's `'src/**'` row** and dropped PR-16's duplicate `'**'` key (plan §14
+  says so, and `apps/web/vitest.config.ts` says why).
+- **PR-14 was absent.** The flag's consumer was `apps/web/src/test/editor-harness.tsx`, a ~50-line stand-in that
   implements exactly PR-14 §6's `settings.autosave === false` rule and is documented as a harness rather than a
-  component. `useAutosaveEnabled()` is the injection surface PR-14 briefs; when it lands it must absorb these
-  assertions, not delete them.
+  component. `useAutosaveEnabled()` is the injection surface PR-14 briefs, and PR-14 has since merged:
+  `features/notes/useAutosave.ts` reads `settingsOptions()` / `autosaveFlag()` from the merged `features/settings/settings.api.ts`.
+  The harness survived the merge on purpose — PR-16's assertions are about the *flag contract*, not the engine — but the
+  follow-up is for PR-14's engine to cover those same rows rather than leave two implementations of one rule.
 - **"Navigating away with a dirty buffer prompts Save / Discard / Stay" (§5) is not implemented here.** That prompt is
-  a router blocker, and PR-13 owns `routes/app/route.tsx` and the `useBlocker` kit it hangs off; neither is in this
-  tree, and a settings PR inventing its own blocker would be the second, weaker copy MVP-08 §4 rules out. The harness
+  a router blocker, and `routes/app/route.tsx` — PR-12's, which has since merged — is where the `useBlocker` kit hangs
+  off, while the note route that needs it is PR-13's. A settings PR inventing its own blocker would be the second,
+  weaker copy MVP-08 §4 rules out. The harness
   leaves the blocker out and says why, so the prompt lands once — with PR-13 — rather than twice.
 - **Review round 1 fixed two UI defects this PR shipped** (see the PR discussion, not a §6 criterion):
   - The first draft defined `--color-paper-dark`/`--color-ink-dark` and used them on `<body>` only, so under

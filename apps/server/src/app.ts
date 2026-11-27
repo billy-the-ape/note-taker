@@ -19,12 +19,14 @@ import { authRoutes } from './routes/auth.routes.js';
 import { folderRoutes } from './routes/folders.routes.js';
 import { healthRoutes } from './routes/health.routes.js';
 import { noteRoutes } from './routes/notes.routes.js';
+import { searchRoutes } from './routes/search.routes.js';
 import { settingsRoutes } from './routes/settings.routes.js';
 import { treeRoutes } from './routes/tree.routes.js';
 import { usersRoutes } from './routes/users.routes.js';
 import { createAuthService } from './services/auth.service.js';
 import { createFolderService } from './services/folder.service.js';
 import { createNoteService } from './services/note.service.js';
+import { createSearchService } from './services/search.service.js';
 import { createSettingsService } from './services/settings.service.js';
 import { createTreeService } from './services/tree.service.js';
 
@@ -198,15 +200,17 @@ async function registerAuth(
 
 /**
  * The domain half of the API (docs/plans/mvp/MVP-09.md, plus `PUT /api/notes/:id/content` from
- * docs/plans/mvp/MVP-10.md): `tree.routes.ts` (1) + `folders.routes.ts` (3) + `notes.routes.ts` (5) +
- * `settings.routes.ts` (2).
+ * docs/plans/mvp/MVP-10.md and `GET /api/search` from docs/plans/mvp/MVP-11.md): `tree.routes.ts` (1) +
+ * `folders.routes.ts` (3) + `notes.routes.ts` (5) + `settings.routes.ts` (2) + `search.routes.ts` (1).
  *
  * One service object per process, each built over the same injected pool, which is what makes the folder
  * transaction and the note's envelope share a connection with the rest of the request. Two things are
  * deliberately *not* constructed here:
  *
- * * **The keyring is passed in**, defaulting to {@link getKeyring} at the call site. Only
- *   `services/note.service.ts` ever holds one, and `GET /api/tree` proves it: the tree is served without a key.
+ * * **The keyring is passed in**, defaulting to {@link getKeyring} at the call site. Two services hold one —
+ *   `services/note.service.ts` (seal and open a note) and `services/search.service.ts` (open the ≤500 bodies its
+ *   in-process pass reads) — and `GET /api/tree` proves the rest of the API does not: the tree is served without a
+ *   key, and so is the half of a search that runs in SQL.
  * * **No per-request state of any kind.** `createFolderService` closes over the pool and nothing else, so the
  *   advisory lock in a folder mutation is held by the *transaction*, not by a service instance — which is the
  *   only way two concurrent requests from one user can be serialised by Postgres rather than by whoever happened
@@ -222,11 +226,17 @@ async function registerDomain(
   const noteService = createNoteService({ db, keyring });
   const treeService = createTreeService({ db });
   const settingsService = createSettingsService({ db });
+  // Search is the second consumer of the keyring (`GET /api/notes/:id` is the first): bodies are encrypted, so the
+  // in-process half of a search is the only thing that can read them, and it reads them with the same ring the
+  // write path sealed them with. Metadata-only search would still work without it, which is why the one statement
+  // that covers the whole corpus takes no key at all.
+  const searchService = createSearchService({ db, keyring });
 
   await app.register(treeRoutes, { service: treeService, guard });
   await app.register(folderRoutes, { service: folderService, guard });
   await app.register(noteRoutes, { service: noteService, guard });
   await app.register(settingsRoutes, { service: settingsService, guard });
+  await app.register(searchRoutes, { service: searchService, guard });
 }
 
 /**

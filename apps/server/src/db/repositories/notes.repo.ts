@@ -13,13 +13,20 @@
  * "not found", a 404), and `folderId: null` is the root — where `notes_unique_sib` compares
  * `COALESCE(folder_id, '00000000-…'::uuid)`, so a root note and a note inside a folder can share a name while
  * two root notes cannot.
+ *
+ * PR-11 added the two statements behind `GET /api/search` ({@link searchNotesByMetadata},
+ * {@link listRecentNotesForSearch}). They keep the rule above in the strictest form the feature allows: the
+ * search still hands back the *opaque* triple and never a plaintext — decrypting it is `crypto/envelope.ts`
+ * inside `services/search.service.ts`, and the `WHERE` clause that decides which bodies are even read is SQL
+ * over the columns the schema keeps in the clear (names, folder paths, timestamps).
  */
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 
 import type { Db, DbOrTx } from '../client.js';
 import { newId } from '../ids.js';
-import { expectOne, firstOrNone } from '../rows.js';
+import { expectOne, firstOrNone, rawRows, rawTimestamp } from '../rows.js';
 import { type Note, notes } from '../schema.js';
+import { folderPathCte } from './folders.repo.js';
 
 /**
  * A sealed note: AES-256-GCM `ciphertext || tag` plus the 12-byte IV it needs, the key version that sealed
@@ -309,4 +316,169 @@ export async function listNotesForTree(db: Db, input: { readonly userId: string 
     .from(notes)
     .where(eq(notes.userId, input.userId))
     .orderBy(sql`${notes.name} collate "C"`, asc(notes.id));
+}
+
+/**
+ * One row of a search result set: the note, its folder's breadcrumb path, and — for the candidate window only —
+ * the opaque envelope triple (PR-11, docs/plans/mvp/MVP-11.md §4).
+ *
+ * `folderPath` is the contract's `folderPath`: the folder's own name and every ancestor's, `/`-joined, root
+ * first, and **empty for a note at the root**. It arrives as `array_to_string` rather than as a `text[]`
+ * because that is the one shape the contract has a field for, and the joining happens in the same statement
+ * that decided the row matched, so the string a client is shown and the string the server matched on cannot
+ * be two different answers.
+ */
+export interface NoteSearchRow {
+  readonly id: string;
+  readonly name: string;
+  readonly folderId: string | null;
+  readonly folderPath: string;
+  readonly contentUpdatedAt: Date;
+}
+
+/** A candidate for the in-process pass: the row, its path, and the envelope `crypto/envelope.ts` opens. */
+export interface NoteSearchCandidate extends NoteSearchRow {
+  readonly contentCipher: Uint8Array;
+  readonly contentIv: Uint8Array;
+  readonly keyVersion: number;
+}
+
+/**
+ * The columns both search statements read, in the one spelling that makes `content_updated_at` a value a
+ * JavaScript date parse can be sure of.
+ *
+ * The `floor(extract(epoch …) * 1000)::bigint` cast is `folders.repo.ts`'s `listFolderTree`, and for the same
+ * reason: a raw
+ * `db.execute` carries no column metadata, so a `timestamptz` would come back as whatever the driver felt like
+ * writing. {@link rawTimestamp} then reads the epoch milliseconds back into a `Date` and would throw rather than
+ * invent one — which matters here beyond the response shape, because `content_updated_at` *is* the search's
+ * recency tiebreak (§4) and a silently-wrong date would reorder results rather than fail.
+ */
+const SEARCH_COLUMNS = sql`
+      n.id,
+      n.name,
+      n.folder_id,
+      coalesce(array_to_string(folder_paths.path, '/'), '') as folder_path,
+      floor(extract(epoch from n.content_updated_at) * 1000)::bigint as content_updated_at`;
+
+/** The five columns both search statements share, minus the envelope. */
+function searchRowBase(row: Record<string, unknown>): NoteSearchRow {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    folderId: row.folder_id === null || row.folder_id === undefined ? null : String(row.folder_id),
+    // A root note has no folder row to join, so its path arrives NULL: "empty" is the contract's answer, not a
+    // string this file invented for it.
+    folderPath: String(row.folder_path ?? ''),
+    contentUpdatedAt: rawTimestamp(row.content_updated_at),
+  };
+}
+
+/** The escape character of both `LIKE`s, spelled the way Postgres wants a backslash inside a string literal. */
+const LIKE_ESCAPE = sql`escape '\'`;
+
+/**
+ * The `LIKE` pattern that means "the caller's text, as a substring, literally".
+ *
+ * Two characters have to survive translation. `%` and `_` are the wildcards, and a search box that typed
+ * `100%` means the discount, not "everything" — which is exactly what an unescaped `%` would answer, for the
+ * whole corpus, in the one branch that is guaranteed to see the whole corpus. `\` is the escape character, so a
+ * backslash in the text has to escape itself or it would silently eat the character after it.
+ *
+ * Escaping happens here rather than in the service because this file owns the meaning of the string it puts in
+ * the `WHERE`: handing a caller's `%` to `LIKE` from the service would be a repository whose pattern means two
+ * things depending on who built it.
+ */
+export function likeContainsPattern(term: string): string {
+  const escaped = term.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+  // `[` and `]` are not wildcards in Postgres `LIKE` (they are in `SIMILAR TO`), so they need no third rule —
+  // and `escape '\'` is what makes the backslashes above the escape character rather than a literal `\`.
+  return `%${escaped}%`;
+}
+
+/**
+ * Every note whose **name**, or whose folder's **name**, matches the pattern — the branch that guarantees search
+ * sees the whole corpus (PR-11 §4).
+ *
+ * Three properties the in-process pass cannot give and this one can:
+ *
+ * * it does not stop at the 500 most recent notes;
+ * * it needs no key, so it answers while some note bodies in the install are unreadable;
+ * * it is indexed-adjacent work at MVP size (the folder walk is per user and tiny; the note scan is the same
+ *   sequential read `GET /api/tree` already pays).
+ *
+ * **It is accent-sensitive, and that asymmetry is documented rather than hidden.** `unaccent` is not installed —
+ * PR-04's migration enables `pgcrypto` alone — and NFD accent folding is not expressible as a `LIKE` pattern, so
+ * `cafe` finds a note named `café` only while that note is inside the other statement's window. Closing the gap
+ * needs a folded generated column or `unaccent`: backlog PR-29, not this PR.
+ *
+ * The folder test is `exists (… unnest(path) …)`, i.e. **one segment of the path**, not the joined string: a
+ * folder name can never contain `/` (`docs/NAME-RULES.md`'s forbidden characters), so a query that does contain
+ * `/` should match nothing rather than every note under some folder.
+ *
+ * `lower(...) ilike …` is belt-and-braces (`ilike` alone would match, and the pattern is already lowercase), but
+ * it is what the brief names and it makes the statement's collation dependence obvious rather than incidental.
+ */
+export async function searchNotesByMetadata(
+  db: Db,
+  input: { readonly userId: string; readonly pattern: string; readonly limit: number },
+): Promise<NoteSearchRow[]> {
+  const result = await db.execute(
+    sql`${folderPathCte(input.userId)}
+    select ${SEARCH_COLUMNS}
+      from notes n
+      left join folder_paths on folder_paths.id = n.folder_id
+     where n.user_id = ${input.userId}
+       and (
+            lower(n.name) ilike ${input.pattern} ${LIKE_ESCAPE}
+         or exists (
+              select 1
+                from unnest(folder_paths.path) as matched_segment(segment_name)
+               where lower(matched_segment.segment_name) ilike ${input.pattern} ${LIKE_ESCAPE}
+            )
+         )
+     order by n.content_updated_at desc, n.id
+     limit ${input.limit}`,
+  );
+  return rawRows<Record<string, unknown>>(result).map(searchRowBase);
+}
+
+/**
+ * The **candidate window**: up to `limit` of the caller's most recently updated notes, envelopes included, newest
+ * first — the set the in-process pass decrypts and matches name, path and body against (PR-11 §4).
+ *
+ * It is `recentNotes`' ordering (`content_updated_at desc, id asc`, which is exactly
+ * `notes_user_content_updated_idx`) with the breadcrumb path joined on, so the window the pass scores and the
+ * recency tiebreak it falls back on come from the same statement. The `limit` is not a pagination knob: it *is*
+ * the scan bound, and a caller that could raise it would be paying to decrypt a corpus-sized request, which is
+ * the trade-off ADR-0002 accepted at MVP scale and backlog PR-29 exists to retire.
+ *
+ * Ordered, and ordered *stably*, because the pass it feeds can only rank what it is handed: `id` breaks a tie
+ * between two writes in the same millisecond, so "the 501st most recent note is not searched" is a fact rather
+ * than a race.
+ */
+export async function listRecentNotesForSearch(
+  db: Db,
+  input: { readonly userId: string; readonly limit: number },
+): Promise<NoteSearchCandidate[]> {
+  const result = await db.execute(
+    sql`${folderPathCte(input.userId)}
+    select ${SEARCH_COLUMNS},
+           n.content_cipher,
+           n.content_iv,
+           n.key_version
+      from notes n
+      left join folder_paths on folder_paths.id = n.folder_id
+     where n.user_id = ${input.userId}
+     order by n.content_updated_at desc, n.id
+     limit ${input.limit}`,
+  );
+  return rawRows<Record<string, unknown>>(result).map((row) => ({
+    ...searchRowBase(row),
+    // The triple stays a triple: this layer never decrypts, and `crypto/envelope.ts` accepts the three fields
+    // structurally (`NoteEnvelope`), so the candidate row goes to it unchanged.
+    contentCipher: row.content_cipher as Uint8Array,
+    contentIv: row.content_iv as Uint8Array,
+    keyVersion: Number(row.key_version),
+  }));
 }

@@ -257,7 +257,8 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   is the server's `depth`: a 100-level chain costs 100 indents, which is the §9.2 #13 cap's problem, not the
   sidebar's, and nothing here re-derives it), the descendant set (legal-move pruning and the count a delete
   warning owes), the
-  breadcrumbs and `recentNotes` (PR-11's `/api/search/recent` mirror, so the shell does not re-derive recency).
+  breadcrumbs and `recentNotes` (recency read from `GET /api/tree`'s `contentUpdatedAt` — PR-11 shipped no
+  `/api/search/recent`, so the shell has one source for "which note is newest" and never re-derives it).
   `tree.mutations.ts` imports `moveIsBlocked` from that same module, so **an illegal move is refused before
   `fetch`** — the server stays the authority and still answers 409. Optimistic writes are
   `react-query`'s `onMutate` on `['tree', userId]`; each of `applyRename`/`applyMove`/`applyDelete` returns the
@@ -377,3 +378,24 @@ Available since PR-01 (Node 22 — see `.nvmrc` — and pnpm, pinned by `package
   fact about the visit rather than about the note. Until PR-13's route exists the navigation is
   `navigate({ href: noteEditorHref(id) })`, because `to` is typed against a generated tree with no `/app/*` in it;
   `NOTE_EDITOR_PATH` is exported for the one-line swap when that file lands.
+- **Search is two passes, and one documented asymmetry** (PR-11): `GET /api/search` answers metadata hits from SQL
+  over the *whole* corpus — `notes.repo.ts`'s `searchNotesByMetadata`, `ILIKE` on `lower(name)` and on every
+  folder-name **segment** of the breadcrumb (not the joined path: `/` is a forbidden name character, so `a/b` should
+  match nothing rather than every note under `a`), with `%`, `_` and `\` escaped by `likeContainsPattern()` so a
+  search for `100%` means the discount — and body hits from `listRecentNotesForSearch`, which hands
+  `services/search.service.ts` up to **500** of the caller's most recently updated notes *with their envelopes* so
+  it can decrypt and match name, path and body. Both statements scope by `user_id`, so cross-user results are
+  structurally impossible rather than filtered out, and the breadcrumb both of them join is
+  `folders.repo.ts`'s `folderPathCte` — one walk, one definition of "this note's path", shared with `listFolderTree`.
+  The window is the **scan bound**, not a page: `limit` cannot raise it (the contract caps results at 25, and the
+  service re-bounds for a caller that reached it past the schema). NFD accent folding (`foldKey`) runs **only in the
+  in-process pass**, so `cafe` finds an in-window `café` and misses an out-of-window one; `docs/API.md` #21 states
+  the rule, `search.service.int.test.ts` pins both halves (including the miss, so the gap cannot be "fixed" by a
+  quiet `unaccent` — that is backlog PR-29's folded column). `score` is a **tier** (`name 2 > body-or-path 1`), with
+  ties falling to `content_updated_at DESC` then `id`; a snippet is ≤120 **code points** of plaintext around the
+  match — never a UTF-16 slice, which is how an emoji gets cut in half — and `''` when the match was not in a body.
+  A note whose envelope will not open is **skipped from both passes**, its ids logged on the request's logger (the
+  line the envelope's `x-request-id` points at), and the request still answers `200`: never `500`, never blank or
+  garbage text standing in for an unreadable body. The one honest exception is an *out-of-window* corrupt body,
+  which the metadata pass can name without ever decrypting it — that is the same fact as "search needs no key for
+  names", and `search.service.int.test.ts` asserts the in-window half.

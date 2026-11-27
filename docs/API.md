@@ -10,8 +10,8 @@ response body against the schema it names. Nothing generates this file and no CI
 routes: it is maintained by hand, and `AGENTS.md` requires it to change in the same PR as the contract it
 describes.
 
-> **Status.** Everything below is implemented except `GET /api/search` (**PR-11**): `apps/server` serves rows 1–20
-> and 22 today, and the "Lands in" column says which PR put each one there. The UI PRs (**PR-08**,
+> **Status.** Everything below is implemented: `apps/server` serves rows 1–22 today (the search endpoint, row 21,
+> arrived with **PR-11**), and the "Lands in" column says which PR put each one there. The UI PRs (**PR-08**,
 > **PR-12…PR-17**) only consume it. An unknown path answers the envelope with `NOT_FOUND`, which is the shape every
 > route keeps.
 
@@ -138,7 +138,7 @@ conflict (plan §11.4).
 | 18 | `PUT /api/notes/:id/content` | yes | `contentUpdateSchema` | `200 NoteWithContent` (`version:version+1`) + `ETag: W/"v<new version>"` | **PR-10** (the versioned write, and the read side #17 is PR-09: `baseVersion` is compared, never trusted, and `version + 1` happens in the **same** `UPDATE` as the new envelope, so two tabs holding one version cannot both win and a request killed mid-flight leaves no half-written note. A stale `baseVersion` is `VERSION_CONFLICT` carrying `data.content` and `data.version` — the server's current body and version, which PR-14's autosave compares with the exact snapshot it sent before it calls anything a conflict. The write filters on `user_id` too, so a note that is missing **or** somebody else's is re-read scoped and answered `404`, never the `409` that would confirm the row (and its content) exists. `If-Match` is optional and honoured when present (see Concurrency above); an empty `content` is legal and still stores a real envelope, and `content_bytes`/`word_count`/`content_updated_at` move with the body — the only endpoint that moves `version` at all. `baseVersion` is bounded by `MAX_NOTE_VERSION`, the `int4` ceiling of the column it is compared against: a body naming a version past it is `400 VALIDATION` on `baseVersion`, not a Postgres `22003` that `mapError()` can only report as `500`) |
 | 19 | `PATCH /api/notes/:id` | yes | `renameMoveSchema` | `200 NoteNode` | **PR-09** (rename and/or re-file in one request, applied as **one** `UPDATE` inside one transaction, so the sibling index judges the `(folder, name)` the request asked for and never a half-applied pair — and a move whose destination already holds the name is `409 CONFLICT` carrying that row's id; `folderId: null` moves to the root and a name that still ends in `.md` is stripped once on the way in; `version` is untouched, so renaming never invalidates an open editor) |
 | 20 | `DELETE /api/notes/:id` | yes | — | `204` | **PR-09** (hard delete of the row and its envelope; a second delete answers `404`) |
-| 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | — | `searchResponseSchema` | PR-11 |
+| 21 | `GET /api/search?q=&limit=` (`searchPath()`) | yes | query `q` (required, trimmed, non-blank, ≤200 chars) and optional `limit` (1–25, default 25) | `searchResponseSchema` (`{results}`, ≤25) | **PR-11** (two passes over the caller's own rows, because bodies are encrypted: SQL matches **names and folder names** over the whole corpus — `ILIKE` on `lower(name)` with `%`, `_` and `\` escaped, so a search for `100%` means the discount — and a second pass decrypts up to **500** of the caller's most recently updated notes and matches name, folder path and **body**. Ordering is `name hit > body hit > recency` (`score` is 2 or 1; equal scores fall to `content_updated_at DESC`, then `id`). `folderPath` is the note's folder path, `/`-joined and `""` at the root; `snippet` is ≤120 **code points** of the plaintext around the match, cut so it can never split an emoji, and `""` when the match was not in a body. `q` blank, whitespace-only or absent is `400 VALIDATION` naming `q`, and a `limit` the schema cannot honour (`0`, `26`, `ten`) is the same, so no caller can ask for more than the 500-note scan implies. Everything is scoped by `user_id` inside the repository: another user's notes are not excluded by a filter, they are not in the statement, and a query only they contain answers `200 {results: []}`. A note whose stored body does not authenticate is **skipped** — its id is logged, the rest of the corpus is still searched, and the request is not a `500`. **The accent asymmetry is part of the contract:** search keys are folded (NFD, combining marks stripped) inside the in-process pass only, so `cafe` finds a note named `café` while that note is inside the 500-candidate window, and only the exact `café` matches outside it (`unaccent` is not installed and a fold is not a `LIKE` pattern; closing the gap needs a folded generated column, which is backlog PR-29). Pinned by its own integration test, so it cannot be "fixed" quietly) |
 | 22 | `GET /api/settings`, `PATCH /api/settings` | yes | `patchSettingsSchema` | `Settings` | **PR-09** (get-or-create: a caller with no row reads the column defaults with `200` and leaves exactly one row behind, which the next `GET` reads back, so PR-16 has no "settings missing" state to render; `PATCH` ensures the same row, so it can never be a zero-row write reported as success, and it is partial but never empty) |
 
 ## Examples
@@ -215,6 +215,49 @@ would have left `version` where it was (**PR-10**).
 
 `path` is dot-joined relative to the request body (an issue with no path reports as `body`); there are
 no Zod codes on the wire.
+
+### `GET /api/search?q=quarterly` — 200
+
+```jsonc
+// ← 200 (searchResponseSchema)
+{
+  "results": [
+    // score 2: the query is in the note's name. `snippet` is "" because there was no body match to quote.
+    { "noteId": "0198…", "name": "quarterly report", "folderPath": "work/2026", "snippet": "", "score": 2 },
+    // score 1: the query is in the body, so the snippet is up to 120 code points of plaintext around the match.
+    {
+      "noteId": "0199…", "name": "notes on the retreat", "folderPath": "work/2026",
+      "snippet": "follow-ups: the quarterly report is due Friday, before the offsite", "score": 1
+    }
+  ]
+}
+```
+
+`score` is a tier, not a relevance: 2 for a hit on the note's own name, 1 for a hit on its body or on one of its
+folder names, and the list arrives already ordered (`score DESC`, then `content_updated_at DESC`, then `id`), so a
+client renders it as it came and never re-sorts on `score` alone. An empty `results` and an empty corpus are the
+same response, which is what lets this endpoint answer about another user's words without admitting they exist.
+
+A snippet carries no ellipsis and no highlight markers: it is raw text from the note, cut on a code-point boundary
+so an emoji cannot arrive as half a character, and the match is always inside it. PR-17 highlights the match from
+the query it still has.
+
+**Why a name hit can be missing a body hit, and vice versa.** Bodies are encrypted, so no index can see them
+(ADR-0002). A query therefore runs twice: once in SQL over names and folder names, which covers every note the
+caller owns and needs no key, and once in the process over the ≤500 most recently updated notes, which decrypts and
+reads the body. The consequence is a documented asymmetry rather than a bug to chase:
+
+| the note named `café`… | `?q=café` | `?q=cafe` |
+| --- | --- | --- |
+| inside the 500-candidate window | found | found — search keys are accent-folded (NFD, combining marks stripped) in the in-process pass |
+| outside it | found — the SQL branch saw the exact name | **not found** — SQL cannot fold, and the pass that can never saw that far back |
+
+The same rule in one sentence: `cafe` finds a note named `café` whenever that note is inside the 500-candidate
+window, and only the exact `café` matches outside it. Making name search uniformly accent-insensitive needs a folded
+generated column or `unaccent`, which is backlog **PR-29**; until then `search.service.int.test.ts` asserts the
+miss, so the gap can be neither closed quietly nor mistaken for a regression. Body search has no such asymmetry
+inside the window — it is only ever the in-process pass — and 500 notes is where plan §6 puts the MVP corpus, with
+`pg_trgm`/`tsvector` as the scale-out path past a few thousand.
 
 ### `GET /api/nope` — 404 from the route table
 
